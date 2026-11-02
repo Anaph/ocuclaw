@@ -19,15 +19,10 @@ _TRANSLIT = {
     "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "",
     "э": "e", "ю": "yu", "я": "ya",
 }
-_CYRILLIC_RE = None  # built lazily
+import re
 
-
-def _cyrillic_re():
-    global _CYRILLIC_RE
-    if _CYRILLIC_RE is None:
-        import re
-        _CYRILLIC_RE = re.compile("[" + "".join(_TRANSLIT) + "А-Яа-яЁё]")
-    return _CYRILLIC_RE
+# Russian range + Ё/ё (other scripts pass through untouched).
+_CYRILLIC_RE = re.compile("[А-Яа-яЁё]")
 
 
 def romanize_enabled() -> bool:
@@ -38,7 +33,7 @@ def romanize_enabled() -> bool:
 
 def romanize_title(text):
     """Transliterate Cyrillic runs to Latin; anything else passes through."""
-    if not isinstance(text, str) or not text or not _cyrillic_re().search(text):
+    if not isinstance(text, str) or not text or not _CYRILLIC_RE.search(text):
         return text
     out = []
     for ch in text:
