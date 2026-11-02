@@ -36,6 +36,7 @@ from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from .title_romanize import maybe_romanize
 from .conversation_resolver import carriers_for_key, compression_ancestors, compression_tip, resolve_conversation, ConversationUnavailable
 
 from .session_writer import SharedSessionWriter
@@ -721,7 +722,7 @@ class SessionRpc:
             "lineageRootId": self._lineage_root_id(row),
             # REAL unix seconds — the Node bridge owns the ×1000 conversion.
             "lastActive": row.get("last_active"),
-            "title": row.get("title"),
+            "title": maybe_romanize(row.get("title")),
             "preview": row.get("preview"),
             "messageCount": row.get("message_count"),
         }
@@ -860,6 +861,8 @@ class SessionRpc:
         rows = self._dedupe_by_session_key(rows)
         wire = [self._row_to_wire(row) for row in rows]
         if search:
+            # A Cyrillic search term must still hit the romanized display title.
+            search_alt = maybe_romanize(search)
             # Title/preview substring (the map's sanctioned inside-mode search
             # shape; FTS session search is a future refinement).
             wire = [
@@ -867,6 +870,8 @@ class SessionRpc:
                 for w in wire
                 if search in (w.get("title") or "").lower()
                 or search in (w.get("preview") or "").lower()
+                or search_alt in (w.get("title") or "").lower()
+                or search_alt in (w.get("preview") or "").lower()
             ][:limit]
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
