@@ -26,7 +26,7 @@ const {
 
   const res = await bridge.request("chat.history", {
     sessionKey: "hermes:main:t1",
-     limit: 2,
+    limit: 2,
     beforeId: 7,
   });
   const c = calls[0];
