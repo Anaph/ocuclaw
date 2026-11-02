@@ -1,0 +1,17 @@
+"""Romanize self-check as a file test (romanize branch)."""
+import pathlib, sys, types
+
+REPO = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO.parent))
+_pkg = types.ModuleType("ocuclaw")
+_pkg.__path__ = [str(REPO)]
+sys.modules.setdefault("ocuclaw", _pkg)
+from ocuclaw.title_romanize import romanize_title
+
+assert romanize_title("Погода в Москве") == "Pogoda v Moskve"
+assert romanize_title("Елка") == "Elka"    # е -> e (BGN)
+assert romanize_title("Ёлка") == "Yolka"   # ё -> yo
+assert romanize_title("Щука") == "Shchuka"
+assert romanize_title("Hello 123") == "Hello 123"
+assert romanize_title(None) is None
+print("test_title_romanize OK")
