@@ -122,6 +122,30 @@ def _optional_int(value: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
+def _paginate_conversation(messages, after_id, before_id, limit):
+    """Shape a conversational page (load-earlier pagination).
+
+    Legacy behavior stays byte-identical when ``before_id`` is None: ``after_id``
+    tails forward, ``limit`` keeps the tail slice, and no cursor fields appear.
+    With ``before_id`` the page is the ``limit`` rows immediately older than the
+    cursor (exclusive), returned oldest->newest; ``hasMore`` says whether even
+    older rows exist and ``nextBeforeId`` is the cursor for the next page.
+    """
+    rows = messages
+    if after_id is not None:
+        rows = [m for m in rows if m.get("id") is not None and int(m["id"]) > after_id]
+    if before_id is None:
+        if limit > 0 and len(rows) > limit:
+            return {"messages": rows[-limit:], "hasMore": True, "nextBeforeId": None}
+        return {"messages": rows, "hasMore": False, "nextBeforeId": None}
+    older = [m for m in rows if m.get("id") is not None and int(m["id"]) < before_id]
+    page = older[-limit:] if limit > 0 else older
+    return {
+        "messages": page,
+        "hasMore": len(older) > len(page),
+        "nextBeforeId": int(page[0]["id"]) if page else None,
+    }
+
 
 def _is_stale_schema_error(exc: BaseException) -> bool:
     """True for the two errors a store behind ``SCHEMA_SQL`` raises at prepare
@@ -1165,22 +1189,27 @@ class SessionRpc:
         # projection carries no row ids (0.19-compatible readers) cannot tail
         # — say so instead of returning the whole transcript as "new".
         after_id = _optional_int(p.get("afterId"))
+        before_id = _optional_int(p.get("beforeId"))
         row_ids_unavailable = False
-        if after_id is not None:
-            if any(message.get("id") is None for message in messages):
-                row_ids_unavailable = True
-                messages = []
-            else:
-                messages = [
-                    message for message in messages if int(message["id"]) > after_id
-                ]
+        if (after_id is not None or before_id is not None) and any(
+            message.get("id") is None for message in messages
+        ):
+            row_ids_unavailable = True
+            messages = []
         try:
             limit = int(p.get("limit"))
         except (TypeError, ValueError):
             limit = 0
-        if limit > 0 and len(messages) > limit:
-            messages = messages[-limit:]
-        result: Dict[str, Any] = {"messages": messages, "sessionId": tip, "total": total}
+        page = _paginate_conversation(messages, after_id, before_id, limit)
+        result: Dict[str, Any] = {
+            "messages": page["messages"],
+            "sessionId": tip,
+            "total": total,
+        }
+        if before_id is not None:
+            result["hasMore"] = page["hasMore"]
+            if page["nextBeforeId"] is not None:
+                result["nextBeforeId"] = page["nextBeforeId"]
         if row_ids_unavailable:
             result["rowIdsUnavailable"] = True
         return result
