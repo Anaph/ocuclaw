@@ -2,7 +2,7 @@
 const {
   createHermesGatewayBridge,
   LINK_DB_METHODS,
-} = require("/workspace/ocuclaw/dist-cjs/runtime/hermes-gateway-bridge.cjs");
+} = require(require('path').join(__dirname, '..', 'dist-cjs', 'runtime', 'hermes-gateway-bridge.cjs'));
 
 (async () => {
   const calls = [];
@@ -23,9 +23,8 @@ const {
     },
   };
   const { bridge } = createHermesGatewayBridge({ link });
-  const send = bridge.request || bridge.dispatch || bridge.handle;
 
-  const res = await send.call(bridge, "chat.history", {
+  const res = await bridge.request("chat.history", {
     sessionKey: "hermes:main:t1",
      limit: 2,
     beforeId: 7,
@@ -45,7 +44,7 @@ const {
     total: 4,
   };
   calls.length = 0;
-  const res2 = await send.call(bridge, "chat.history", { sessionKey: "hermes:main:t1", limit: 2 });
+  const res2 = await bridge.request("chat.history", { sessionKey: "hermes:main:t1", limit: 2 });
   if (calls[0].params.beforeId !== undefined) throw new Error("beforeId leaked into legacy call");
   if ("hasMore" in res2 || "nextBeforeId" in res2) throw new Error("cursor keys leaked on legacy reply: " + JSON.stringify(res2));
 
