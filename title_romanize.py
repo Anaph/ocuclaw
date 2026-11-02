@@ -10,6 +10,7 @@ pass titles through unchanged.
 from __future__ import annotations
 
 import os
+import re
 
 _TRANSLIT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
@@ -19,7 +20,6 @@ _TRANSLIT = {
     "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "",
     "э": "e", "ю": "yu", "я": "ya",
 }
-import re
 
 # Russian range + Ё/ё (other scripts pass through untouched).
 _CYRILLIC_RE = re.compile("[А-Яа-яЁё]")
