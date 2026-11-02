@@ -14,4 +14,10 @@ assert romanize_title("Ёлка") == "Yolka"   # ё -> yo
 assert romanize_title("Щука") == "Shchuka"
 assert romanize_title("Hello 123") == "Hello 123"
 assert romanize_title(None) is None
+import os
+from ocuclaw.title_romanize import maybe_romanize
+os.environ["OCUCLAW_TITLE_ROMANIZE"] = "0"
+assert maybe_romanize("Погода") == "Погода"  # toggle off: pass-through
+os.environ["OCUCLAW_TITLE_ROMANIZE"] = "1"
+assert maybe_romanize("Погода") == "Pogoda"  # toggle on
 print("test_title_romanize OK")
