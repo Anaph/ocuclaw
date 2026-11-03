@@ -59,4 +59,15 @@ res = make_rpc([{"role": "user", "content": "x"}])._sync_history(
 )
 assert res["messages"] == [] and res["rowIdsUnavailable"] is True
 
+# pages span compression ancestors transparently: one beforeId page mixing
+# ancestor and tip rows comes back oldest-first (history is include-ancestors)
+MIXED = [
+    {"id": 1, "role": "user", "content": "anc1", "sessionId": "anc"},
+    {"id": 2, "role": "assistant", "content": "anc2", "sessionId": "anc"},
+    {"id": 3, "role": "user", "content": "tip1", "sessionId": "tip"},
+]
+res = make_rpc(MIXED)._sync_history({"identity": {}, "beforeId": 3, "limit": 2})
+assert [m["id"] for m in res["messages"]] == [1, 2], res
+assert res["hasMore"] is False and res["nextBeforeId"] == 1
+
 print("test_sync_history_emu OK")

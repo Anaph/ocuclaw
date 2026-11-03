@@ -1178,10 +1178,9 @@ class SessionRpc:
         ]
         # PRE-slice count. The tail slice below is the only reason a caller
         # can silently lose the beginning of its own conversation; `total`
-        # is what makes that loss observable instead of invisible. No
-        # `offset` companion: nothing in composeApp or the plugin has a
-        # load-earlier affordance, so an offset would be protocol surface for
-        # a UI that does not exist. The slice stays TAIL-anchored.
+        # is what makes that loss observable instead of invisible. The
+        # `beforeId` cursor below is the load-earlier affordance this count
+        # exists to serve; without a cursor the slice stays TAIL-anchored.
         total = len(messages)
         # Desktop→glasses mirror (#2513): `afterId` tails the transcript past a
         # `db.chat.watermark` row id. Applied BEFORE the limit so the caller
