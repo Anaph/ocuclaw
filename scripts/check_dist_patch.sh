@@ -6,7 +6,7 @@ set -u
 BRIDGE="$(cd "$(dirname "$0")/.." && pwd)/dist-cjs/runtime/hermes-gateway-bridge.cjs"
 fail=0
 for marker in beforeId nextBeforeId hasMore; do
-  grep -q "$marker" "$BRIDGE" || { echo "check_dist_patch: MISSING '$marker' in $BRIDGE" >&2; fail=1; }
+  grep -qF "$marker" "$BRIDGE" || { echo "check_dist_patch: MISSING '$marker' in $BRIDGE" >&2; fail=1; }
 done
 if [ "$fail" -ne 0 ]; then
   echo "The dist-cjs bridge lost the db.chat.history pagination patch (rebuilt from TS upstream?)." >&2
