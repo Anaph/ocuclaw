@@ -870,15 +870,19 @@ class SessionRpc:
             # reused read-only). Degrades to substring-only whenever FTS is
             # unavailable or errors -- never fails the list.
             fts_ids = self._fts_session_ids(search)
-            wire = [
-                w
-                for w in wire
-                if search in (w.get("title") or "").lower()
-                or search in (w.get("preview") or "").lower()
-                or search_alt in (w.get("title") or "").lower()
-                or search_alt in (w.get("preview") or "").lower()
-                or str(w.get("id")) in fts_ids
-            ][:limit]
+
+            def _matches(w: Dict[str, Any]) -> bool:
+                title = (w.get("title") or "").lower()
+                preview = (w.get("preview") or "").lower()
+                return (
+                    search in title
+                    or search in preview
+                    or search_alt in title
+                    or search_alt in preview
+                    or str(w.get("id")) in fts_ids
+                )
+
+            wire = [w for w in wire if _matches(w)][:limit]
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
 
