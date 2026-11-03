@@ -954,7 +954,6 @@ class SessionRpc:
             None,
         )
 
-    @_session_operation
     def _fts_session_ids(self, query: str) -> set:
         """Session-tip ids whose MESSAGES match `query` in the host's FTS5
         index, projected to visible compression tips. Empty set (never an
@@ -988,6 +987,7 @@ class SessionRpc:
         except Exception:
             return set()
 
+    @_session_operation
     def _sync_search(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         query = str(p.get("query") or "").strip()
