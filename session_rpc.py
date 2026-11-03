@@ -723,7 +723,9 @@ class SessionRpc:
             # REAL unix seconds — the Node bridge owns the ×1000 conversion.
             "lastActive": row.get("last_active"),
             "title": maybe_romanize(row.get("title")),
-            "preview": row.get("preview"),
+            # Display projection, same as the title: the phone font lacks
+            # Cyrillic glyphs (see title_romanize).
+            "preview": maybe_romanize(row.get("preview")),
             "messageCount": row.get("message_count"),
         }
         model = row.get("model")
@@ -863,8 +865,11 @@ class SessionRpc:
         if search:
             # A Cyrillic search term must still hit the romanized display title.
             search_alt = maybe_romanize(search)
-            # Title/preview substring (the map's sanctioned inside-mode search
-            # shape; FTS session search is a future refinement).
+            # Title/preview substring UNIONed with sessions whose MESSAGES
+            # match the host's FTS index (the db.sessions.search capability,
+            # reused read-only). Degrades to substring-only whenever FTS is
+            # unavailable or errors -- never fails the list.
+            fts_ids = self._fts_session_ids(search)
             wire = [
                 w
                 for w in wire
@@ -872,6 +877,7 @@ class SessionRpc:
                 or search in (w.get("preview") or "").lower()
                 or search_alt in (w.get("title") or "").lower()
                 or search_alt in (w.get("preview") or "").lower()
+                or str(w.get("id")) in fts_ids
             ][:limit]
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
@@ -945,6 +951,39 @@ class SessionRpc:
         )
 
     @_session_operation
+    def _fts_session_ids(self, query: str) -> set:
+        """Session-tip ids whose MESSAGES match `query` in the host's FTS5
+        index, projected to visible compression tips. Empty set (never an
+        exception) when the index is unavailable: db.sessions.list search
+        must degrade to substring mode, not fail.
+        """
+        try:
+            db = self._get_reader()
+            if not bool(getattr(db, "_fts_enabled", False)):
+                return set()
+            matches = db.search_messages(
+                self._search_query(query),
+                exclude_sources=list(DENY_SOURCES),
+                role_filter=["user", "assistant"],
+                limit=SEARCH_SCAN_LIMIT,
+                sort="newest",
+                fields=("session_id",),
+            )
+            projected: Dict[str, Optional[Dict[str, Any]]] = {}
+            tips = set()
+            for match in matches:
+                raw = str(match.get("session_id") or "")
+                if not raw:
+                    continue
+                if raw not in projected:
+                    projected[raw] = self._visible_search_row(raw)
+                row = projected[raw]
+                if row is not None:
+                    tips.add(str(row.get("id")))
+            return tips
+        except Exception:
+            return set()
+
     def _sync_search(self, params: Any) -> Dict[str, Any]:
         p = params if isinstance(params, dict) else {}
         query = str(p.get("query") or "").strip()
