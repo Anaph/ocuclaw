@@ -70,6 +70,7 @@ from .cli import register_cli_commands
 from . import uninstall_gate
 from .session_status import SessionStatusObserver
 from .session_title_hold import SessionTitleHold, turn_user_text
+from .title_romanize import configure as configure_title_romanize
 from .session_writer import SharedSessionWriter
 from .control_link import (
     HERMES_BUNDLE_DEFAULT_WS_BIND,
@@ -2908,6 +2909,10 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         "externalDebugToolsEnabled": _bool("externalDebugToolsEnabled", True),
         "debugAutoArm": _bool("debugAutoArm", False),
         "allowDebugUpload": _bool("allowDebugUpload", True),
+        # Display romanization of session titles/previews for the phone's
+        # glyph-limited font (title_romanize). Env OCUCLAW_TITLE_ROMANIZE
+        # remains the un-configured escape; this explicit key wins.
+        "titleRomanize": _bool("titleRomanize", True),
         "debugUploadMaxZipBytes": debug_upload_max_zip_bytes,
         "debugUploadCapturePreset": _list("debugUploadCapturePreset"),
         "debugBundleSaveDir": str(extra.get("debugBundleSaveDir") or ""),
@@ -4861,6 +4866,7 @@ def _build_adapter(config: Any):
             _guard_secondary_port_binding_scope()
             super().__init__(platform_config, platform)
             self._settings = resolve_adapter_settings(platform_config)
+            configure_title_romanize(self._settings.get("titleRomanize"))
             _check_liveui_tool_timeout_budget(
                 _liveui_render_link_timeout_s(self._settings)
             )

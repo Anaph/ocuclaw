@@ -20,4 +20,14 @@ os.environ["OCUCLAW_TITLE_ROMANIZE"] = "0"
 assert maybe_romanize("Погода") == "Погода"  # toggle off: pass-through
 os.environ["OCUCLAW_TITLE_ROMANIZE"] = "1"
 assert maybe_romanize("Погода") == "Pogoda"  # toggle on
+from ocuclaw import title_romanize as _tr
+os.environ["OCUCLAW_TITLE_ROMANIZE"] = "0"
+_tr.configure(True)
+assert maybe_romanize("Погода") == "Pogoda"  # explicit config beats env-off
+_tr.configure(None)
+assert maybe_romanize("Погода") == "Погода"  # un-pinned: env governs again
+_tr.configure(False)
+assert maybe_romanize("Погода") == "Погода"  # explicit config off
+_tr.configure(None)
+os.environ.pop("OCUCLAW_TITLE_ROMANIZE")
 print("test_title_romanize OK")

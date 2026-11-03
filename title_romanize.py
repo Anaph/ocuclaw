@@ -25,7 +25,19 @@ _TRANSLIT = {
 _CYRILLIC_RE = re.compile("[А-Яа-яЁё]")
 
 
+_configured = None  # explicit plugin setting (platforms.ocuclaw.extra.titleRomanize)
+
+
+def configure(enabled) -> None:
+    """Pin romanization from the resolved plugin setting. Passing None (or a
+    non-bool) un-pins and the OCUCLAW_TITLE_ROMANIZE env escape governs."""
+    global _configured
+    _configured = enabled if isinstance(enabled, bool) else None
+
+
 def romanize_enabled() -> bool:
+    if _configured is not None:
+        return _configured
     return os.environ.get("OCUCLAW_TITLE_ROMANIZE", "1").strip().lower() not in {
         "0", "false", "no", "off",
     }
