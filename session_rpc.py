@@ -985,6 +985,8 @@ class SessionRpc:
                     tips.add(str(row.get("id")))
             return tips
         except Exception:
+            logger.debug("list search: FTS union unavailable; substring-only",
+                         exc_info=True)
             return set()
 
     @_session_operation
