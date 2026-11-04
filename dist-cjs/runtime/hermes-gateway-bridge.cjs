@@ -1602,11 +1602,13 @@ function createHermesGatewayBridge(opts) {
       const limit = toFiniteNumber(params && params.limit);
 
       const afterId = toFiniteNumber(params && params.afterId);
+      const beforeId = toFiniteNumber(params && params.beforeId);
       const linkParams = {
         identity: keyToIdentity(params && params.sessionKey),
 
         ...(limit !== null && limit > 0 ? { limit: Math.floor(limit) } : {}),
         ...(afterId !== null && afterId >= 0 ? { afterId: Math.floor(afterId) } : {}),
+        ...(beforeId !== null && beforeId >= 0 ? { beforeId: Math.floor(beforeId) } : {}),
       };
       const result = await link.request(LINK_DB_METHODS.chatHistory, linkParams, DB_READ_TIMEOUT);
       const messages = shapeConversationMessages(
@@ -1620,6 +1622,8 @@ function createHermesGatewayBridge(opts) {
         messages,
         ...(total !== null && total >= 0 ? { total: Math.floor(total) } : {}),
         ...(result && result.rowIdsUnavailable === true ? { rowIdsUnavailable: true } : {}),
+        ...(result && typeof result.hasMore === "boolean" ? { hasMore: result.hasMore } : {}),
+        ...(Number.isFinite(result && result.nextBeforeId) ? { nextBeforeId: Math.floor(result.nextBeforeId) } : {}),
       };
     },
 
