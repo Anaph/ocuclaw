@@ -36,6 +36,7 @@ from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from .title_romanize import maybe_romanize
 from .conversation_resolver import carriers_for_key, compression_ancestors, compression_tip, resolve_conversation, ConversationUnavailable
 
 from .session_writer import SharedSessionWriter
@@ -721,8 +722,10 @@ class SessionRpc:
             "lineageRootId": self._lineage_root_id(row),
             # REAL unix seconds — the Node bridge owns the ×1000 conversion.
             "lastActive": row.get("last_active"),
-            "title": row.get("title"),
-            "preview": row.get("preview"),
+            "title": maybe_romanize(row.get("title")),
+            # Display projection, same as the title: the phone font lacks
+            # Cyrillic glyphs (see title_romanize).
+            "preview": maybe_romanize(row.get("preview")),
             "messageCount": row.get("message_count"),
         }
         model = row.get("model")
@@ -860,14 +863,26 @@ class SessionRpc:
         rows = self._dedupe_by_session_key(rows)
         wire = [self._row_to_wire(row) for row in rows]
         if search:
-            # Title/preview substring (the map's sanctioned inside-mode search
-            # shape; FTS session search is a future refinement).
-            wire = [
-                w
-                for w in wire
-                if search in (w.get("title") or "").lower()
-                or search in (w.get("preview") or "").lower()
-            ][:limit]
+            # A Cyrillic search term must still hit the romanized display title.
+            search_alt = maybe_romanize(search)
+            # Title/preview substring UNIONed with sessions whose MESSAGES
+            # match the host's FTS index (the db.sessions.search capability,
+            # reused read-only). Degrades to substring-only whenever FTS is
+            # unavailable or errors -- never fails the list.
+            fts_ids = self._fts_session_ids(search)
+
+            def _matches(w: Dict[str, Any]) -> bool:
+                title = (w.get("title") or "").lower()
+                preview = (w.get("preview") or "").lower()
+                return (
+                    search in title
+                    or search in preview
+                    or search_alt in title
+                    or search_alt in preview
+                    or str(w.get("id")) in fts_ids
+                )
+
+            wire = [w for w in wire if _matches(w)][:limit]
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
 
@@ -938,6 +953,45 @@ class SessionRpc:
             (dict(candidate) for candidate in rich_rows if candidate.get("id") == tip),
             None,
         )
+
+    def _fts_session_ids(self, query: str) -> set:
+        """Session-tip ids whose MESSAGES match `query` in the host's FTS5
+        index, projected to visible compression tips. Empty set (never an
+        exception) when the index is unavailable: db.sessions.list search
+        must degrade to substring mode, not fail.
+
+        Locking invariant: the caller already holds ``_access_lock`` (this
+        helper is only invoked from @_session_operation-decorated methods);
+        it deliberately takes no lock of its own.
+        """
+        try:
+            db = self._get_reader()
+            if not bool(getattr(db, "_fts_enabled", False)):
+                return set()
+            matches = db.search_messages(
+                self._search_query(query),
+                exclude_sources=list(DENY_SOURCES),
+                role_filter=["user", "assistant"],
+                limit=SEARCH_SCAN_LIMIT,
+                sort="newest",
+                fields=("session_id",),
+            )
+            projected: Dict[str, Optional[Dict[str, Any]]] = {}
+            tips = set()
+            for match in matches:
+                raw = str(match.get("session_id") or "")
+                if not raw:
+                    continue
+                if raw not in projected:
+                    projected[raw] = self._visible_search_row(raw)
+                row = projected[raw]
+                if row is not None:
+                    tips.add(str(row.get("id")))
+            return tips
+        except Exception:
+            logger.debug("list search: FTS union unavailable; substring-only",
+                         exc_info=True)
+            return set()
 
     @_session_operation
     def _sync_search(self, params: Any) -> Dict[str, Any]:
