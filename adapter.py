@@ -2891,6 +2891,17 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         4_300_000,
         max(100_000, _int("debugUploadMaxZipBytes", 4_000_000)),
     )
+    # Tri-state display-romanization switch: an explicit bool pins the mode;
+    # an absent key keeps the OCUCLAW_TITLE_ROMANIZE env escape in charge; a
+    # present non-bool is a typo -> warn once and fall back to the escape.
+    title_romanize_raw = extra.get("titleRomanize")
+    if title_romanize_raw is not None and not isinstance(title_romanize_raw, bool):
+        logger.warning(
+            "platforms.ocuclaw.extra.titleRomanize expects true/false, got %r; "
+            "falling back to the OCUCLAW_TITLE_ROMANIZE env escape",
+            title_romanize_raw,
+        )
+    title_romanize = title_romanize_raw if isinstance(title_romanize_raw, bool) else None
     return {
         "argv": argv,
         "usesDefaultArgv": not extra.get("runtimeCommand"),
@@ -2912,8 +2923,7 @@ def resolve_adapter_settings(config: Any) -> Dict[str, Any]:
         # Display romanization of session titles/previews for the phone's
         # glyph-limited font (title_romanize). Env OCUCLAW_TITLE_ROMANIZE
         # remains the un-configured escape; this explicit key wins.
-        # Absent key stays None so the env escape still governs.
-        "titleRomanize": extra.get("titleRomanize") if isinstance(extra.get("titleRomanize"), bool) else None,
+        "titleRomanize": title_romanize,
         "debugUploadMaxZipBytes": debug_upload_max_zip_bytes,
         "debugUploadCapturePreset": _list("debugUploadCapturePreset"),
         "debugBundleSaveDir": str(extra.get("debugBundleSaveDir") or ""),

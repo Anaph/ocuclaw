@@ -959,6 +959,10 @@ class SessionRpc:
         index, projected to visible compression tips. Empty set (never an
         exception) when the index is unavailable: db.sessions.list search
         must degrade to substring mode, not fail.
+
+        Locking invariant: the caller already holds ``_access_lock`` (this
+        helper is only invoked from @_session_operation-decorated methods);
+        it deliberately takes no lock of its own.
         """
         try:
             db = self._get_reader()
