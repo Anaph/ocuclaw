@@ -12,6 +12,7 @@ import {
   type Snapshot,
 } from "./model";
 import { Relay } from "./transport";
+import { ReceiptStore, endpointScope, randomId, isSnapshot } from "./protocol";
 import { Glasses, wavBase64 } from "./glasses";
 type Screen =
   | "home"
@@ -76,6 +77,60 @@ const notificationQueue: (Question | Completion)[] = [],
   positions = new Map<string, string>(),
   stopping = new Set<string>();
 let choices = new Set<number>();
+let connectionGeneration = 0,
+  connectionScope = "",
+  sessionSearch = "";
+let receipts: ReceiptStore | null = null;
+function uiKey() {
+  return `ocuclaw.ui:${encodeURIComponent(connectionScope)}`;
+}
+function resetConnection(scope: string) {
+  connectionGeneration++;
+  connectionScope = scope;
+  notice = "";
+  model.reset();
+  sessions = [];
+  messages = [];
+  total = 0;
+  chatKey = "";
+  chatTitle = "";
+  questionId = "";
+  completionId = "";
+  confirmAction = null;
+  confirmText = "";
+  target = null;
+  draft = "";
+  textField.value = "";
+  readText = "";
+  readPage = 0;
+  clearNotification();
+  notificationQueue.length = 0;
+  positions.clear();
+  stopping.clear();
+  choices.clear();
+  screen = "home";
+  selected = 0;
+  sawSnapshot = false;
+  loadedOlder = false;
+  nextCompleted = null;
+  available = false;
+  sessionSearch = "";
+  receipts = new ReceiptStore(sessionStorage, scope);
+  // A receipt from the old unscoped format cannot be safely assigned to a server.
+  sessionStorage.removeItem("ocuclaw.pendingOperation");
+  try {
+    const saved = JSON.parse(localStorage.getItem(uiKey()) || "null");
+    if (
+      saved &&
+      ["home", "pending", "completed", "sessions"].includes(saved.screen)
+    ) {
+      screen = saved.screen;
+      for (const [key, id] of saved.positions || [])
+        if (typeof key === "string" && typeof id === "string")
+          positions.set(key, id);
+    }
+  } catch {}
+}
 const textField = document.querySelector<HTMLInputElement>("#text")!,
   providerField = document.querySelector<HTMLInputElement>("[name=provider]")!;
 const q = () => model.snapshot.pending.find((x) => x.id === questionId),
@@ -134,16 +189,27 @@ function compose(next: Target) {
   textField.value = "";
   go("compose");
 }
-async function refreshSessions(search = "") {
+async function refreshSessions(search = sessionSearch) {
+  const generation = connectionGeneration;
+  sessionSearch = search;
   const data = await relay.request("sessions.list", { search });
+  if (generation !== connectionGeneration || search !== sessionSearch) return;
   sessions = data.sessions || [];
-  for (const s of sessions) if (!s.agentStatus?.working) stopping.delete(s.key);
+  for (const s of sessions)
+    if (
+      s.agentStatus?.working === false &&
+      !s.agentStatus.unknown &&
+      !s.agentStatus.needsYou
+    )
+      stopping.delete(s.key);
 }
 async function openChat(key: string, title = key) {
+  const generation = connectionGeneration;
   const data = await relay.request("chat.history", {
     sessionKey: key,
     limit: 20,
   });
+  if (generation !== connectionGeneration) return;
   chatKey = key;
   chatTitle = title;
   messages = data.messages || [];
@@ -156,7 +222,7 @@ function questionAnswer(answer: Answer) {
   const bound = {
     id: item.id,
     sessionKey: item.sessionKey,
-    operationId: crypto.randomUUID(),
+    operationId: randomId(),
     answer,
   };
   const shown =
@@ -176,17 +242,13 @@ function questionAnswer(answer: Answer) {
         go("pending");
         return message(statusLabel(fresh.status));
       }
-      sessionStorage.setItem(
-        "ocuclaw.pendingOperation",
-        JSON.stringify({
-          operationId: bound.operationId,
-          id: bound.id,
-          sessionKey: bound.sessionKey,
-        }),
-      );
+      receipts!.save({
+        operationId: bound.operationId,
+        id: bound.id,
+        sessionKey: bound.sessionKey,
+      });
       const reply = await relay.request("inbox.answer", bound);
-      if (reply.status !== "uncertain")
-        sessionStorage.removeItem("ocuclaw.pendingOperation");
+      if (reply.status !== "uncertain") receipts?.clear();
       if (reply.status === "accepted") {
         go("pending");
         message("Ответ принят");
@@ -349,6 +411,18 @@ function view(): View {
     return {
       title: "Сессии",
       actions: [
+        ...(sessionSearch
+          ? [
+              {
+                id: "clear-search",
+                label: "Сбросить поиск",
+                run: async () => {
+                  await refreshSessions("");
+                  render();
+                },
+              },
+            ]
+          : []),
         {
           id: "new",
           label: "+ Новая сессия",
@@ -664,7 +738,7 @@ function useDraft() {
   if (!target) return;
   const boundTarget = target,
     boundDraft = draft,
-    sendId = crypto.randomUUID();
+    sendId = randomId();
   if (boundTarget.kind === "question") {
     questionId = boundTarget.id;
     const item = q();
@@ -780,7 +854,12 @@ function clearNotification() {
   notificationTimer = null;
 }
 function showNotification() {
-  if (notification || ["record", "confirm", "compose"].includes(screen) || busy)
+  if (
+    notification ||
+    ["record", "confirm", "compose"].includes(screen) ||
+    (screen === "read" && ["confirm", "compose"].includes(readReturn)) ||
+    busy
+  )
     return;
   notification = null;
   while (notificationQueue.length && !notification) {
@@ -802,35 +881,44 @@ function showNotification() {
   }
 }
 async function refreshInbox() {
-  model.update(await relay.request("inbox.snapshot"));
-  render();
+  const generation = connectionGeneration;
+  const snapshot = await relay.request("inbox.snapshot");
+  if (generation !== connectionGeneration) return;
+  applySnapshot(snapshot);
 }
 async function reconcileOperation() {
-  const saved = sessionStorage.getItem("ocuclaw.pendingOperation");
-  if (!saved) return;
-  const pending = JSON.parse(saved);
+  const generation = connectionGeneration,
+    store = receipts;
+  const pending = store?.load();
+  if (!pending) return;
   const receipt = await relay.request("inbox.operation", {
     operationId: pending.operationId,
   });
+  if (generation !== connectionGeneration) return;
   if (receipt.status === "accepted") {
-    sessionStorage.removeItem("ocuclaw.pendingOperation");
+    receipts?.clear();
     message("Предыдущий ответ принят Hermes");
   } else {
     const current = await relay.request("inbox.get", pending);
+    if (generation !== connectionGeneration) return;
+    if (current.status === "source_unavailable") {
+      message(
+        "Источник вопросов недоступен. Предыдущая отправка ещё не подтверждена.",
+      );
+      return;
+    }
     message(
       current.status === "pending"
         ? "Предыдущая отправка не подтверждена. Вопрос ещё ожидает ответа."
-        : "Предыдущий вопрос уже закрыт. Повторной отправки не было.",
+        : "Предыдущий запрос больше не активен. Повторной отправки не было.",
     );
-    if (current.status !== "pending")
-      sessionStorage.removeItem("ocuclaw.pendingOperation");
+    if (current.status !== "pending") store?.clear();
   }
 }
-relay.onSnapshot = (snapshot: Snapshot) => {
+function applySnapshot(snapshot: Snapshot) {
+  if (!isSnapshot(snapshot)) throw Error("Некорректный снимок Входящих");
   const before = new Set(model.snapshot.pending.map((x) => x.id));
   const beforeCompleted = new Set(model.snapshot.completed.map((x) => x.id));
-  if (!snapshot.available)
-    snapshot = { ...snapshot, pending: model.snapshot.pending };
   if (!loadedOlder) nextCompleted = snapshot.completedNextBefore ?? null;
   model.update(snapshot);
   available = snapshot.available;
@@ -843,7 +931,9 @@ relay.onSnapshot = (snapshot: Snapshot) => {
   sawSnapshot = true;
   render();
   showNotification();
-};
+}
+relay.onSnapshot = applySnapshot;
+relay.onError = message;
 relay.onState = (online) => {
   document.querySelector("#connection")!.textContent = online
     ? "VPS подключён"
@@ -1025,7 +1115,7 @@ function render(restore = true) {
   glasses.paint(canvas);
   if (["home", "pending", "completed", "sessions"].includes(screen))
     localStorage.setItem(
-      "ocuclaw.ui",
+      uiKey(),
       JSON.stringify({ screen, positions: [...positions] }),
     );
 }
@@ -1037,7 +1127,17 @@ document.querySelector("#connect")!.addEventListener("submit", (event) => {
   event.preventDefault();
   const data = new FormData(event.currentTarget as HTMLFormElement);
   try {
-    relay.connect(String(data.get("url")), String(data.get("token")));
+    if (busy || screen === "record")
+      return message(
+        "Завершите текущую отправку или запись перед сменой сервера",
+      );
+    const address = String(data.get("url")),
+      token = String(data.get("token"));
+    const scope = endpointScope(address);
+    if (!token.trim()) throw Error("Введите ключ подключения");
+    resetConnection(scope);
+    relay.connect(address, token);
+    render();
     (document.querySelector("#setup") as HTMLDetailsElement).open = false;
   } catch (e) {
     message((e as Error).message);
@@ -1052,16 +1152,6 @@ document.querySelector("#text-form")!.addEventListener("submit", (event) => {
   draft = textField.value;
   run(useDraft);
 });
-try {
-  const saved = JSON.parse(localStorage.getItem("ocuclaw.ui") || "null");
-  if (
-    saved &&
-    ["home", "pending", "completed", "sessions"].includes(saved.screen)
-  ) {
-    screen = saved.screen;
-    for (const [key, id] of saved.positions || []) positions.set(key, id);
-  }
-} catch {}
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && relay.online) {
     void refreshInbox().catch(() => {});
@@ -1073,7 +1163,7 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("pagehide", () => {
   clearTimeout(recordTimer);
-  void glasses.stop();
+  void glasses.stop().catch((error) => glasses.onError(String(error.message)));
   if (screen === "record") screen = "compose";
 });
 void document.fonts.ready.then(() => render());

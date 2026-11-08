@@ -4,6 +4,7 @@ import {
   InboxModel,
   orderedQuestions,
   canSend,
+  sessionStatus,
   type Question,
   type Snapshot,
 } from "./model";
@@ -68,4 +69,66 @@ test("answer elsewhere removes only that item", () => {
   model.update(snapshot([question("b", far)]));
   assert.deepEqual(model.order, ["b"]);
   assert.equal(model.selectedId, "b");
+});
+
+test("explicit connection reset discards data from the previous server", () => {
+  const model = new InboxModel(),
+    now = Date.now();
+  model.update({
+    ...snapshot([question("server-a", now + 100000)]),
+    completed: [
+      {
+        id: "result-a",
+        sessionKey: "hermes:main:a",
+        agentName: "a",
+        sessionTitle: "Secret server A",
+        summary: "Private",
+        read: false,
+        createdAtMs: now,
+      },
+    ],
+  });
+  model.reset();
+  model.update(snapshot([]));
+  assert.deepEqual(model.snapshot.completed, []);
+  assert.deepEqual(model.order, []);
+});
+test("profile revocation removes cached older results and offline questions", () => {
+  const model = new InboxModel(),
+    now = Date.now();
+  const item = question("private-question", now + 100000);
+  item.sessionKey = "hermes:private:a";
+  model.update({
+    ...snapshot([item]),
+    authorizedNamespaces: ["main", "private"],
+    completed: [
+      {
+        id: "private-result",
+        sessionKey: "hermes:private:a",
+        agentName: "a",
+        sessionTitle: "Private",
+        summary: "Private",
+        read: false,
+        createdAtMs: now,
+      },
+    ],
+  });
+  model.update({
+    ...snapshot([]),
+    available: false,
+    authorizedNamespaces: ["main"],
+  });
+  assert.equal(model.snapshot.pending.length, 0);
+  assert.equal(model.snapshot.completed.length, 0);
+});
+
+test("stale activity observations must not claim a session is still working", () => {
+  assert.equal(
+    sessionStatus(
+      { key: "a", agentStatus: { working: true, observedAtMs: 1000 } },
+      true,
+      20000,
+    ),
+    "Нет связи",
+  );
 });

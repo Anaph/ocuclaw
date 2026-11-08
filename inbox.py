@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 RETENTION_MS = 7 * 86400 * 1000
+RESULT_PAGE_BYTES = 192 * 1024
 
 
 async def resolved(value):
@@ -34,11 +35,30 @@ class Inbox:
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS completions (
             id TEXT PRIMARY KEY, created INTEGER NOT NULL, payload TEXT NOT NULL,
-            read INTEGER NOT NULL DEFAULT 0);
+            read INTEGER NOT NULL DEFAULT 0, namespace TEXT NOT NULL DEFAULT '');
           CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY, created INTEGER NOT NULL, fingerprint TEXT NOT NULL,
             result TEXT NOT NULL);
         """)
+        # Upgrade 0.1.0 stores without dropping results or their read receipts.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(completions)")}
+        if "namespace" not in columns:
+            self.db.execute(
+                "ALTER TABLE completions ADD COLUMN namespace TEXT NOT NULL DEFAULT ''"
+            )
+            for identity, payload in self.db.execute(
+                "SELECT id,payload FROM completions"
+            ).fetchall():
+                self.db.execute(
+                    "UPDATE completions SET namespace=? WHERE id=?",
+                    (
+                        self._namespace(json.loads(payload).get("sessionKey", "")),
+                        identity,
+                    ),
+                )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS completion_scope_order ON completions(namespace,created DESC,id DESC)"
+        )
         self.db.commit()
         self._mutation = asyncio.Lock()
         self._known = {}
@@ -55,9 +75,29 @@ class Inbox:
             return
         with self._lock, self.db:
             self.db.execute(
-                "INSERT OR IGNORE INTO completions VALUES (?,?,?,0)",
-                (item["id"], self.now(), json.dumps(item, ensure_ascii=False)),
+                "INSERT OR IGNORE INTO completions (id,created,payload,read,namespace) VALUES (?,?,?,0,?)",
+                (
+                    item["id"],
+                    self.now(),
+                    json.dumps(item, ensure_ascii=False),
+                    self._namespace(item["sessionKey"]),
+                ),
             )
+
+    @staticmethod
+    def _namespace(key):
+        parts = key.split(":", 2)
+        return parts[1] if len(parts) == 3 and parts[0] == "hermes" else ""
+
+    def _scope(self):
+        namespaces = getattr(self.source, "namespaces", None)
+        if namespaces is None:
+            return "1=1", []  # Source implementations without profile multiplexing.
+        try:
+            allowed = sorted(set(namespaces()))
+        except Exception:
+            allowed = []  # Losing the routing table must narrow the projection.
+        return "namespace IN (" + ",".join("?" for _ in allowed) + ")", allowed
 
     def _prune(self):
         cutoff = self.now() - RETENTION_MS
@@ -95,6 +135,9 @@ class Inbox:
             "observedAtMs": now,
             "available": available,
             "capabilities": self.source.capabilities(),
+            "authorizedNamespaces": self._scope()[1]
+            if hasattr(self.source, "namespaces")
+            else None,
             "pending": pending,
             "completed": done["items"],
             "completedNextBefore": done["nextBefore"],
@@ -105,7 +148,9 @@ class Inbox:
     async def completed(self, params):
         self._prune()
         before = params.get("before")
-        where, args = "", []
+        scope, scope_args = self._scope()
+        args = list(scope_args)
+        where = " WHERE " + scope
         if before is not None:
             if (
                 not isinstance(before, dict)
@@ -113,8 +158,8 @@ class Inbox:
                 or not isinstance(before.get("id"), str)
             ):
                 raise ValueError("invalid_result_cursor")
-            where = " WHERE created < ? OR (created = ? AND id < ?)"
-            args = [before["createdAtMs"], before["createdAtMs"], before["id"]]
+            where += " AND (created < ? OR (created = ? AND id < ?))"
+            args = args + [before["createdAtMs"], before["createdAtMs"], before["id"]]
         with self._lock:
             rows = list(
                 self.db.execute(
@@ -125,21 +170,30 @@ class Inbox:
                 )
             )
             total, unread = self.db.execute(
-                "SELECT count(*), coalesce(sum(read=0),0) FROM completions"
+                "SELECT count(*), coalesce(sum(read=0),0) FROM completions WHERE "
+                + scope,
+                scope_args,
             ).fetchone()
-        items = [
-            dict(json.loads(row[0]), read=bool(row[1]), createdAtMs=row[2])
-            for row in rows[:100]
-        ]
+        items, used = [], 0
+        for row in rows[:100]:
+            item = dict(json.loads(row[0]), read=bool(row[1]), createdAtMs=row[2])
+            size = len(json.dumps(item, ensure_ascii=False).encode("utf-8"))
+            if items and used + size > RESULT_PAGE_BYTES:
+                break
+            items.append(item)
+            used += size
         cursor = (
             {"id": items[-1]["id"], "createdAtMs": items[-1]["createdAtMs"]}
-            if len(rows) > 100
+            if len(rows) > len(items)
             else None
         )
         return {"items": items, "total": total, "unread": unread, "nextBefore": cursor}
 
     async def get(self, params):
-        item = await resolved(self.source.get(str(params.get("id") or "")))
+        try:
+            item = await resolved(self.source.get(str(params.get("id") or "")))
+        except Exception:
+            return {"status": "source_unavailable"}
         if item and item.get("sessionKey") != params.get("sessionKey"):
             return {"status": "not_found"}
         if not item:
@@ -152,7 +206,7 @@ class Inbox:
                 and known["expiresAtMs"] <= self.now()
             ):
                 return {"status": "expired"}
-            return {"status": "already_answered"}
+            return {"status": "already_answered" if known else "not_found"}
         self._known[item["id"]] = dict(item)
         if item.get("expiresAtMs") is not None and item["expiresAtMs"] <= self.now():
             return {"status": "expired"}
@@ -244,9 +298,11 @@ class Inbox:
             raise ValueError("invalid_answer")
 
     async def read(self, params):
+        scope, args = self._scope()
         with self._lock, self.db:
             self.db.execute(
-                "UPDATE completions SET read=1 WHERE id=?", (params.get("id"),)
+                "UPDATE completions SET read=1 WHERE id=? AND " + scope,
+                [params.get("id"), *args],
             )
         return {"status": "accepted"}
 

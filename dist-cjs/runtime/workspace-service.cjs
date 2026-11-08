@@ -19,14 +19,18 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
     "workspace.stt.transcribe",
   ]);
   const titles = new Map();
-  async function snapshot() {
-    const data = await bridge.request("inbox.snapshot", {});
-    const keys = new Set(
-      [...data.pending, ...data.completed].map((x) => x.sessionKey),
-    );
-    for (const key of keys) {
-      let cached = titles.get(key);
-      if (!cached || cached.until < now()) {
+  let snapshotPending = null,
+    closed = false;
+  const titleQueue = new Set(),
+    titleActive = new Set();
+  function hydrateTitles() {
+    if (closed) return;
+    while (titleActive.size < 4 && titleQueue.size) {
+      const key = titleQueue.values().next().value;
+      titleQueue.delete(key);
+      titleActive.add(key);
+      void (async () => {
+        let cached;
         try {
           const result = await bridge.request("sessions.list", {
             search: key,
@@ -38,17 +42,55 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
             title: row?.label || row?.displayName || key,
             until: now() + 30000,
           };
-          titles.set(key, cached);
         } catch {
           cached = { title: key, until: now() + 5000 };
-          titles.set(key, cached);
         }
-      }
-      for (const item of [...data.pending, ...data.completed])
-        if (item.sessionKey === key) item.sessionTitle = cached.title;
+        if (!closed) titles.set(key, cached);
+      })().finally(() => {
+        titleActive.delete(key);
+        hydrateTitles();
+      });
     }
-    for (const key of titles.keys()) if (!keys.has(key)) titles.delete(key);
-    return data;
+  }
+  function snapshot() {
+    if (snapshotPending) return snapshotPending;
+    const work = Promise.resolve()
+      .then(() => bridge.request("inbox.snapshot", {}))
+      .then((raw) => {
+        const decorate = (item) => {
+          const key = item.sessionKey,
+            cached = titles.get(key);
+          if ((!cached || cached.until < now()) && !titleActive.has(key))
+            titleQueue.add(key);
+          return {
+            ...item,
+            sessionTitle: cached?.title || item.sessionTitle || key,
+          };
+        };
+        const data = {
+          ...raw,
+          pending: raw.pending.map(decorate),
+          completed: raw.completed.map(decorate),
+        };
+        const live = new Set(
+          [...data.pending, ...data.completed].map((x) => x.sessionKey),
+        );
+        for (const key of titles.keys()) if (!live.has(key)) titles.delete(key);
+        for (const key of titleQueue)
+          if (!live.has(key)) titleQueue.delete(key);
+        hydrateTitles();
+        return data;
+      });
+    snapshotPending = work;
+    void work.then(
+      () => {
+        if (snapshotPending === work) snapshotPending = null;
+      },
+      () => {
+        if (snapshotPending === work) snapshotPending = null;
+      },
+    );
+    return work;
   }
   async function poll() {
     if (polling) return;
@@ -69,6 +111,7 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         data.unreadCompleted,
         data.completedTotal,
         data.capabilities,
+        data.authorizedNamespaces,
       ]);
       for (const [id, sub] of subscribers)
         if (sub.fingerprint !== fingerprint) {
@@ -110,7 +153,11 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
       if (frame.method === "inbox.subscribe") {
         if (!subscribers.has(clientId) && subscribers.size >= 32)
           throw Error("subscription_limit");
-        subscribers.set(clientId, { until: now() + 45000, fingerprint: "" });
+        const previous = subscribers.get(clientId);
+        subscribers.set(clientId, {
+          until: now() + 45000,
+          fingerprint: previous?.fingerprint || "",
+        });
         if (!timer) {
           timer = setInterval(poll, 2000);
           timer.unref?.();
@@ -157,6 +204,9 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
       subscribers.delete(id);
     },
     close() {
+      closed = true;
+      titleQueue.clear();
+      titles.clear();
       clearInterval(timer);
       subscribers.clear();
     },

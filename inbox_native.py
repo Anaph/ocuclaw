@@ -51,6 +51,12 @@ class NativeInboxSource:
             "resultsRetentionDays": 7,
         }
 
+    def namespaces(self):
+        from .adapter import _load_profile_routing
+
+        multiplex, routes = _load_profile_routing()
+        return {"main", *(routes if multiplex else ())}
+
     def _key(self, native_key):
         # The same admission table as the normal sessions plane. Never expose
         # a profile just because its pending request exists in this process.
@@ -59,10 +65,7 @@ class NativeInboxSource:
             if len(parts) != 3:
                 return None
             ns, rest = parts[1:]
-            from .adapter import _load_profile_routing
-
-            multiplex, routes = _load_profile_routing()
-            if ns != "main" and (not multiplex or ns not in routes):
+            if ns not in self.namespaces():
                 return None
             return (
                 self.adapter._public_key_for_native_session(native_key)

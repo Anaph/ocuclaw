@@ -8,6 +8,13 @@ status=0
 for t in tests_manual/test_*.py; do [ -e "$t" ] || continue; python3 "$t" || status=1; done
 if command -v node >/dev/null 2>&1; then
   for t in tests_manual/test_*.cjs; do [ -e "$t" ] || continue; node "$t" || status=1; done
+else
+  for t in tests_manual/test_*.cjs; do
+    [ -e "$t" ] || continue
+    echo "run_tests: Node.js is required for the bridge tests" >&2
+    status=1
+    break
+  done
 fi
 if [ -f scripts/check_dist_patch.sh ]; then sh scripts/check_dist_patch.sh || status=1; fi
 [ "$status" -eq 0 ] && echo "run_tests OK" || echo "run_tests FAILED"

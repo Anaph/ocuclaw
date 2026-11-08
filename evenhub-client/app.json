@@ -2,7 +2,7 @@
   "package_id": "com.anaph.ocuclawinbox",
   "edition": "202601",
   "name": "OcuClaw Inbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "min_sdk_version": "0.0.16",
   "min_app_version": "2.3.2",
   "entrypoint": "index.html",
@@ -16,5 +16,7 @@
       "desc": "Диктовка ответов агентам"
     }
   ],
-  "supported_languages": ["en"]
+  "supported_languages": [
+    "en"
+  ]
 }

@@ -23,7 +23,7 @@ and input buttons; the native microphone/display require Even Hub.
 The connection form takes the existing relay WebSocket address and credential.
 Prefer the HTTPS/WSS Tailscale endpoint configured for OcuClaw. The token stays in
 memory, not localStorage. Reconnect works while the runtime survives; a destroyed
-WebView needs a new connection. UI locations survive without saving message drafts
+WebView needs a new connection. UI locations and uncertain-operation receipts are scoped to the relay endpoint. Explicitly switching servers clears cached rows and drafts. UI locations survive without saving message drafts
 or credentials. Results and answer receipts remain on the server. A ws:// LAN URL
 is useful for tests; Android cleartext/mixed-content policies may reject it.
 
@@ -90,3 +90,20 @@ Dictation is limited to 17 seconds / 560,000 PCM bytes to stay below the existin
 control-link cap after WAV/base64 encoding. Longer replies can be typed. STT uses
 an existing configured Hermes provider and never installs a model. Delivery while
 the plugin is closed is not included. Results are paginated in pages of 100 with a global unread count; storage prunes at seven days. No pending question is resurrected from disk.
+
+## Connection and admission guarantees
+
+The client becomes ready only after protocol-v2 / Workspace-v1 negotiation and a
+validated initial snapshot. Invalid credentials stop reconnect attempts until an
+explicit new connection. A native question-source outage does not pretend the
+WebSocket disconnected, and does not discard uncertain answer receipts.
+
+Persisted results and unread counts are filtered by the currently admitted profile
+namespaces on every read. The 0.1.0 SQLite store is migrated in place with its read
+receipts preserved. Cached client rows from a revoked profile are also removed,
+including during a question-source outage. Result pages are bounded by both 100
+records and a UTF-8 byte budget; continuation cursors preserve the rest.
+
+Session-title enrichment is asynchronous and limited to four concurrent lookups.
+Slow title reads cannot block delivery of the question queue. Microphone stop is
+shared across simultaneous callers and retains tail PCM until native acknowledgment.

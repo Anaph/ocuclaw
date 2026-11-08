@@ -37,3 +37,18 @@ const {createDownstreamHandler}=require('../dist-cjs/runtime/downstream-handler.
  service.close();
  console.log('test_workspace_session_boundaries OK');
 })().catch(e=>{console.error(e);process.exitCode=1});
+
+(async()=>{
+ let resolveTitles;let reads=0;
+ const bridge={request:async(method)=>{
+   if(method==='inbox.snapshot'){reads++;return {version:1,pending:[{id:'q',sessionKey:'hermes:main:a',sessionTitle:'A'}],completed:[]};}
+   if(method==='sessions.list')return new Promise(resolve=>{resolveTitles=resolve;});
+ }};
+ const service=createWorkspaceService({bridge,sessions:{},send(){}});
+ const request=id=>service.request(id,{version:1,id,method:'inbox.subscribe'});
+ const results=await Promise.race([Promise.all([request('a'),request('b')]),new Promise((_,reject)=>setTimeout(()=>reject(Error('title hydration blocked inbox')),100))]);
+ assert.equal(reads,1);
+ assert.equal(JSON.parse(results[0].unicast).data.pending[0].id,'q');
+ resolveTitles({sessions:[]});service.close();
+ console.log('test_workspace_nonblocking_snapshot OK');
+})().catch(e=>{console.error(e);process.exitCode=1});

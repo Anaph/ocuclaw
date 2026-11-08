@@ -2963,3 +2963,18 @@ settles. Transcription never dispatches an agent message. Existing restrictions 
 foreign session mutation/dispatch remain enforced by the bridge.
 
 Workspace session reads opt into `originalText:true` on `sessions.list` / `db.sessions.list`. Only those responses retain original Cyrillic titles/previews; legacy callers retain the configured romanization projection.
+
+### Workspace review hardening
+
+Snapshots include optional `authorizedNamespaces` (null for nonmultiplexed custom
+sources). Persisted results, pagination counts and read mutations honor that live
+admission set; clients also evict cached rows outside it. Existing result stores
+are migrated additively with no reset of read receipts. Completed pages honor a
+192 KiB UTF-8 item budget as well as their row limit.
+
+Session-title reads are asynchronous, capped at four concurrent operations, and
+never gate snapshot delivery. Concurrent snapshot readers share an in-flight read.
+Client storage and answer receipts are scoped to the relay endpoint without query
+credentials; changing endpoints clears all session/question UI state. Protocol v2
+alone is not enough to enable commands: Workspace negotiation and a valid initial
+snapshot are required. A source outage remains distinct from a socket outage.

@@ -99,6 +99,20 @@ async def test():
         assert (await inbox.get({"id": "expired", "sessionKey": "hermes:main:a"}))[
             "status"
         ] == "expired"
+        # High UTF-8 content cannot overflow the control link on one results page.
+        for i in range(30):
+            inbox.completion(
+                {
+                    "id": f"unicode:{i:03}",
+                    "sessionKey": "hermes:main:a",
+                    "summary": "🧪" * 4000,
+                }
+            )
+        page = await inbox.completed({})
+        import json
+
+        assert len(json.dumps(page, ensure_ascii=False).encode()) < 300000
+        assert page["nextBefore"] is not None
         inbox.close()
 
 

@@ -20,6 +20,8 @@ export class Glasses {
   private bytes = 0;
   private recording = false;
   private off?: () => void;
+  private stopping: Promise<Uint8Array> | null = null;
+  constructor(private bridgeFactory = waitForEvenAppBridge) {}
   onInput: (v: Input) => void = () => {};
   onMenu: (id: number) => void = () => {};
   onLimit: () => void = () => {};
@@ -27,7 +29,7 @@ export class Glasses {
   async init() {
     if (new URLSearchParams(location.search).get("preview") === "1")
       throw Error("preview_mode");
-    const bridge = await waitForEvenAppBridge();
+    const bridge = await this.bridgeFactory();
     const result = await bridge.createStartUpPageContainer(createPage());
     if (result !== StartUpPageCreateResult.success)
       throw Error("G2 отклонили страницу");
@@ -103,30 +105,59 @@ export class Glasses {
   }
   async start() {
     if (!this.bridge) throw Error("Откройте клиент в Even Hub");
+    if (this.stopping) await this.stopping;
+    if (this.recording) throw Error("Запись уже идёт");
     this.pcm = [];
     this.bytes = 0;
     this.recording = true;
-    if (!(await this.bridge.audioControl(true, AudioInputSource.Glasses))) {
+    try {
+      if (!(await this.bridge.audioControl(true, AudioInputSource.Glasses)))
+        throw Error("Микрофон недоступен. Откройте плагин заново.");
+    } catch (error) {
       this.recording = false;
-      throw Error("Микрофон недоступен. Откройте плагин заново.");
+      this.pcm = [];
+      this.bytes = 0;
+      try {
+        await this.bridge.audioControl(false);
+      } catch {}
+      throw error;
     }
   }
   async stop() {
-    this.recording = false;
-    await this.bridge?.audioControl(false);
-    const result = new Uint8Array(this.bytes);
-    let at = 0;
-    for (const p of this.pcm) {
-      result.set(p, at);
-      at += p.length;
+    if (this.stopping) return this.stopping;
+    const work = (async () => {
+      try {
+        // Keep accepting tail PCM until the host acknowledges microphone stop.
+        if (this.bridge && !(await this.bridge.audioControl(false)))
+          throw Error(
+            "Остановка микрофона не подтверждена. Откройте плагин заново.",
+          );
+        const result = new Uint8Array(this.bytes);
+        let at = 0;
+        for (const part of this.pcm) {
+          result.set(part, at);
+          at += part.length;
+        }
+        return result;
+      } finally {
+        this.recording = false;
+        this.pcm = [];
+        this.bytes = 0;
+      }
+    })();
+    this.stopping = work;
+    try {
+      return await work;
+    } finally {
+      if (this.stopping === work) this.stopping = null;
     }
-    this.pcm = [];
-    this.bytes = 0;
-    return result;
   }
   async dispose() {
-    await this.stop();
-    this.off?.();
+    try {
+      await this.stop();
+    } finally {
+      this.off?.();
+    }
   }
 }
 export function wavBase64(pcm: Uint8Array) {

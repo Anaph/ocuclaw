@@ -218,7 +218,9 @@ test("session actions and completion read receipts are available without switchi
     socket.onMessage((raw) => {
       const f = JSON.parse(String(raw));
       if (f.type === "protocolHello") {
-        socket.send(JSON.stringify({ type: "protocolHelloAck" }));
+        socket.send(
+          JSON.stringify({ type: "protocolHelloAck", protocolVersion: "v2" }),
+        );
         return;
       }
       if (f.type !== "ocuclaw.workspace.request") return;
@@ -345,4 +347,96 @@ test("session actions and completion read receipts are available without switchi
     ),
   ).toBe(true);
   expect(calls.some((x) => x.method === "sessions.switch")).toBe(false);
+});
+
+test("switching VPS isolates cached results and uncertain receipts", async ({
+  page,
+}) => {
+  const calls: { server: string; method: string }[] = [];
+  await page.routeWebSocket("ws://127.0.0.1:47803/**", (socket) =>
+    socket.onMessage((raw) => {
+      const f = JSON.parse(String(raw));
+      const server = new URL(socket.url()).pathname;
+      if (f.type === "protocolHello") {
+        socket.send(
+          JSON.stringify({ type: "protocolHelloAck", protocolVersion: "v2" }),
+        );
+        return;
+      }
+      if (f.type !== "ocuclaw.workspace.request") return;
+      calls.push({ server, method: f.method });
+      let data: any = {};
+      if (f.method === "capabilities") data = { version: 1 };
+      if (f.method === "inbox.subscribe")
+        data = {
+          version: 1,
+          available: true,
+          capabilities: { allGatewayQuestions: true },
+          pending: [],
+          completed:
+            server === "/a"
+              ? [
+                  {
+                    id: "secret",
+                    sessionKey: "hermes:main:a",
+                    agentName: "A",
+                    sessionTitle: "Секрет сервера A",
+                    summary: "Приватный результат A",
+                    createdAtMs: Date.now(),
+                    read: false,
+                  },
+                ]
+              : [],
+        };
+      if (f.method === "inbox.operation") data = { status: "uncertain" };
+      if (f.method === "inbox.get") data = { status: "source_unavailable" };
+      socket.send(
+        JSON.stringify({
+          type: "ocuclaw.workspace.result",
+          version: 1,
+          id: f.id,
+          data,
+        }),
+      );
+    }),
+  );
+  await page.goto("/?preview=1");
+  await page.evaluate(() =>
+    sessionStorage.setItem(
+      "ocuclaw.pendingOperation:" +
+        encodeURIComponent("ws://127.0.0.1:47803/a"),
+      JSON.stringify({
+        operationId: "operation-a",
+        id: "q-a",
+        sessionKey: "hermes:main:a",
+      }),
+    ),
+  );
+  await page.getByLabel("Адрес сервера").fill("ws://127.0.0.1:47803/a");
+  await page.getByLabel("Ключ подключения").fill("test-a");
+  await page.getByRole("button", { name: "Подключить", exact: true }).click();
+  await expect(page.locator("#notice")).toContainText(
+    "Предыдущая отправка ещё не подтверждена",
+  );
+  expect(
+    await page.evaluate(() =>
+      sessionStorage.getItem(
+        "ocuclaw.pendingOperation:" +
+          encodeURIComponent("ws://127.0.0.1:47803/a"),
+      ),
+    ),
+  ).not.toBeNull();
+  await page.getByRole("button", { name: "Готово · 1", exact: true }).click();
+  await expect(page.locator("#actions")).toContainText("Секрет сервера A");
+  await page.locator("#setup summary").click();
+  await page.getByLabel("Адрес сервера").fill("ws://127.0.0.1:47803/b");
+  await page.getByLabel("Ключ подключения").fill("test-b");
+  await page.getByRole("button", { name: "Подключить", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Готово · 0", exact: true }),
+  ).toBeVisible();
+  await expect(page.locator("#actions")).not.toContainText("Секрет сервера A");
+  expect(
+    calls.filter((x) => x.server === "/b" && x.method === "inbox.operation"),
+  ).toEqual([]);
 });
