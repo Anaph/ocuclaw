@@ -17,6 +17,7 @@ if (!legacy) hudRoot.hidden = true;
 root.append(hudRoot);
 const hud = mountHud(relay, glasses, model, hudRoot);
 if (!legacy) {
+  (hudRoot.querySelector("#setup") as HTMLElement).hidden = true;
   const phoneRoot = document.createElement("section");
   root.prepend(phoneRoot);
   new PhoneApp(phoneRoot, relay, glasses, model, hud, hudRoot);

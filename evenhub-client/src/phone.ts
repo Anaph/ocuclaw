@@ -448,8 +448,15 @@ export class PhoneApp {
       session = this.data.sessions.find((x) => x.key === key),
       foreign = key.split(":")[2] === "x";
     const title =
-      session?.label || session?.displayName || session?.title || "Новый чат";
-    this.panel.innerHTML = `<div class="heading"><button id="chat-back">‹ Чаты</button><h1>${esc(title)}</h1><button id="on-glasses">На очки</button></div><div class="row" id="chat-actions"></div><div class="messages" role="log" aria-label="Переписка">${this.data.hasMore ? '<button id="older">Предыдущие сообщения</button>' : ""}${this.data.messages.map((message, i) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-meta">${esc(message.role === "user" ? "Вы" : message.role === "assistant" ? "Hermes" : message.role)}${this.showContext ? `<label><input type="checkbox" data-context="${i}" ${this.contextIds.has(String(message.id ?? i)) ? "checked" : ""}> В контекст задачи</label>` : ""}</div><div class="markdown">${markdown(messageText(message.content))}</div><button class="schedule-from" data-index="${i}">В расписание</button></article>`).join("")}${this.data.liveText ? `<article class="message assistant streaming"><div class="message-meta">Hermes · отвечает…</div><div class="markdown">${markdown(this.data.liveText)}</div></article>` : ""}</div><button id="latest">К новым сообщениям ↓</button>${foreign ? '<p class="muted">История открыта без смены владельца сессии. Продолжение и остановка доступны только через её штатный контроллер.</p>' : `<form id="compose-chat"><textarea id="message-input" aria-label="Сообщение Hermes" rows="3" placeholder="Сообщение Hermes…">${esc(this.data.draft())}</textarea><div id="attachment-list" class="row"></div><div class="row"><label class="file-button">Файл<input type="file" id="files" multiple></label><button type="button" id="gallery">Фото</button><button type="button" id="camera">Камера</button><button type="button" id="dictate">${this.recording ? "Завершить диктовку" : "Диктовать"}</button><button type="submit">Отправить</button></div></form>`}`;
+      session?.label ||
+      session?.displayName ||
+      session?.title ||
+      (key.includes(":x:cron:")
+        ? "Запуск задачи"
+        : foreign
+          ? "Чат Hermes"
+          : "Новый чат");
+    this.panel.innerHTML = `<div class="heading"><button id="chat-back">‹ Чаты</button><h1>${esc(title)}</h1><button id="on-glasses">На очки</button></div><div class="row" id="chat-actions"></div><div class="messages" role="log" aria-label="Переписка">${this.data.hasMore ? '<button id="older">Предыдущие сообщения</button>' : ""}${this.data.messages.map((message, i) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-meta">${esc(message.role === "user" ? "Вы" : message.role === "assistant" ? "Hermes" : message.role)}${this.showContext ? `<label><input type="checkbox" data-context="${i}" ${this.contextIds.has(String(message.id ?? i)) ? "checked" : ""}> В контекст задачи</label>` : ""}</div><div class="markdown">${markdown(messageText(message.content))}</div><button class="schedule-from" data-index="${i}">В расписание</button></article>`).join("")}${this.data.liveText ? `<article class="message assistant streaming"><div class="message-meta">Hermes · отвечает…</div><div class="markdown">${markdown(this.data.liveText)}</div></article>` : ""}</div><button id="latest">К новым сообщениям ↓</button>${foreign ? '<p class="muted">Это история отдельной сессии. Продолжение и остановка доступны там, где она запущена.</p>' : `<form id="compose-chat"><textarea id="message-input" aria-label="Сообщение Hermes" rows="3" placeholder="Сообщение Hermes…">${esc(this.data.draft())}</textarea><div id="attachment-list" class="row"></div><div class="row"><label class="file-button">Файл<input type="file" id="files" multiple></label><button type="button" id="gallery">Фото</button><button type="button" id="camera">Камера</button><button type="button" id="dictate">${this.recording ? "Завершить диктовку" : "Диктовать"}</button><button type="submit">Отправить</button></div></form>`}`;
     this.bind("#chat-back", async () => {
       this.data.chatKey = "";
       this.data.messages = [];
@@ -463,6 +470,19 @@ export class PhoneApp {
       el.scrollTop = el.scrollHeight;
     });
     const actions = this.panel.querySelector("#chat-actions")!;
+    if (key.includes(":x:cron:"))
+      actions.append(
+        this.button("Продолжить с результатом", async () => {
+          const context = [...this.data.messages]
+            .reverse()
+            .find((message) => message.role === "assistant");
+          const ns = key.split(":")[1];
+          await this.data.create(ns === "main" ? "default" : ns, "", "");
+          this.data.saveDraft(
+            `Результат предыдущего запуска:\n${messageText(context?.content).slice(0, 12000)}\n\nНовая задача: `,
+          );
+        }),
+      );
     if (this.data.pendingSend())
       actions.append(
         this.button("Проверить отправку", async () => {

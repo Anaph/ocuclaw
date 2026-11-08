@@ -363,6 +363,15 @@ test("schedule uses server preview before save, native pause/run and execution h
     path: "test-results/phone-chat-mobile.png",
     fullPage: true,
   });
+  await expect(
+    page.getByRole("heading", { name: "Запуск задачи", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Продолжить с результатом", exact: true })
+    .click();
+  await expect(page.getByLabel("Сообщение Hermes")).toHaveValue(
+    /Результат предыдущего запуска:/,
+  );
 });
 
 test("new chat keeps profile/model affinity and file-picker cancellation is harmless", async ({
