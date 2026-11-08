@@ -1602,7 +1602,9 @@ function createHermesGatewayBridge(opts) {
       const limit = toFiniteNumber(params && params.limit);
 
       const afterId = toFiniteNumber(params && params.afterId);
-      const beforeId = toFiniteNumber(params && params.beforeId);
+      const beforeValue = params && params.beforeId;
+      const beforeId = beforeValue == null || beforeValue === "" || typeof beforeValue === "boolean"
+        ? null : toFiniteNumber(beforeValue);
       const linkParams = {
         identity: keyToIdentity(params && params.sessionKey),
 

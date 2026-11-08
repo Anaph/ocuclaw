@@ -48,5 +48,11 @@ const {
   if (calls[0].params.beforeId !== undefined) throw new Error("beforeId leaked into legacy call");
   if ("hasMore" in res2 || "nextBeforeId" in res2) throw new Error("cursor keys leaked on legacy reply: " + JSON.stringify(res2));
 
+  for (const beforeId of [null, "", false]) {
+    calls.length = 0;
+    await bridge.request("chat.history", { sessionKey: "hermes:main:t1", beforeId });
+    if ("beforeId" in calls[0].params) throw new Error("invalid beforeId forwarded: " + String(beforeId));
+  }
+
   console.log("test_bridge_emu OK");
 })().catch((e) => { console.error("FAIL:", e.message); process.exit(1); });
