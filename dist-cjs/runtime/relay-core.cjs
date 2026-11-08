@@ -5061,7 +5061,14 @@ function createRelay(opts) {
       : null;
   }
 
+  const { createWorkspaceService } = require("./workspace-service.cjs");
+  const workspace = createWorkspaceService({
+    bridge: gatewayBridge,
+    sessions: sessionService,
+    send: (id, frame) => { if (server) server.unicast(id, JSON.stringify(frame)); },
+  });
   const handler = createDownstreamHandler({
+    onWorkspaceRequest: (clientId, frame) => workspace.request(clientId, frame),
     logger,
     externalDebugToolsEnabled,
     getGlassesUiLiveConfig: opts.getGlassesUiLiveConfig,
@@ -7560,6 +7567,7 @@ function createRelay(opts) {
     },
 
     onAppClientClosed(clientId     ) {
+      workspace.disconnect(clientId);
       inputPredictionService.onClientDisconnect(clientId);
 
       replyDelivery.forgetClient(clientId);

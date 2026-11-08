@@ -77,4 +77,8 @@ rpc._visible_search_row = lambda sid: old if sid == "90" else None
 res = rpc._sync_list({"search": "needle"})
 assert [s["id"] for s in res["sessions"]] == [90], res
 
+# The Cyrillic-capable opt-in client must retain original title/preview text.
+res = make_rpc(FakeDB(fts_enabled=False))._sync_list({"originalText": True})
+assert res["sessions"][1]["title"] == "Отчёт", res
+assert res["sessions"][1]["preview"] == "кварталы", res
 print("test_list_search_emu OK")

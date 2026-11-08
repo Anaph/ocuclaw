@@ -738,7 +738,9 @@ class SessionRpc:
 
     # -- wire shaping --------------------------------------------------------
 
-    def _row_to_wire(self, row: Dict[str, Any]) -> Dict[str, Any]:
+    def _row_to_wire(
+        self, row: Dict[str, Any], *, original_text: bool = False
+    ) -> Dict[str, Any]:
         wire = {
             "id": row.get("id"),
             "sessionKey": row.get("session_key"),
@@ -746,10 +748,12 @@ class SessionRpc:
             "lineageRootId": self._lineage_root_id(row),
             # REAL unix seconds — the Node bridge owns the ×1000 conversion.
             "lastActive": row.get("last_active"),
-            "title": maybe_romanize(row.get("title")),
+            "title": row.get("title") if original_text else maybe_romanize(row.get("title")),
             # Display projection, same as the title: the phone font lacks
             # Cyrillic glyphs (see title_romanize).
-            "preview": maybe_romanize(row.get("preview")),
+            "preview": (
+                row.get("preview") if original_text else maybe_romanize(row.get("preview"))
+            ),
             "messageCount": row.get("message_count"),
         }
         model = row.get("model")
@@ -868,7 +872,7 @@ class SessionRpc:
                 **hidden_kwargs,
             )
             wire = [
-                self._row_to_wire(row)
+                self._row_to_wire(row, original_text=p.get("originalText") is True)
                 for row in rows
                 if row.get("id") == tip and self._list_row_visible(row)
             ]
@@ -905,7 +909,10 @@ class SessionRpc:
                         or str(row.get("id")) in fts_ids)
 
             rows = [row for row in rows if _matches(row)][:limit]
-        wire = [self._row_to_wire(row) for row in rows]
+        wire = [
+            self._row_to_wire(row, original_text=p.get("originalText") is True)
+            for row in rows
+        ]
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
 

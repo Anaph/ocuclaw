@@ -1773,6 +1773,10 @@ def _on_session_end_hook(**kwargs: Any) -> None:
     thread). Routes into each live adapter's turn-completion glue."""
     for adapter in list(_ADAPTERS):
         try:
+            try:
+                adapter.record_inbox_completion(kwargs)
+            except Exception:
+                logger.exception("[ocuclaw] inbox completion observation failed")
             adapter.handle_session_end(kwargs)
         except Exception:  # noqa: BLE001 — a hook raise must never break turns
             logger.exception("[ocuclaw] on_session_end glue failed")
@@ -4894,6 +4898,12 @@ def _build_adapter(config: Any):
                 stale_turn_seconds=self._settings["staleTurnSeconds"],
             )
             self._session_status = SessionStatusObserver()
+            from .inbox import Inbox
+            from .inbox_native import NativeInboxSource
+            from hermes_constants import get_process_hermes_home
+            self._inbox_source = NativeInboxSource(self)
+            self._inbox = Inbox(Path(get_process_hermes_home()) / "state" / "ocuclaw-inbox.sqlite", self._inbox_source)
+
             self._phone_turn_candidate_gate = PhoneTurnCandidateGate()
             # The phone's session-name toggle over Hermes's own titler
             # (session_title_hold.py): sessions we held at llm provenance.
@@ -5315,6 +5325,8 @@ def _build_adapter(config: Any):
             # speak (the bridge may issue db.*/dispatch requests right after
             # the handshake completes).
             for method, handler in self._session_rpc.handlers().items():
+                link.register_request_handler(method, handler)
+            for method, handler in self._inbox.handlers().items():
                 link.register_request_handler(method, handler)
             # Observe the existing authorized profile fan-out; never broaden
             # its namespace or session visibility rules for status tracking.
@@ -5946,6 +5958,8 @@ def _build_adapter(config: Any):
                 "deadlineSec": deadline_s,
                 "expiresAtMs": int((time.time() + deadline_s) * 1000),
             }
+            presentation["createdAtMs"] = int(time.time() * 1000)
+            self._inbox_source.remember(str(session_key), presentation)
             try:
                 self._session_status.observe_clarify(str(session_key), presentation)
             except Exception:  # observation must not change native delivery
@@ -10534,6 +10548,33 @@ def _build_adapter(config: Any):
             return result
 
         # -- turn completion (hermes on_session_end, sync, worker thread) ----
+
+        def record_inbox_completion(self, kwargs: Dict[str, Any]) -> None:
+            # Public finalizer hook covers Desktop and OcuClaw on this gateway.
+            if not kwargs.get("completed") or kwargs.get("interrupted") or self._delivery_is_cancelled():
+                return
+            session_id = str(kwargs.get("session_id") or "")
+            if not session_id:
+                return
+            row = self._session_rpc.row_by_id(session_id)
+            if not row or row.get("source") in ("tool", "cron", "subagent"):
+                return
+            key = self._inbox_source._key(str(row.get("session_key") or session_id))
+            if not key:
+                return
+            messages = self._session_rpc.conversation_by_id(session_id, limit=4)
+            tail = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
+            if tail is None or tail.get("id") is None:
+                return  # No fabricated run identity: a later observable completion may supply it.
+            content = tail.get("content")
+            if isinstance(content, list):
+                content = "\n".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+            self._inbox.completion({
+                "id": "result:" + session_id + ":" + str(tail["id"]),
+                "sessionKey": key, "agentName": key.split(":")[1],
+                "sessionTitle": row.get("title") or key,
+                "summary": str(content or "")[:4000],
+            })
 
         def handle_session_end(self, kwargs: Dict[str, Any]) -> None:
             # Tier 0 (T2 #2510) clears BEFORE the platform filter.

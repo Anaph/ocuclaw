@@ -2921,3 +2921,45 @@ an old live gateway. A CLI invocation observes its own loaded package.
 The shared health collector serves adapter/CLI/dashboard/support/setup/Cloudways/
 uninstall calls. Desktop's periodic POST /fleet/snapshot only publishes the
 presenter's fleet inventory; it never calls the connection-health collector.
+
+## Opt-in Workspace v1 / Inbox client
+
+The `evenhub-client/` web app uses the existing token-authenticated relay socket
+and `protocolHello` v2 with `clientCapabilities:["workspaceV1"]`.
+Legacy frames and the currently selected relay session do not change.
+
+Request: `{type:"ocuclaw.workspace.request",version:1,id,method,params}`.
+Response: `{type:"ocuclaw.workspace.result",version:1,id,data}`; refusals contain
+`data.error`. An allowlist excludes arbitrary management RPCs.
+`capabilities` negotiates version 1. `inbox.subscribe` returns a snapshot and leases
+a per-client subscription for 45 s (renew at 15 s). Reconciliation runs every 2 s
+while subscribers exist. Changes are unicast as
+`{type:"ocuclaw.workspace.changed",version:1,data:<snapshot>}`. Disconnect forgets
+the subscription; reconnect obtains a fresh source snapshot.
+
+Methods: `inbox.snapshot`, `inbox.get {id,sessionKey}`,
+`inbox.answer {id,sessionKey,operationId,answer}`,
+`inbox.operation {operationId}`, `inbox.read {id}`.
+Answers are exactly one of `{indices:[...]}`, `{text:"..."}` or, for a permission,
+`{decision:"..."}`. Source choices govern permission decisions.
+Snapshots contain `pending`, `completed`, `available`, `observedAtMs` and native
+coverage capabilities. Outcomes distinguish `accepted`, `already_answered`,
+`expired`, `not_found`, `source_unavailable`, `uncertain`.
+An operation id binds the full session/request/answer fingerprint. A receipt is
+persisted BEFORE resolution as uncertain, then committed. Repeats never invoke
+the native resolver twice; after a lost acknowledgment query the original receipt.
+
+`inbox.py` persists results/receipts in `state/ocuclaw-inbox.sqlite` (0600), retained
+seven days. Questions are rechecked against the public native source. Known
+original deadlines classify expirations without re-registering a request.
+Results are newest-first in pages of 100. `inbox.completed {before?}` returns items, total/unread counts and a nextBefore cursor; read state is independent of session unread.
+
+Workspace also allows `sessions.list`, `sessions.patch`, `sessions.abort`,
+`chat.history`, `agent`, plus `sessions.pin`, `sessions.create` (detached key,
+materialized by first send), `workspace.stt.providers`, and
+`workspace.stt.transcribe {wav,provider,model?,language?}`. A bounded WAV is spilled
+privately with the existing STT prefix and discarded after the native STT lane
+settles. Transcription never dispatches an agent message. Existing restrictions on
+foreign session mutation/dispatch remain enforced by the bridge.
+
+Workspace session reads opt into `originalText:true` on `sessions.list` / `db.sessions.list`. Only those responses retain original Cyrillic titles/previews; legacy callers retain the configured romanization projection.

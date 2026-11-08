@@ -1,3 +1,10 @@
 config.yaml
 __pycache__/
 *.pyc
+
+# Own Even Hub client: source and lockfile are tracked, dependencies/output are not.
+/evenhub-client/node_modules/
+/evenhub-client/dist/
+/evenhub-client/*.ehpk
+/evenhub-client/test-results/
+/evenhub-client/playwright-report/

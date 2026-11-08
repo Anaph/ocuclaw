@@ -7615,6 +7615,11 @@ function createDownstreamHandler(opts) {
       }
 
       switch (msg.type) {
+        case "ocuclaw.workspace.request":
+          return typeof opts.onWorkspaceRequest === "function"
+            ? opts.onWorkspaceRequest(clientId, msg)
+            : {unicast: JSON.stringify({type:"ocuclaw.workspace.result",id:msg.id,version:1,data:{error:"unsupported_operation"}})};
+
         case "ocuclaw.optional.setup.request": {
           const request = parseOptionalSetupRequest(msg);
           const respond = (result) => ({ unicast: JSON.stringify({ type: "ocuclaw.optional.setup.result", ...result }) });

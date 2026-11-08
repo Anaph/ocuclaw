@@ -753,7 +753,25 @@ function createHermesGatewayBridge(opts) {
     return ack;
   }
 
+  const workspaceMethods = Object.fromEntries(
+    ["snapshot", "completed", "get", "answer", "operation", "read"].map(name => [
+      `inbox.${name}`, params => link.request(`inbox.${name}`, params || {}, DB_READ_TIMEOUT)
+    ])
+  );
   const translators = {
+    ...workspaceMethods,
+    async "workspace.stt.providers"() { return link.request("stt.capabilities.list", {}); },
+    async "workspace.stt.transcribe"(params) {
+      const content = params && params.wav;
+      if (typeof content !== "string" || content.length > 800000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(content)) throw Error("invalid_audio");
+      const file = await writeLinkSpillFile(content, {prefix:"ocuclaw-stt-"});
+      try {
+        return await link.request("stt.transcribe", {
+          provider:params.provider, language:params.language || "ru", model:params.model,
+          audio:{format:"wav",sampleRateHz:16000,channels:1,path:file}
+        }, {timeoutMs:60000});
+      } finally { discardLinkSpillFile(file); }
+    },
 
     ...createHermesInputPredictionTranslators({ link }),
     async agent(params) {
@@ -1329,6 +1347,7 @@ function createHermesGatewayBridge(opts) {
 
     async "sessions.list"(params) {
       const linkParams = {};
+      if (params && params.originalText === true) linkParams.originalText = true;
       const limit = toFiniteNumber(params && params.limit);
       if (limit !== null && limit > 0) linkParams.limit = Math.floor(limit);
       const search =
