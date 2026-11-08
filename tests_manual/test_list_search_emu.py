@@ -65,4 +65,16 @@ assert [s["id"] for s in res["sessions"]] == [2], res
 res = make_rpc(FakeDB(raise_on_search=True))._sync_list({"search": "not"})
 assert [s["id"] for s in res["sessions"]] == [1], res
 
+# A transliteration that disappears must not match every session.
+res = make_rpc(FakeDB(fts_enabled=False))._sync_list({"search": "ь"})
+assert res["sessions"] == [], res
+
+# FTS results outside the recent-session window must still be included.
+old = {"id": 90, "session_key": "old", "source": "cli", "last_active": 1,
+       "title": "Old", "preview": "", "message_count": 1}
+rpc = make_rpc(FakeDB(hits=[{"session_id": 90}]))
+rpc._visible_search_row = lambda sid: old if sid == "90" else None
+res = rpc._sync_list({"search": "needle"})
+assert [s["id"] for s in res["sessions"]] == [90], res
+
 print("test_list_search_emu OK")

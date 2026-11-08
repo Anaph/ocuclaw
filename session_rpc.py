@@ -860,29 +860,28 @@ class SessionRpc:
             project_compression_tips=True,
         )
         rows = [row for row in rows if self._list_row_visible(row)]
-        rows = self._dedupe_by_session_key(rows)
-        wire = [self._row_to_wire(row) for row in rows]
         if search:
-            # A Cyrillic search term must still hit the romanized display title.
+            # Include FTS matches outside the bounded recent-session scan.
+            # Search raw text as well as the display projection: transliteration
+            # is lossy (e.g. the Russian soft sign becomes an empty string).
+            fts_rows = self._fts_session_rows(search)
+            known_ids = {str(row.get("id")) for row in rows}
+            rows.extend(row for row in fts_rows if str(row.get("id")) not in known_ids)
+            rows.sort(key=lambda row: float(row.get("last_active") or 0), reverse=True)
+        rows = self._dedupe_by_session_key(rows)
+        if search:
             search_alt = maybe_romanize(search)
-            # Title/preview substring UNIONed with sessions whose MESSAGES
-            # match the host's FTS index (the db.sessions.search capability,
-            # reused read-only). Degrades to substring-only whenever FTS is
-            # unavailable or errors -- never fails the list.
-            fts_ids = self._fts_session_ids(search)
+            fts_ids = {str(row.get("id")) for row in fts_rows}
 
-            def _matches(w: Dict[str, Any]) -> bool:
-                title = (w.get("title") or "").lower()
-                preview = (w.get("preview") or "").lower()
-                return (
-                    search in title
-                    or search in preview
-                    or search_alt in title
-                    or search_alt in preview
-                    or str(w.get("id")) in fts_ids
-                )
+            def _matches(row: Dict[str, Any]) -> bool:
+                raw = ((row.get("title") or "") + "\n" + (row.get("preview") or "")).lower()
+                display = maybe_romanize(raw)
+                return (search in raw or search in display
+                        or bool(search_alt and search_alt in display)
+                        or str(row.get("id")) in fts_ids)
 
-            wire = [w for w in wire if _matches(w)][:limit]
+            rows = [row for row in rows if _matches(row)][:limit]
+        wire = [self._row_to_wire(row) for row in rows]
         # Dedupe can shrink a no-search page below limit; accepted for now.
         return {"sessions": wire}
 
@@ -954,9 +953,10 @@ class SessionRpc:
             None,
         )
 
-    def _fts_session_ids(self, query: str) -> set:
-        """Session-tip ids whose MESSAGES match `query` in the host's FTS5
-        index, projected to visible compression tips. Empty set (never an
+    def _fts_session_rows(self, query: str) -> List[Dict[str, Any]]:
+        """Visible session-tip rows whose messages match the host FTS index.
+
+        Empty list (never an
         exception) when the index is unavailable: db.sessions.list search
         must degrade to substring mode, not fail.
 
@@ -967,7 +967,7 @@ class SessionRpc:
         try:
             db = self._get_reader()
             if not bool(getattr(db, "_fts_enabled", False)):
-                return set()
+                return []
             matches = db.search_messages(
                 self._search_query(query),
                 exclude_sources=list(DENY_SOURCES),
@@ -977,7 +977,7 @@ class SessionRpc:
                 fields=("session_id",),
             )
             projected: Dict[str, Optional[Dict[str, Any]]] = {}
-            tips = set()
+            tips: Dict[str, Dict[str, Any]] = {}
             for match in matches:
                 raw = str(match.get("session_id") or "")
                 if not raw:
@@ -986,12 +986,12 @@ class SessionRpc:
                     projected[raw] = self._visible_search_row(raw)
                 row = projected[raw]
                 if row is not None:
-                    tips.add(str(row.get("id")))
-            return tips
+                    tips[str(row.get("id"))] = row
+            return list(tips.values())
         except Exception:
             logger.debug("list search: FTS union unavailable; substring-only",
                          exc_info=True)
-            return set()
+            return []
 
     @_session_operation
     def _sync_search(self, params: Any) -> Dict[str, Any]:
