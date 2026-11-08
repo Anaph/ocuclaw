@@ -35,6 +35,30 @@ export class Relay {
   private subscription: Promise<void> | null = null;
   private snapshot: Snapshot | null = null;
   private timing: Timing;
+  capabilities: Record<string, any> = {};
+  private observers = new Set<{
+    snapshot?: (v: Snapshot) => void;
+    state?: (v: boolean) => void;
+    error?: (v: string) => void;
+    chat?: (v: any) => void;
+  }>();
+  observe(observer: {
+    snapshot?: (v: Snapshot) => void;
+    state?: (v: boolean) => void;
+    error?: (v: string) => void;
+    chat?: (v: any) => void;
+  }) {
+    this.observers.add(observer);
+    return () => this.observers.delete(observer);
+  }
+  private emitSnapshot(value: Snapshot) {
+    this.onSnapshot(value);
+    for (const observer of this.observers) observer.snapshot?.(value);
+  }
+  private emitError(value: string) {
+    this.onError(value);
+    for (const observer of this.observers) observer.error?.(value);
+  }
   onSnapshot: (value: Snapshot) => void = () => {};
   onState: (online: boolean) => void = () => {};
   onError: (message: string) => void = () => {};
@@ -71,6 +95,7 @@ export class Relay {
     if (this.online !== online) {
       this.online = online;
       this.onState(online);
+      for (const observer of this.observers) observer.state?.(online);
     }
   }
   private clearTimers() {
@@ -94,7 +119,7 @@ export class Relay {
     const stop = (message: string, terminal = false) => {
       if (!this.active(generation, socket)) return;
       this.terminal = terminal;
-      this.onError(message);
+      this.emitError(message);
       socket.close();
     };
     this.handshake = setTimeout(
@@ -108,7 +133,7 @@ export class Relay {
           type: "protocolHello",
           supportedProtocolVersions: ["v2"],
           clientName: "ocuclaw-inbox",
-          clientVersion: "0.1.1",
+          clientVersion: "0.2.0",
           clientCapabilities: ["workspaceV1"],
         }),
       );
@@ -149,13 +174,21 @@ export class Relay {
       ) {
         if (isSnapshot(frame.data)) {
           this.snapshot = frame.data;
-          this.onSnapshot(frame.data);
+          this.emitSnapshot(frame.data);
         } else stop("Некорректный снимок Входящих");
       }
       if (frame.type === "ocuclaw.workspace.unavailable" && this.snapshot) {
         this.snapshot = { ...this.snapshot, available: false };
-        this.onSnapshot(this.snapshot);
+        this.emitSnapshot(this.snapshot);
       }
+      if (
+        frame.type === "ocuclaw.workspace.chat" &&
+        this.online &&
+        frame.version === 1 &&
+        frame.data &&
+        typeof frame.data.sessionKey === "string"
+      )
+        for (const observer of this.observers) observer.chat?.(frame);
       if (frame.type === "error" && !this.online) {
         stop("Обновите сервер: Workspace v1 недоступен", true);
         return;
@@ -179,7 +212,7 @@ export class Relay {
       this.rejectPending("Соединение потеряно; проверьте результат операции");
       if (event.code === 4001 || event.code === 1008) {
         this.terminal = true;
-        this.onError(
+        this.emitError(
           event.code === 4001
             ? "Ключ подключения отклонён"
             : "Сервер отклонил протокол подключения",
@@ -207,6 +240,7 @@ export class Relay {
             this.timing.handshake,
           );
           if (!this.active(generation, socket)) return;
+          this.capabilities = cap || {};
           if (cap?.version !== 1) {
             this.terminal = true;
             throw Error("Сервер не поддерживает Workspace v1");
@@ -221,11 +255,11 @@ export class Relay {
         }
         this.snapshot = snapshot;
         this.state(true);
-        this.onSnapshot(snapshot);
+        this.emitSnapshot(snapshot);
       } catch (error) {
         if (!this.active(generation, socket)) return;
         this.state(false);
-        this.onError((error as Error).message);
+        this.emitError((error as Error).message);
         // A non-compatible server needs an explicit reconnect after update.
         if ((error as Error).message === "unsupported_operation")
           this.terminal = true;

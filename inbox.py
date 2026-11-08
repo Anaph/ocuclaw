@@ -78,7 +78,7 @@ class Inbox:
                 "INSERT OR IGNORE INTO completions (id,created,payload,read,namespace) VALUES (?,?,?,0,?)",
                 (
                     item["id"],
-                    self.now(),
+                    min(self.now(), int(item.get("createdAtMs") or self.now())),
                     json.dumps(item, ensure_ascii=False),
                     self._namespace(item["sessionKey"]),
                 ),
@@ -108,7 +108,7 @@ class Inbox:
     async def snapshot(self, _params=None):
         self._prune()
         try:
-            items = await resolved(self.source.snapshot())
+            items = await resolved(await asyncio.to_thread(self.source.snapshot))
             available = True
         except Exception:
             items, available = [], False
@@ -129,6 +129,13 @@ class Inbox:
                 x["id"],
             )
         )
+        collect = getattr(self.source, "completions", None)
+        if collect:
+            try:
+                for result in await resolved(await asyncio.to_thread(collect)):
+                    self.completion(result)
+            except Exception:
+                pass  # Pending questions remain usable if result storage is temporarily unavailable.
         done = await self.completed({})
         return {
             "version": 1,

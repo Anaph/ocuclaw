@@ -4901,6 +4901,8 @@ def _build_adapter(config: Any):
             from .inbox import Inbox
             from .inbox_native import NativeInboxSource
             from hermes_constants import get_process_hermes_home
+            from .workspace_dispatch import WorkspaceDispatch
+            self._workspace_sends = WorkspaceDispatch(Path(get_process_hermes_home()) / "state" / "ocuclaw-workspace-sends.sqlite")
             self._inbox_source = NativeInboxSource(self)
             self._inbox = Inbox(Path(get_process_hermes_home()) / "state" / "ocuclaw-inbox.sqlite", self._inbox_source)
 
@@ -5326,6 +5328,12 @@ def _build_adapter(config: Any):
             # the handshake completes).
             for method, handler in self._session_rpc.handlers().items():
                 link.register_request_handler(method, handler)
+            from .workspace_schedule import WorkspaceSchedule
+            self._workspace_schedule = WorkspaceSchedule(self._gw_rpc, self._session_rpc)
+            link.register_request_handler("workspace.schedule", self._workspace_schedule.handle)
+            link.register_request_handler("workspace.models", self._workspace_schedule.models)
+            link.register_request_handler("workspace.send.receipt", self.handle_workspace_send_receipt)
+            link.register_request_handler("workspace.cron.history", self._workspace_schedule.chat_history)
             for method, handler in self._inbox.handlers().items():
                 link.register_request_handler(method, handler)
             # Observe the existing authorized profile fan-out; never broaden
@@ -6156,6 +6164,15 @@ def _build_adapter(config: Any):
 
         async def handle_dispatch(self, params: Any) -> Dict[str, Any]:
             p = params if isinstance(params, dict) else {}
+            if "workspaceOperationId" in p:
+                ns, _, route_error = self._target_chat(p)
+                route_error = route_error or self._namespace_route_error(ns)
+                if route_error:
+                    self._discard_attachment_spills(p.get("attachments"))
+                    return {"status": "rejected", "error": route_error}
+                return await self._workspace_sends.send(
+                    p, self.handle_dispatch, self._discard_attachment_spills
+                )
             attachments = p.get("attachments")
             run_id = str(p.get("runId") or "").strip()
             if not run_id:
@@ -9396,6 +9413,12 @@ def _build_adapter(config: Any):
             if not mark_awaiting_text(clarify_id):
                 return {"status": "ignored", "reason": "clarify not pending"}
             return {"status": "accepted"}
+
+        async def handle_workspace_send_receipt(self, params: Any) -> Dict[str, Any]:
+            ns, _, error = self._target_chat(params)
+            if error or self._namespace_route_error(ns):
+                return {"status": "source_unavailable"}
+            return await self._workspace_sends.receipt(params)
 
         async def handle_sessions_abort(self, params: Any) -> Dict[str, Any]:
             p = params if isinstance(params, dict) else {}

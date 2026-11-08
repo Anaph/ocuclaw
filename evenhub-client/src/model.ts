@@ -17,6 +17,9 @@ export interface Question {
   createdAtMs: number;
 }
 export interface Completion {
+  jobId?: string;
+  executionId?: string;
+  profileId?: string;
   id: string;
   sessionKey: string;
   agentName: string;
@@ -47,6 +50,7 @@ export interface Session {
   title?: string;
   updatedAt?: number;
   pinned?: boolean;
+  hidden?: boolean;
   agentStatus?: {
     needsYou?: boolean;
     working?: boolean;

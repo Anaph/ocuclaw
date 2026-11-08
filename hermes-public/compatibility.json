@@ -1,0 +1,13 @@
+{
+  "hermesVersion": "0.21.1",
+  "tag": "v2026.9.7",
+  "commit": "2237be355906fbe6065ce1815711eee52b2d646e",
+  "sdk": "0.0.16",
+  "sources": {
+    "cron/jobs.py": "782350ffcf16ee9e48631d08435844bd551a8fc651321db8aadbb73c4a269731",
+    "cron/scheduler.py": "58f3ee95e068214fbc5f6f37c01eb10717009a7c00f552a75475ff42d5031692",
+    "tools/clarify_gateway.py": "ffce5289e27ebd022494d893c38e866f6a1dae33e1991ccd9503f72a04e0ffab",
+    "tools/approval.py": "e48f1909968b253907fca01e9dad0593bee7a2bf7cf5278470c6d15a5150359f",
+    "cron/executions.py": "0c774e55bb1ccbfcf0478d1d7a4a6efee8bdb5a9ca23f71d644aa92ca69a2341"
+  }
+}

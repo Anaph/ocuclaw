@@ -14,11 +14,19 @@ import {
 export type Input = "up" | "down" | "select" | "back" | "menu";
 export class Glasses {
   bridge: Awaited<ReturnType<typeof waitForEvenAppBridge>> | null = null;
+  displayReady = false;
+  phoneInteracting = false;
+  get isRecording() {
+    return this.recording;
+  }
+  onDevice: (connected: boolean) => void = () => {};
+  private connecting: Promise<void> | null = null;
   private queue = Promise.resolve();
   private desired: HTMLCanvasElement | null = null;
   private pcm: Uint8Array[] = [];
   private bytes = 0;
   private recording = false;
+  private limitHandler: () => void = () => {};
   private off?: () => void;
   private stopping: Promise<Uint8Array> | null = null;
   constructor(private bridgeFactory = waitForEvenAppBridge) {}
@@ -30,10 +38,29 @@ export class Glasses {
     if (new URLSearchParams(location.search).get("preview") === "1")
       throw Error("preview_mode");
     const bridge = await this.bridgeFactory();
-    const result = await bridge.createStartUpPageContainer(createPage());
-    if (result !== StartUpPageCreateResult.success)
-      throw Error("G2 отклонили страницу");
     this.bridge = bridge;
+    const connectDisplay = async () => {
+      if (this.connecting) return this.connecting;
+      const work = (async () => {
+        const result = await bridge.createStartUpPageContainer(createPage());
+        this.displayReady = result === StartUpPageCreateResult.success;
+        this.onDevice(this.displayReady);
+      })();
+      this.connecting = work;
+      try {
+        await work;
+      } finally {
+        this.connecting = null;
+      }
+    };
+    bridge.onDeviceStatusChanged?.((status) => {
+      if (status.connectType === "connected")
+        void connectDisplay().catch((error) => this.onError(error.message));
+      else {
+        this.displayReady = false;
+        this.onDevice(false);
+      }
+    });
     this.off = bridge.onEvenHubEvent((event) => {
       if (event.menuItemClickEvent?.itemID) {
         this.onMenu(event.menuItemClickEvent.itemID);
@@ -42,7 +69,7 @@ export class Glasses {
       if (event.audioEvent && this.recording) {
         const part = new Uint8Array(event.audioEvent.audioPcm);
         if (this.bytes + part.length > 560000) {
-          this.onLimit();
+          this.limitHandler();
           return;
         }
         this.pcm.push(part);
@@ -59,6 +86,7 @@ export class Glasses {
       else if (type === OsEventTypeList.CLICK_EVENT || type === undefined)
         this.onInput("select");
     });
+    await connectDisplay();
   }
   paint(canvas: HTMLCanvasElement) {
     this.desired = canvas;
@@ -66,7 +94,7 @@ export class Glasses {
       .then(async () => {
         const next = this.desired;
         this.desired = null;
-        if (!next || !this.bridge) return;
+        if (!next || !this.bridge || !this.displayReady) return;
         for (let i = 0; i < 4; i++) {
           const tile = document.createElement("canvas");
           tile.width = 288;
@@ -103,15 +131,19 @@ export class Glasses {
       })
       .catch((e) => this.onError(String(e.message)));
   }
-  async start() {
+  async start(
+    source: AudioInputSource = AudioInputSource.Glasses,
+    onLimit = this.onLimit,
+  ) {
     if (!this.bridge) throw Error("Откройте клиент в Even Hub");
     if (this.stopping) await this.stopping;
     if (this.recording) throw Error("Запись уже идёт");
     this.pcm = [];
     this.bytes = 0;
     this.recording = true;
+    this.limitHandler = onLimit;
     try {
-      if (!(await this.bridge.audioControl(true, AudioInputSource.Glasses)))
+      if (!(await this.bridge.audioControl(true, source)))
         throw Error("Микрофон недоступен. Откройте плагин заново.");
     } catch (error) {
       this.recording = false;
@@ -217,6 +249,7 @@ export function createPage() {
         new MenuItemProperty({ itemID: 101, itemName: "Inbox" }),
         new MenuItemProperty({ itemID: 102, itemName: "Sessions" }),
         new MenuItemProperty({ itemID: 103, itemName: "Actions" }),
+        new MenuItemProperty({ itemID: 104, itemName: "Schedule" }),
       ],
     }),
   });

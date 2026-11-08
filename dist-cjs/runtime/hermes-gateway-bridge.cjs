@@ -692,6 +692,7 @@ function createHermesGatewayBridge(opts) {
           : "",
     };
 
+    if (params && typeof params.workspaceOperationId === "string") dispatchParams.workspaceOperationId = params.workspaceOperationId;
     if (params && typeof params.idempotencyKey === "string" && params.idempotencyKey) {
       dispatchParams.idempotencyKey = params.idempotencyKey;
     }
@@ -760,6 +761,9 @@ function createHermesGatewayBridge(opts) {
   );
   const translators = {
     ...workspaceMethods,
+    "workspace.models": params => link.request("workspace.models",params || {},DB_READ_TIMEOUT),
+    "workspace.cron.history": params => link.request("workspace.cron.history", params || {}, DB_READ_TIMEOUT),
+    "workspace.schedule": params => link.request("workspace.schedule", params || {}, {timeoutMs:60000}),
     async "workspace.stt.providers"() { return link.request("stt.capabilities.list", {}); },
     async "workspace.stt.transcribe"(params) {
       const content = params && params.wav;
@@ -774,6 +778,8 @@ function createHermesGatewayBridge(opts) {
     },
 
     ...createHermesInputPredictionTranslators({ link }),
+    "workspace.send.receipt": params => { const route=keyToMintedTarget(params?.sessionKey,"sessionKey"); return link.request("workspace.send.receipt",{...params,target:route.target},DB_READ_TIMEOUT); },
+    async "workspace.send"(params) { return dispatchTurn({...params,workspaceOperationId:params.idempotencyKey}); },
     async agent(params) {
       return dispatchTurn(params);
     },
@@ -1348,6 +1354,7 @@ function createHermesGatewayBridge(opts) {
     async "sessions.list"(params) {
       const linkParams = {};
       if (params && params.originalText === true) linkParams.originalText = true;
+      if (params && params.includeHidden === true) linkParams.includeHidden = true;
       const limit = toFiniteNumber(params && params.limit);
       if (limit !== null && limit > 0) linkParams.limit = Math.floor(limit);
       const search =
@@ -1568,7 +1575,7 @@ function createHermesGatewayBridge(opts) {
         structured = await pending;
         if (structured && structured.status === "unsupported") {
 
-          const fallback = sessionOptionsFallbackCommands(options);
+          const fallback = sessionOptionsFallbackCommands(options).map(command => params?.perSessionOnly === true && command.startsWith("/model ") ? `${command} --session` : command);
           logger.warn(
             `[hermes-bridge] structured session options unsupported on this Hermes; falling back to ${fallback.join(", ")}`,
           );

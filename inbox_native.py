@@ -109,7 +109,15 @@ class NativeInboxSource:
         if callable(enumerate_pending):
             entries = enumerate_pending()
         else:
-            entries = [native.get_pending(key) for key in list(self.presentations)]
+            lookup = getattr(native, "get_pending", None)
+            entries = [
+                lookup(key)
+                if callable(lookup)
+                else native.get_pending_for_session(
+                    row["nativeKey"], include_choice_prompts=True
+                )
+                for key, row in list(self.presentations.items())
+            ]
         out = [item for entry in entries if (item := self._question(entry)) is not None]
         now = int(time.time() * 1000)
         with self.adapter._approval_lock:
@@ -167,13 +175,22 @@ class NativeInboxSource:
                     )
         except ImportError:
             pass
+        schedule = getattr(self.adapter, "_workspace_schedule", None)
+        if schedule:
+            out.extend(schedule.pending_questions())
         return out
+
+    def completions(self):
+        schedule = getattr(self.adapter, "_workspace_schedule", None)
+        return schedule.completions() if schedule else []
 
     def get(self, item_id):
         if item_id.startswith("question:"):
-            return self._question(
-                self.native().get_pending(item_id.removeprefix("question:"))
-            )
+            native = self.native()
+            lookup = getattr(native, "get_pending", None)
+            if callable(lookup):
+                return self._question(lookup(item_id.removeprefix("question:")))
+            return next((x for x in self.snapshot() if x["id"] == item_id), None)
         return next((x for x in self.snapshot() if x["id"] == item_id), None)
 
     async def resolve(self, item_id, answer):
@@ -213,5 +230,12 @@ class NativeInboxSource:
                 if item["multiSelect"]
                 else labels[0]
             )
-        ok = self.native().resolve_gateway_clarify(item["sourceId"], text)
+        if item_id.startswith("scheduled-question:"):
+            import asyncio
+
+            ok = await asyncio.to_thread(
+                self.adapter._workspace_schedule.resolve_question, item, text
+            )
+        else:
+            ok = self.native().resolve_gateway_clarify(item["sourceId"], text)
         return {"status": "accepted" if ok else "already_answered"}

@@ -1,7 +1,25 @@
 // Opt-in workspace protocol; never changes the relay's selected session.
+const { createWorkspaceUploads } = require("./workspace-uploads.cjs");
 const { isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
 function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
   const subscribers = new Map();
+  const chatSubscribers = new Map();
+  const uploads = createWorkspaceUploads(now);
+  const off = ["streaming", "message", "activity"]
+    .map((name) =>
+      bridge.on?.(name, (data) => {
+        if (!data || typeof data.sessionKey !== "string") return;
+        for (const [id, sub] of chatSubscribers)
+          if (sub.until >= now() && sub.key === data.sessionKey)
+            send(id, {
+              type: "ocuclaw.workspace.chat",
+              version: 1,
+              event: name,
+              data,
+            });
+      }),
+    )
+    .filter(Boolean);
   let timer = null,
     polling = false;
   const allowed = new Set([
@@ -15,6 +33,7 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
     "sessions.patch",
     "sessions.abort",
     "agent",
+    "workspace.send.receipt",
     "workspace.stt.providers",
     "workspace.stt.transcribe",
   ]);
@@ -104,6 +123,13 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         return;
       }
       const data = await snapshot();
+      for (const [id, sub] of chatSubscribers)
+        if (
+          sub.until < now() ||
+          (Array.isArray(data.authorizedNamespaces) &&
+            !data.authorizedNamespaces.includes(sub.key.split(":")[1]))
+        )
+          chatSubscribers.delete(id);
       const fingerprint = JSON.stringify([
         data.pending,
         data.completed,
@@ -149,7 +175,95 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         : {};
     try {
       if (frame.method === "capabilities")
-        return reply({ version: 1, inbox: true, sessions: true, voice: true });
+        return reply({
+          version: 1,
+          inbox: true,
+          sessions: true,
+          voice: true,
+          chatStream: true,
+          catalog: true,
+          schedules: true,
+          uploads: uploads.limits,
+        });
+      if (frame.method.startsWith("uploads."))
+        return reply(uploads.request(clientId, frame.method, p));
+      if (frame.method === "workspace.catalog") {
+        const [agents, models] = await Promise.all([
+          bridge.request("agents.list", {}),
+          bridge.request("workspace.models", {
+            profileId: p.profileId || "default",
+          }),
+        ]);
+        return reply({ ...agents, ...models });
+      }
+      if (
+        frame.method.startsWith("automations.") ||
+        frame.method.startsWith("jobs.")
+      ) {
+        const operations = new Set([
+          "automations.options",
+          "automations.read",
+          "automations.preview",
+          "automations.draft",
+          "automations.create",
+          "automations.update",
+          "automations.delete",
+          "automations.receipt",
+          "jobs.list",
+          "jobs.history",
+          "jobs.pause",
+          "jobs.resume",
+          "jobs.run",
+          "jobs.stop",
+          "jobs.receipt",
+        ]);
+        if (!operations.has(frame.method)) throw Error("unsupported_operation");
+        return reply(
+          await bridge.request("workspace.schedule", {
+            ...p,
+            operation: frame.method,
+          }),
+        );
+      }
+      if (frame.method === "chat.subscribe") {
+        if (
+          typeof p.sessionKey !== "string" ||
+          !p.sessionKey.startsWith("hermes:") ||
+          p.sessionKey.length > 512
+        )
+          throw Error("invalid_session");
+        // Reading first is also the live admission check. No global selected chat changes.
+        const history = await bridge.request(
+          /:x:cron:/.test(p.sessionKey)
+            ? "workspace.cron.history"
+            : "chat.history",
+          { sessionKey: p.sessionKey, limit: 30 },
+        );
+        chatSubscribers.set(clientId, {
+          key: p.sessionKey,
+          until: now() + 45000,
+        });
+        return reply(history);
+      }
+      if (frame.method === "chat.unsubscribe") {
+        chatSubscribers.delete(clientId);
+        return reply({ ok: true });
+      }
+      if (
+        frame.method === "chat.history" &&
+        /:x:cron:/.test(p.sessionKey || "")
+      )
+        return reply(await bridge.request("workspace.cron.history", p));
+      if (frame.method === "agent") {
+        if (p.attachments !== undefined)
+          throw Error("use_authenticated_uploads");
+        return reply(
+          await bridge.request("workspace.send", {
+            ...p,
+            attachments: uploads.descriptors(clientId, p.uploadIds || []),
+          }),
+        );
+      }
       if (frame.method === "inbox.subscribe") {
         if (!subscribers.has(clientId) && subscribers.size >= 32)
           throw Error("subscription_limit");
@@ -168,6 +282,7 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         const data = await bridge.request("sessions.list", {
           limit: 500,
           search: p.search,
+          includeHidden: p.includeHidden === true,
           originalText: true,
         });
         return reply({
@@ -188,10 +303,39 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         return reply(
           sessions.setSessionPinned("ocuclaw", p.key, p.pinned === true),
         );
-      if (frame.method === "sessions.create")
-        return reply({
-          key: sessions.createDetachedSessionKey("hermes:main:"),
+      if (frame.method === "sessions.create") {
+        const catalog = await bridge.request("agents.list", {});
+        const profile = p.profileId || "default";
+        if (!catalog.agents?.some((x) => x.id === profile))
+          throw Error("profile_not_served");
+        const ns = profile === "default" ? "main" : profile;
+        if (!/^[A-Za-z0-9_-]+$/.test(ns)) throw Error("invalid_profile");
+        const key = sessions.createDetachedSessionKey(`hermes:${ns}:`, {
+          agentRef: profile,
         });
+        if (!key.startsWith(`hermes:${ns}:`))
+          throw Error("profile_affinity_mismatch");
+        if (p.model) {
+          const catalog = await bridge.request("workspace.models", {
+            profileId: profile,
+          });
+          if (
+            !catalog.models?.some(
+              (row) => row.id === p.model && row.provider === p.provider,
+            )
+          )
+            throw Error("model_unavailable");
+          await bridge.request("sessions.patch", {
+            key,
+            model: p.model,
+            modelProvider: p.provider,
+            initial: true,
+            confirmModelSelection: true,
+            perSessionOnly: true,
+          });
+        }
+        return reply({ key });
+      }
       if (!allowed.has(frame.method)) throw Error("unsupported_operation");
       return reply(await bridge.request(frame.method, p));
     } catch (error) {
@@ -202,9 +346,14 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
     request,
     disconnect(id) {
       subscribers.delete(id);
+      chatSubscribers.delete(id);
+      uploads.release(id);
     },
     close() {
       closed = true;
+      for (const unsubscribe of off) unsubscribe();
+      chatSubscribers.clear();
+      uploads.close();
       titleQueue.clear();
       titles.clear();
       clearInterval(timer);

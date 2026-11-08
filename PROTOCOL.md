@@ -2978,3 +2978,44 @@ Client storage and answer receipts are scoped to the relay endpoint without quer
 credentials; changing endpoints clears all session/question UI state. Protocol v2
 alone is not enough to enable commands: Workspace negotiation and a valid initial
 snapshot are required. A source outage remains distinct from a socket outage.
+
+### Workspace phone / schedule extension (client 0.2.0)
+
+Workspace v1 adds capability fields `chatStream`, `catalog`, `schedules`, and upload
+limits. Existing envelopes/legacy behavior remain unchanged. `workspace.catalog`
+returns admitted profiles and the native model catalog. `sessions.create` accepts
+`profileId`, `model`, `provider`; model configuration explicitly requests session-only
+behavior. Arbitrary management RPCs remain excluded.
+
+`chat.subscribe {sessionKey}` first authorizes/reads that session, then leases an
+addressed 45-second event subscription. Renew every 15 seconds; `chat.unsubscribe`
+removes it. Events are `{type:"ocuclaw.workspace.chat",version:1,event,data}` for
+native `streaming`, `message`, `activity`; only subscribers of the exact session key
+receive them. The relay's globally selected session is untouched. Reconnection reads
+history again. Read-only cron history uses a separate profile-verified native binding.
+
+`uploads.begin {size,fileName,mimeType}`, `uploads.chunk {id,offset,content}`,
+`uploads.cancel {id}` implement socket-owned, sequential, bounded base64 chunks.
+`agent` accepts `uploadIds` only; client-supplied attachment descriptors/paths are
+refused. The bridge stages native attachment descriptors internally. Workspace sends
+carry an opt-in durable admission identity into the existing dispatch path;
+`workspace.send.receipt {sessionKey,operationId}` reconciles the original result.
+Unknown admission never automatically re-dispatches after a process restart.
+
+Allowed schedule methods: `automations.options/read/preview/draft/create/update/delete/receipt`
+and `jobs.list/history/pause/resume/run/stop/receipt`, always with `profileId`.
+The server checks live profile admission and calls the public `cron.phone_workspace`
+API. Options return native server time/timezone and actual scheduler policy.
+Preview returns native `nextRuns` and a two-minute `reviewHash`. Create/update require
+that proof; update/delete also require the current job `revision`. Every mutation
+requires `operationId`, stores a receipt before native admission, rejects reuse with
+a different fingerprint and never retries an uncertain receipt. Job stop additionally
+requires the exact `executionId`. Job history has a native cursor and UTF-8 budget.
+
+Cron questions are live cross-process rendezvous in Hermes, validated against the
+producer's PID birth and original deadline. Answers remain request-addressed through
+Inbox. Seven-day terminal projections are captured by native execution finalization,
+including while the client is closed, and correlate `jobId`, `executionId`, profile
+and an actual session when one exists. `cron-run` result identities represent failed
+or script executions without a chat; clients open run information, not a fabricated
+conversation. Source prep and exact compatibility are documented in `hermes-public`.

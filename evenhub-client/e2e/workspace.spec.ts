@@ -112,7 +112,7 @@ test("three sessions, explicit confirmation, voice-text address, external resolu
       );
     });
   });
-  await page.goto("/?preview=1");
+  await page.goto("/?preview=1&hud=1");
   await page.getByLabel("Адрес сервера").fill("ws://127.0.0.1:47801/");
   await page.getByLabel("Ключ подключения").fill("local-test-only");
   await page.getByRole("button", { name: "Подключить", exact: true }).click();
@@ -274,7 +274,7 @@ test("session actions and completion read receipts are available without switchi
       );
     }),
   );
-  await page.goto("/?preview=1");
+  await page.goto("/?preview=1&hud=1");
   await page.getByLabel("Адрес сервера").fill("ws://127.0.0.1:47802/");
   await page.getByLabel("Ключ подключения").fill("local-test-only");
   await page.getByRole("button", { name: "Подключить", exact: true }).click();
@@ -400,7 +400,7 @@ test("switching VPS isolates cached results and uncertain receipts", async ({
       );
     }),
   );
-  await page.goto("/?preview=1");
+  await page.goto("/?preview=1&hud=1");
   await page.evaluate(() =>
     sessionStorage.setItem(
       "ocuclaw.pendingOperation:" +

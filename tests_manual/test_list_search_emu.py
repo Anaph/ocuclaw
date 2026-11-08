@@ -82,3 +82,15 @@ res = make_rpc(FakeDB(fts_enabled=False))._sync_list({"originalText": True})
 assert res["sessions"][1]["title"] == "Отчёт", res
 assert res["sessions"][1]["preview"] == "кварталы", res
 print("test_list_search_emu OK")
+
+# Opt-in phone list includes hidden rows; legacy reads preserve their projection.
+import ocuclaw.session_rpc as session_module
+session_module.session_read_state_supported = lambda: True
+class HiddenDB(FakeDB):
+    def list_sessions_rich(self, **kw):
+        rows = super().list_sessions_rich(**kw)
+        return rows if kw.get('include_hidden') else rows[:1]
+rpc = make_rpc(HiddenDB(fts_enabled=False))
+assert len(rpc._sync_list({})['sessions']) == 1
+assert len(rpc._sync_list({'includeHidden': True})['sessions']) == 2
+print('test_hidden_phone_list OK')

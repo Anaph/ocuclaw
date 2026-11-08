@@ -82,3 +82,28 @@ test("failed microphone start disarms capture and attempts native cleanup", asyn
   await glasses.start();
   await glasses.stop();
 });
+
+test("phone microphone remains available when G2 refuses its display page", async () => {
+  Object.defineProperty(globalThis, "location", {
+    value: { search: "" },
+    configurable: true,
+  });
+  const sources: any[] = [];
+  const bridge = {
+    createStartUpPageContainer: async () => 1,
+    onEvenHubEvent: () => () => {},
+    audioControl: async (open: boolean, source: any) => {
+      if (open) sources.push(source);
+      return true;
+    },
+  };
+  const { Glasses } = await import("./glasses");
+  const { AudioInputSource } = await import("@evenrealities/even_hub_sdk");
+  const glasses = new Glasses(async () => bridge as any);
+  await glasses.init();
+  assert(!glasses.displayReady);
+  assert(glasses.bridge);
+  await glasses.start(AudioInputSource.Phone);
+  await glasses.stop();
+  assert.deepEqual(sources, [AudioInputSource.Phone]);
+});

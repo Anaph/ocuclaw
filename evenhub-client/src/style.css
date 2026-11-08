@@ -141,3 +141,248 @@ details p {
     padding: 9px;
   }
 }
+[hidden] {
+  display: none !important;
+}
+.phone {
+  max-width: 1000px;
+  padding-bottom: 110px;
+}
+.phone header small {
+  display: block;
+  color: #98ada2;
+  margin-top: 8px;
+}
+#phone-status {
+  font-size: 12px;
+  align-self: center;
+}
+#phone-content {
+  min-height: 60vh;
+}
+.bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: #0b1313f5;
+  border-top: 1px solid #355043;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  padding: 10px max(12px, env(safe-area-inset-left))
+    calc(10px + env(safe-area-inset-bottom));
+  margin: 0;
+}
+.bottom-nav button {
+  text-align: center;
+  padding: 14px 6px;
+  border-color: transparent;
+  background: transparent;
+}
+.active {
+  border-color: #a6e3c1 !important;
+  background: #234034 !important;
+}
+.heading,
+.row,
+.inline {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.heading {
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+.heading h1 {
+  margin: 0;
+  flex: 1;
+}
+.cards {
+  display: grid;
+  gap: 12px;
+  margin: 18px 0;
+}
+.card {
+  padding: 20px;
+  border: 1px solid #29413a;
+  background: #10201b;
+  border-radius: 14px;
+  overflow-wrap: anywhere;
+}
+.card h2 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+.card button {
+  margin: 5px;
+}
+.session-card {
+  width: 100%;
+  line-height: 1.7;
+}
+.muted,
+.empty {
+  color: #98ada2;
+  font-size: 14px;
+}
+.empty {
+  padding: 40px 12px;
+  text-align: center;
+}
+textarea,
+select {
+  font: inherit;
+  width: 100%;
+  color: inherit;
+  background: #12221e;
+  border: 1px solid #476457;
+  border-radius: 8px;
+  padding: 12px;
+}
+textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+label.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+input[type="checkbox"] {
+  width: auto;
+}
+.messages {
+  overflow-y: auto;
+  max-height: 57vh;
+  min-height: 25vh;
+  padding: 10px 3px;
+  scrollbar-gutter: stable;
+}
+.message {
+  padding: 16px;
+  margin: 12px 0;
+  max-width: 96%;
+  border-radius: 12px;
+  background: #12221e;
+  overflow-wrap: anywhere;
+}
+.message.user {
+  margin-left: auto;
+  background: #234034;
+}
+.message-meta {
+  font-size: 12px;
+  color: #a6e3c1;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.message .schedule-from {
+  font-size: 11px;
+  padding: 5px 8px;
+  opacity: 0.7;
+}
+.markdown {
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.markdown pre {
+  position: relative;
+  background: #08100d;
+  overflow: auto;
+  padding: 16px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.markdown code {
+  font-family: ui-monospace, monospace;
+}
+.markdown a {
+  color: #b6eacb;
+}
+.markdown table {
+  display: block;
+  overflow: auto;
+  border-collapse: collapse;
+}
+.markdown td,
+.markdown th {
+  border: 1px solid #355043;
+  padding: 6px;
+}
+.copy-code {
+  padding: 4px 8px;
+  font-size: 11px;
+  display: block;
+  margin-top: 10px;
+}
+.file-button {
+  cursor: pointer;
+  border: 1px solid #355043;
+  border-radius: 9px;
+  padding: 12px 16px;
+}
+.file-button input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.attachment img {
+  max-height: 70px;
+  max-width: 100px;
+  border-radius: 8px;
+}
+.preserve {
+  white-space: pre-wrap;
+}
+fieldset {
+  border: 1px solid #355043;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+#hud-panel {
+  max-width: 1000px;
+  margin: 0 auto;
+  border: 1px solid #355043;
+  border-radius: 12px;
+}
+@media (max-width: 600px) {
+  .card {
+    padding: 14px;
+  }
+  .heading h1 {
+    font-size: 20px;
+  }
+  .bottom-nav button {
+    font-size: 12px;
+  }
+  #phone-status {
+    max-width: 150px;
+    text-align: right;
+  }
+  .messages {
+    max-height: 52vh;
+  }
+  .message {
+    max-width: 100%;
+  }
+  .row button {
+    padding: 10px;
+  }
+  .phone main {
+    padding: 12px;
+  }
+}

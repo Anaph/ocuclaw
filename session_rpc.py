@@ -886,13 +886,14 @@ class SessionRpc:
             include_children=True,
             order_by_last_active=True,
             project_compression_tips=True,
+            **({"include_hidden": True} if p.get("includeHidden") is True and session_read_state_supported() else {}),
         )
         rows = [row for row in rows if self._list_row_visible(row)]
         if search:
             # Include FTS matches outside the bounded recent-session scan.
             # Search raw text as well as the display projection: transliteration
             # is lossy (e.g. the Russian soft sign becomes an empty string).
-            fts_rows = self._fts_session_rows(search)
+            fts_rows = self._fts_session_rows(search, include_hidden=True) if p.get("includeHidden") is True else self._fts_session_rows(search)
             known_ids = {str(row.get("id")) for row in rows}
             rows.extend(row for row in fts_rows if str(row.get("id")) not in known_ids)
             rows.sort(key=lambda row: float(row.get("last_active") or 0), reverse=True)
@@ -947,7 +948,7 @@ class SessionRpc:
                 terms.append(f"{token}*")
         return " ".join(terms)
 
-    def _visible_search_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def _visible_search_row(self, session_id: str, *, include_hidden: bool = False) -> Optional[Dict[str, Any]]:
         db = self._get_reader()
         tip = compression_tip(db, str(session_id))
         raw_row = db.get_session(tip)
@@ -978,13 +979,14 @@ class SessionRpc:
             include_children=True,
             order_by_last_active=True,
             project_compression_tips=True,
+            **({"include_hidden": True} if include_hidden and session_read_state_supported() else {}),
         )
         return next(
             (dict(candidate) for candidate in rich_rows if candidate.get("id") == tip),
             None,
         )
 
-    def _fts_session_rows(self, query: str) -> List[Dict[str, Any]]:
+    def _fts_session_rows(self, query: str, *, include_hidden: bool = False) -> List[Dict[str, Any]]:
         """Visible session-tip rows whose messages match the host FTS index.
 
         Empty list (never an
@@ -1014,7 +1016,7 @@ class SessionRpc:
                 if not raw:
                     continue
                 if raw not in projected:
-                    projected[raw] = self._visible_search_row(raw)
+                    projected[raw] = self._visible_search_row(raw, include_hidden=True) if include_hidden else self._visible_search_row(raw)
                 row = projected[raw]
                 if row is not None:
                     tips[str(row.get("id"))] = row

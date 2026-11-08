@@ -1,0 +1,23 @@
+const assert=require('node:assert/strict');
+const {createSessionService}=require('../dist-cjs/runtime/session-service.cjs');
+const {createWorkspaceService}=require('../dist-cjs/runtime/workspace-service.cjs');
+const {createHermesGatewayBridge}=require('../dist-cjs/runtime/hermes-gateway-bridge.cjs');
+(async()=>{
+ const calls=[],events=[];
+ const {bridge,dispatchBackendEvent}=createHermesGatewayBridge({link:{request:async(method,params)=>{calls.push({method,params});if(method==='db.chat.history')return {messages:[]};if(method==='gw.profiles.list')return {profiles:[{name:'default'},{name:'research'}]};if(method==='workspace.models')return {models:[{id:'test-model',provider:'custom'}]};if(method==='sessions.options.apply')return {status:'unsupported'};return {status:'accepted',runId:'run'};}}});
+ const sessions=createSessionService({gatewayBridge:bridge,defaultSessionKeyPrefix:'hermes:main:',sessionKeyPrefixForAgentRef:ref=>`hermes:${ref==='default'?'main':ref||'main'}:`});
+ const service=createWorkspaceService({bridge,sessions,send:(id,data)=>events.push({id,data})});
+ const request=async(id,method,params={})=>JSON.parse((await service.request(id,{version:1,id:'request',method,params})).unicast).data;
+ assert.ok((await request('a','sessions.create',{profileId:'research',model:'test-model',provider:'custom'})).key.startsWith('hermes:research:'));assert.equal(sessions.peekSessionKey(),null);
+ const model=calls.find(x=>x.method==='dispatch.send'&&x.params.message.startsWith('/model'));
+ assert.match(model.params.message,/--session$/);assert.equal(model.params.target.ns,'research');
+ await request('a','chat.subscribe',{sessionKey:'hermes:main:a'});await request('b','chat.subscribe',{sessionKey:'hermes:main:b'});
+ dispatchBackendEvent('streaming',{sessionKey:'hermes:main:a',runId:'run-a',seq:1,text:'Русский ответ'});
+ assert.deepEqual(events.map(x=>x.id),['a']);assert.equal(events[0].data.data.text,'Русский ответ');
+ await request('a','agent',{sessionKey:'hermes:main:a',message:'Задача',idempotencyKey:'send-id'});
+ assert.equal(calls.at(-1).params.workspaceOperationId,'send-id');
+ await request('a','workspace.send.receipt',{sessionKey:'hermes:main:a',operationId:'send-id'});assert.equal(calls.at(-1).method,'workspace.send.receipt');assert.deepEqual(calls.at(-1).params.target,{ns:'main',chatId:'a'});
+ const denied=await request('a','agent',{sessionKey:'hermes:main:a',message:'x',attachments:[{path:'/private'}]});assert.equal(denied.error,'use_authenticated_uploads');
+ service.disconnect('a');dispatchBackendEvent('streaming',{sessionKey:'hermes:main:a',text:'After disconnect'});assert.equal(events.length,1);
+ service.close();console.log('test_workspace_phone OK');
+})().catch(error=>{console.error(error);process.exitCode=1;});

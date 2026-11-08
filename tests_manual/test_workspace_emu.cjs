@@ -24,7 +24,7 @@ const {createDownstreamHandler}=require('../dist-cjs/runtime/downstream-handler.
 
 (async()=>{
  const calls=[];
- const {bridge}=createHermesGatewayBridge({link:{request:async(method,params)=>{calls.push({method,params});return method==='db.sessions.list'?{sessions:[]}:{status:'accepted'};}}});
+ const {bridge}=createHermesGatewayBridge({link:{request:async(method,params)=>{calls.push({method,params});return method==='db.sessions.list'?{sessions:[]}:method==='gw.profiles.list'?{profiles:[{name:'default'}]}:{status:'accepted'};}}});
  const sessions={getSessionPin:()=>({pinned:false}),setSessionPinned:(kind,key,pinned)=>({ok:true,kind,key,pinned}),createDetachedSessionKey:()=> 'hermes:main:new'};
  const service=createWorkspaceService({bridge,sessions,send(){}});
  const request=async(method,params={})=>JSON.parse((await service.request('app',{version:1,id:'1',method,params})).unicast).data;

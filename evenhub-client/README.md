@@ -1,13 +1,13 @@
-# OcuClaw Inbox — Even Hub client
+# OcuClaw Hermes — Even Hub client
 
 A separate stock-firmware G2 application for the Hermes OcuClaw server. It does not
 replace the installed OcuClaw phone app or change the relay's selected session.
-Inbox / Done / Sessions, explicit confirmation, multiple choice, typed replies,
-microphone dictation, history pagination and supported session actions are included.
+The phone has Chats / Inbox / Schedule / Settings; G2 has an independent compact UI.
+Typed/voice replies, attachments, streamed chat and native Hermes scheduling are included.
 
 ## Local development
 
-Use Node 22.13+ (or a newer supported Node) and Python 3.9+.
+Use Node 22.13+ and Python 3.11+ for the Hermes integration tests.
 
 ```sh
 npm ci
@@ -17,21 +17,17 @@ npm run dev
 ```
 
 Open the Vite URL on the phone from Even Hub's developer QR preview. The phone and
-computer must reach that development server. Open `http://localhost:5173/?preview=1` for a browser preview with a 576×288 HUD
-and input buttons; the native microphone/display require Even Hub.
+computer must reach that development server. Open `http://localhost:5173/?preview=1` for the phone preview. Use `/?preview=1&hud=1` for the isolated 576×288 HUD acceptance harness; native microphones/display require Even Hub.
 
 The connection form takes the existing relay WebSocket address and credential.
-Prefer the HTTPS/WSS Tailscale endpoint configured for OcuClaw. The token stays in
-memory, not localStorage. Reconnect works while the runtime survives; a destroyed
-WebView needs a new connection. UI locations and uncertain-operation receipts are scoped to the relay endpoint. Explicitly switching servers clears cached rows and drafts. UI locations survive without saving message drafts
-or credentials. Results and answer receipts remain on the server. A ws:// LAN URL
+Prefer the HTTPS/WSS Tailscale endpoint configured for OcuClaw. By default the token stays in memory; remembering the connection requires an explicit checkbox and Even Hub storage. Reconnect works while the runtime survives. UI locations and uncertain-operation receipts are scoped to the relay endpoint. Explicitly switching servers clears cached rows and drafts. Text drafts are stored separately per server/chat; they are never automatically dispatched. Results and answer receipts remain on the server. A ws:// LAN URL
 is useful for tests; Android cleartext/mixed-content policies may reject it.
 
 SDK 0.0.16 and CLI 0.2.0 are pinned. Minimum Even App version is 2.3.2.
 The CLI language enum lacks `ru`, so the catalogue language is `en`; the UI itself
 is Russian. Noto Sans is packaged under the included OFL. Four serial 288×144 PNG
 tiles preserve Cyrillic independently of firmware fonts. Contextual menu labels
-use ASCII (Inbox / Sessions / Actions), since those labels use the OS font.
+use ASCII (Inbox / Sessions / Actions / Schedule), since those labels use the OS font.
 
 ## Package and browser acceptance
 
@@ -107,3 +103,40 @@ records and a UTF-8 byte budget; continuation cursors preserve the rest.
 Session-title enrichment is asynchronous and limited to four concurrent lookups.
 Slow title reads cannot block delivery of the question queue. Microphone stop is
 shared across simultaneous callers and retains tail PCM until native acknowledgment.
+
+## 0.2.0 — phone workspace
+
+The default route is now the full phone app: Chats / Inbox / Schedule / Settings.
+The HUD preview lives in Settings. Phone navigation and G2 navigation are independent;
+“На очки” explicitly opens a selected chat, question or result there. The former HUD
+acceptance harness remains available at `/?preview=1&hud=1`.
+
+Chats include streamed replies, sanitized Markdown/code copy, earlier history,
+profile/model selection, per-server/per-chat text drafts, dictation, image capture/
+gallery and document uploads. Uploads use authenticated 64 KiB chunks, limited to
+16 MiB per file / 8 staged files and a 32 MiB server-wide staging budget. Files are
+scoped to the socket, expire after five minutes and are released on disconnect.
+Sending uses a durable server receipt: after a lost acknowledgment the original
+operation is checked before an explicit retry. Reconnection never sends a draft.
+Model setup uses Hermes's session-only option or explicit `/model ... --session`;
+it cannot silently select a new global default.
+
+Schedule forms serialize one-shot / daily / weekday / interval / advanced expressions
+for **Hermes**. Only Hermes computes previews and next runs, using its profile clock
+and timezone. The phone shows its native missed-run/run-now rules. Save requires a
+current server preview; concurrent edits fail visibly. Pause and stop-execution are
+separate actions. The glasses can create a voice draft, review native preview times,
+confirm creation, inspect jobs, pause/resume and run now. Voice interpretation is an
+auxiliary inference call without tools; it cannot create a task by itself.
+
+The required native public adapter, source pin and local integration procedure are
+in `../hermes-public/README.md`. Unsupported engines show the unavailable capability;
+there is no local timer or direct job-store fallback. Cron execution questions and
+results join Inbox independently of normal chat/session-list visibility.
+
+The phone can initialize its transport, UI and microphone even if G2 rejects its
+startup page. A later device connection retries the HUD page. The bridge's local
+storage can remember the connection only when explicitly selected; the default
+keeps the token in memory. Browser file input and native camera/gallery cancellation
+leave the draft intact. Background delivery with a destroyed Even Hub WebView is
+still outside this version.
