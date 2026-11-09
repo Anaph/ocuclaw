@@ -58,6 +58,7 @@ export function mountHud(
     total = 0;
   let confirmAction: (() => Promise<void>) | null = null,
     confirmText = "",
+    confirmLabel = "Отправить",
     confirmReturn: Screen = "question";
   type Target =
     | { kind: "question"; id: string; key: string }
@@ -181,9 +182,11 @@ export function mountHud(
     text: string,
     action: () => Promise<void>,
     back: Screen = screen,
+    label = "Отправить",
   ) {
     confirmText = text;
     confirmAction = action;
+    confirmLabel = label;
     confirmReturn = back;
     go("confirm");
   }
@@ -807,7 +810,7 @@ export function mountHud(
         actions: [
           {
             id: "send",
-            label: "Отправить",
+            label: confirmLabel,
             run: async () => {
               await confirmAction?.();
             },
@@ -907,8 +910,9 @@ export function mountHud(
         const { preview } = await scheduleData.schedule("automations.preview", {
           fields,
         });
+        const nextRun = preview.nextRuns[0]?.replace("T", " ") || "—";
         confirm(
-          `${fields.name}\n${fields.prompt}\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\nСоздать задачу?`,
+          `${fields.name}\nБлижайший запуск: ${nextRun}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
           async () => {
             await scheduleData.mutateSchedule("automations.create", {
               fields,
@@ -918,6 +922,7 @@ export function mountHud(
             go("jobs");
           },
           "compose",
+          "Создать задачу",
         );
       })();
     }

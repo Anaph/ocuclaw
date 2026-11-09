@@ -3,6 +3,7 @@ import DOMPurify from "dompurify";
 import { AudioInputSource } from "@evenrealities/even_hub_sdk";
 import {
   Workspace,
+  errorText,
   messageText,
   scheduleForm,
   serializeSchedule,
@@ -506,7 +507,9 @@ export class PhoneApp {
           this.message(
             receipt?.status === "not_found"
               ? "Hermes не получил операцию. Можно повторить исходное сообщение."
-              : `Отправка: ${receipt?.status || "нет данных"}`,
+              : receipt?.error
+                ? errorText(receipt.error)
+                : `Отправка: ${receipt ? statusText(receipt.status) : "нет данных"}`,
           );
         }),
       );
@@ -916,7 +919,9 @@ export class PhoneApp {
       else
         this.message(
           result
-            ? `Состояние операции: ${result.status}`
+            ? result.error
+              ? errorText(result.error)
+              : `Состояние операции: ${statusText(result.status)}`
             : "Неподтверждённых операций нет",
         );
       await this.data.loadJobs();

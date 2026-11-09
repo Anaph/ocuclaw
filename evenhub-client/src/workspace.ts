@@ -180,12 +180,15 @@ export class Workspace {
   async request<T = any>(
     method: string,
     params: Record<string, unknown> = {},
+    options: { acceptStatus?: boolean } = {},
   ): Promise<T> {
     const generation = this.generation;
-    const result = await this.relay.request(method, params);
+    const result = await this.relay.request(method, params, options);
     if (generation !== this.generation) throw Error("Подключение изменилось");
-    if (result?.error && !result.status) throw Error(errorText(result.error));
     return result;
+  }
+  private outcome(method: string, params: Record<string, unknown>) {
+    return this.request(method, params, { acceptStatus: true });
   }
   private draftKey(key: string) {
     return `ocuclaw.draft:${encodeURIComponent(this.scope)}:${encodeURIComponent(key)}`;
@@ -414,7 +417,7 @@ export class Workspace {
         hadFiles: files.length > 0,
       };
       this.storage.setItem(operationKey, JSON.stringify(pending));
-      const result = await this.request("agent", {
+      const result = await this.outcome("agent", {
         sessionKey: key,
         message: text,
         idempotencyKey: pending.id,
@@ -449,7 +452,7 @@ export class Workspace {
   async checkSend(key = this.chatKey) {
     const pending = this.pendingSend(key);
     if (!pending) return null;
-    const receipt = await this.request("workspace.send.receipt", {
+    const receipt = await this.outcome("workspace.send.receipt", {
       sessionKey: key,
       operationId: pending.id,
     });
@@ -478,14 +481,17 @@ export class Workspace {
     const store = new ReceiptStore(sessionStorage, this.scope),
       operationId = randomId();
     store.save({ id: item.id, sessionKey: item.sessionKey, operationId });
-    const result = await this.request("inbox.answer", {
+    const result = await this.outcome("inbox.answer", {
       id: item.id,
       sessionKey: item.sessionKey,
       operationId,
       answer,
     });
     if (result.status !== "uncertain") store.clear();
-    if (result.status !== "accepted") throw Error(statusText(result.status));
+    if (result.status !== "accepted")
+      throw Error(
+        result.error ? errorText(result.error) : statusText(result.status),
+      );
   }
   async schedule(method: string, payload: Record<string, unknown> = {}) {
     const epoch = this.profileEpoch;
@@ -537,7 +543,7 @@ export class Workspace {
   }
   private async submitSchedule(key: string, saved: string, profileId: string) {
     const { operation, operationId, params } = JSON.parse(saved);
-    const result = await this.request(operation, {
+    const result = await this.outcome(operation, {
       ...params,
       operationId,
       profileId,
@@ -567,7 +573,7 @@ export class Workspace {
       epoch = this.profileEpoch;
     const saved = this.storage.getItem(key);
     if (!saved) return;
-    const receipt = await this.request("automations.receipt", {
+    const receipt = await this.outcome("automations.receipt", {
       operationId: JSON.parse(saved).operationId,
       profileId,
     });
@@ -583,7 +589,7 @@ export class Workspace {
       profileId = this.profile;
     const saved = this.storage.getItem(key);
     if (!saved) return null;
-    const result = await this.request("automations.receipt", {
+    const result = await this.outcome("automations.receipt", {
       operationId: JSON.parse(saved).operationId,
       profileId,
     });
@@ -611,6 +617,11 @@ export function statusText(status: string) {
     (
       {
         accepted: "Принято",
+        rejected: "Hermes отклонил операцию",
+        saved: "Сохранено",
+        applied: "Выполнено",
+        deleted: "Удалено",
+        stop_requested: "Остановка запрошена",
         scheduled: "По расписанию",
         running: "Работает",
         claimed: "Запуск принят",

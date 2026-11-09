@@ -1,6 +1,10 @@
 import { test, expect, type Page } from "@playwright/test";
 async function server(page: Page) {
   const calls: any[] = [];
+  const sendReceipts = new Map<string, any>();
+  const scheduleReceipts = new Map<string, any>();
+  const nextReply = new Map<string, any>();
+  const dropReplies = new Set<string>();
   let peer: any;
   let jobs: any[] = [];
   let pending = [
@@ -111,9 +115,16 @@ async function server(page: Page) {
       if (["chat.history", "chat.subscribe"].includes(frame.method))
         data = { messages, hasMore: false, nextBeforeId: null };
       if (frame.method === "agent") {
-        messages = [...messages, { id: 3, role: "user", content: p.message }];
-        data = { status: "accepted", runId: "run-1" };
+        data = nextReply.get("agent") ?? { status: "accepted", runId: "run-1" };
+        if (data.status === "accepted")
+          messages = [
+            ...messages,
+            { id: messages.length + 1, role: "user", content: p.message },
+          ];
+        sendReceipts.set(p.idempotencyKey, data);
       }
+      if (frame.method === "workspace.send.receipt")
+        data = sendReceipts.get(p.operationId) ?? { status: "not_found" };
       if (frame.method === "inbox.get")
         data = pending.some((x) => x.id === p.id)
           ? { status: "pending", item: pending[0] }
@@ -124,6 +135,21 @@ async function server(page: Page) {
       }
       if (frame.method === "automations.options") data = options;
       if (frame.method === "jobs.list") data = { jobs };
+      if (frame.method === "workspace.stt.providers")
+        data = { providers: [{ id: "simulated", available: true }] };
+      if (frame.method === "workspace.stt.transcribe")
+        data = {
+          success: true,
+          transcript: "Каждый день в девять собирай сводку",
+        };
+      if (frame.method === "automations.draft")
+        data = {
+          fields: {
+            name: "Голосовая сводка",
+            prompt: p.text,
+            schedule: "0 9 * * *",
+          },
+        };
       if (frame.method === "automations.preview")
         data = {
           preview: {
@@ -137,7 +163,10 @@ async function server(page: Page) {
             ],
           },
         };
-      if (frame.method === "automations.create") {
+      if (
+        frame.method === "automations.create" &&
+        !nextReply.has(frame.method)
+      ) {
         jobs = [
           {
             id: "job-1",
@@ -152,6 +181,8 @@ async function server(page: Page) {
         data = { status: "saved" };
       }
       if (frame.method === "automations.read") data = { job: jobs[0] };
+      if (frame.method === "automations.receipt")
+        data = scheduleReceipts.get(p.operationId) ?? { status: "not_found" };
       if (frame.method === "jobs.pause") {
         jobs[0].paused = true;
         data = { status: "applied" };
@@ -178,6 +209,16 @@ async function server(page: Page) {
           offset: p.offset + atob(p.content).length,
           complete: true,
         };
+      if (nextReply.has(frame.method)) {
+        data = nextReply.get(frame.method);
+        nextReply.delete(frame.method);
+      }
+      if (frame.method === "automations.create")
+        scheduleReceipts.set(p.operationId, data);
+      if (dropReplies.delete(frame.method)) {
+        void socket.close({ code: 1012, reason: "Simulated relay restart" });
+        return;
+      }
       socket.send(
         JSON.stringify({
           type: "ocuclaw.workspace.result",
@@ -190,6 +231,8 @@ async function server(page: Page) {
   });
   return {
     calls,
+    replyNext: (method: string, data: unknown) => nextReply.set(method, data),
+    dropNextReply: (method: string) => dropReplies.add(method),
     resolveExternal: () => {
       pending = [];
     },
@@ -223,6 +266,249 @@ async function connect(page: Page) {
     .click();
   await expect(page.locator("#phone-status")).toContainText("● Hermes");
 }
+
+test("a rejected send receipt survives a socket restart and releases the draft for a new operation", async ({
+  page,
+}) => {
+  const { calls, replyNext, dropNextReply, emit } = await server(page);
+  await connect(page);
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  const composer = page.getByLabel("Сообщение Hermes");
+  const send = page
+    .locator("#compose-chat")
+    .getByRole("button", { name: "Отправить", exact: true });
+  await composer.fill("Проверка обрыва");
+  replyNext("agent", { status: "rejected", error: "Hermes отклонил запрос" });
+  dropNextReply("agent");
+  await send.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Соединение потеряно",
+  );
+  await expect(page.locator("#phone-status")).toContainText("● Hermes", {
+    timeout: 10000,
+  });
+  await expect
+    .poll(
+      () => calls.filter((frame) => frame.method === "chat.subscribe").length,
+    )
+    .toBe(2);
+  await expect(composer).toHaveValue("Проверка обрыва");
+  const check = page.getByRole("button", {
+    name: "Проверить отправку",
+    exact: true,
+  });
+  await check.click();
+  await expect(check).toHaveCount(0);
+  expect(calls.filter((frame) => frame.method === "agent")).toHaveLength(1);
+  await send.click();
+  await expect(composer).toHaveValue("");
+  const sends = calls.filter((frame) => frame.method === "agent");
+  expect(sends).toHaveLength(2);
+  expect(sends[1].params.idempotencyKey).not.toBe(
+    sends[0].params.idempotencyKey,
+  );
+  emit("streaming", {
+    sessionKey: "hermes:main:a",
+    runId: "after-reconnect",
+    seq: 1,
+    text: "Поток восстановлен",
+  });
+  await expect(page.locator(".streaming")).toContainText("Поток восстановлен");
+});
+
+test("a rejected schedule mutation can be corrected and submitted as a new operation", async ({
+  page,
+}) => {
+  const { calls, replyNext } = await server(page);
+  await connect(page);
+  await page.getByRole("button", { name: "Расписание", exact: true }).click();
+  await page.getByRole("button", { name: "＋ Задача", exact: true }).click();
+  const name = page.getByLabel("Название", { exact: true });
+  await name.fill("Сводка");
+  await page
+    .getByLabel("Инструкция и выбранный контекст")
+    .fill("Собрать данные");
+  const preview = page.getByRole("button", {
+    name: "Проверить расписание",
+    exact: true,
+  });
+  const save = page.getByRole("button", {
+    name: "Подтвердить и сохранить",
+    exact: true,
+  });
+  await preview.click();
+  replyNext("automations.create", {
+    status: "rejected",
+    error: "preview_expired",
+  });
+  await save.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Проверка расписания устарела",
+  );
+  await name.fill("Новая сводка");
+  await preview.click();
+  await save.click();
+  await expect(page.locator("#job-list")).toContainText("Новая сводка");
+  const mutations = calls.filter(
+    (frame) => frame.method === "automations.create",
+  );
+  expect(mutations).toHaveLength(2);
+  expect(mutations[0].params.operationId).not.toBe(
+    mutations[1].params.operationId,
+  );
+});
+
+test("a schedule saved before socket loss is reconciled without a second create", async ({
+  page,
+}) => {
+  const { calls, dropNextReply } = await server(page);
+  await connect(page);
+  await page.getByRole("button", { name: "Расписание", exact: true }).click();
+  await page.getByRole("button", { name: "＋ Задача", exact: true }).click();
+  await page
+    .getByLabel("Название", { exact: true })
+    .fill("Один запуск операции");
+  await page
+    .getByLabel("Инструкция и выбранный контекст")
+    .fill("Собрать данные");
+  await page
+    .getByRole("button", { name: "Проверить расписание", exact: true })
+    .click();
+  const save = page.getByRole("button", {
+    name: "Подтвердить и сохранить",
+    exact: true,
+  });
+  dropNextReply("automations.create");
+  await save.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Соединение потеряно",
+  );
+  await expect(page.locator("#phone-status")).toContainText("● Hermes", {
+    timeout: 10000,
+  });
+  await save.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Сначала проверьте предыдущую операцию",
+  );
+  await page.getByRole("button", { name: "‹ Расписание", exact: true }).click();
+  await page
+    .getByRole("button", {
+      name: "Проверить неподтверждённую операцию",
+      exact: true,
+    })
+    .click();
+  await expect(page.locator("#phone-notice")).toContainText("Сохранено");
+  await expect(
+    page.getByRole("heading", { name: "Один запуск операции", exact: true }),
+  ).toHaveCount(1);
+  const creates = calls.filter(
+    (frame) => frame.method === "automations.create",
+  );
+  expect(creates).toHaveLength(1);
+  const receipt = calls.find((frame) => frame.method === "automations.receipt");
+  expect(receipt.params.operationId).toBe(creates[0].params.operationId);
+});
+
+test("simulated G2 microphone creates a native schedule preview and requires a tap to save", async ({
+  page,
+}) => {
+  const { calls } = await server(page);
+  await page.route("**/src/main.ts", (route) =>
+    route.fulfill({
+      contentType: "application/javascript",
+      body: `
+        import { Glasses } from "/src/glasses.ts";
+        import { Relay } from "/src/transport.ts";
+        import { InboxModel } from "/src/model.ts";
+        import { mountHud } from "/src/hud.ts";
+        import "/src/style.css";
+        const simulated = window.simulatedG2 = { tiles: {}, audio: [] };
+        const bridge = {
+          createStartUpPageContainer: async () => 0,
+          onEvenHubEvent: listener => {
+            simulated.emit = listener;
+            return () => {};
+          },
+          updateImageRawData: async ({ containerID, imageData }) => {
+            simulated.tiles[containerID] = Array.from(new Uint8Array(imageData).slice(0, 8));
+            return "success";
+          },
+          audioControl: async (open, source) => {
+            simulated.audio.push({ open, source });
+            return true;
+          },
+        };
+        const hud = document.querySelector("#app");
+        hud.id = "hud-panel";
+        mountHud(new Relay(), new Glasses(async () => bridge), new InboxModel(), hud);
+      `,
+    }),
+  );
+  await page.goto("/?hud=1");
+  const hud = page.locator("#hud-panel");
+  await hud.locator("#connect [name=url]").fill("ws://127.0.0.1:47801/");
+  await hud.locator("#connect [name=token]").fill("key");
+  await hud.locator("#connect button").click();
+  await expect(hud.locator("#connection")).toHaveText("VPS подключён");
+  const event = (data: unknown) =>
+    page.evaluate((event) => (window as any).simulatedG2.emit(event), data);
+  const tap = () => event({ sysEvent: {} });
+  await event({ menuItemClickEvent: { itemID: 104 } });
+  await expect(
+    hud.getByRole("button", { name: "+ Новая задача голосом" }),
+  ).toBeEnabled();
+  await tap();
+  await expect(hud.locator("#title")).toHaveText("Новая задача по расписанию");
+  await tap();
+  await expect(hud.locator("#title")).toHaveText("Слушаю…");
+  await event({ audioEvent: { audioPcm: [1, 2, 3, 4] } });
+  await tap();
+  await expect(hud.locator("#text")).toHaveValue(
+    "Каждый день в девять собирай сводку",
+  );
+  const audio = await page.evaluate(() => (window as any).simulatedG2.audio);
+  expect(audio.map((entry: { open: boolean }) => entry.open)).toEqual([
+    true,
+    false,
+  ]);
+  const stt = calls.find((call) => call.method === "workspace.stt.transcribe");
+  expect([...Buffer.from(stt.params.wav, "base64").subarray(44)]).toEqual([
+    1, 2, 3, 4,
+  ]);
+  await hud.getByRole("button", { name: "Продолжить с текстом" }).click();
+  await expect(hud.locator("#body")).toContainText("Europe/Istanbul");
+  expect(
+    (await hud.locator("#body").textContent())?.split("\n").slice(0, 2),
+  ).toEqual([
+    "Голосовая сводка",
+    "Ближайший запуск: 2026-11-10 09:00:00+03:00",
+  ]);
+  await expect(
+    hud.getByRole("button", { name: "Создать задачу", exact: true }),
+  ).toBeEnabled();
+  expect(
+    calls.filter((call) => call.method === "automations.create"),
+  ).toHaveLength(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => Object.keys((window as any).simulatedG2.tiles)),
+    )
+    .toEqual(["10", "11", "12", "13"]);
+  const signature = await page.evaluate(
+    () => (window as any).simulatedG2.tiles[10],
+  );
+  expect(signature).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
+  await hud
+    .locator("#display")
+    .screenshot({ path: "test-results/g2-schedule-simulation.png" });
+  await tap();
+  await expect(
+    hud.getByRole("button", { name: /Голосовая сводка/ }),
+  ).toBeVisible();
+  const creates = calls.filter((call) => call.method === "automations.create");
+  expect(creates).toHaveLength(1);
+  expect(creates[0].params.reviewHash).toBe("a".repeat(64));
+});
 
 test("phone without G2: streaming, draft, attachment upload, addressed Inbox and independent HUD", async ({
   page,

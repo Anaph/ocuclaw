@@ -86,6 +86,37 @@ test("Workspace becomes online only after version negotiation and initial snapsh
   assert.deepEqual(states, [true]);
   relay.disconnect();
 });
+test("outcome consumers receive typed rejections but bare protocol errors still reject", async () => {
+  const { relay, sockets } = harness();
+  relay.connect("ws://localhost/a", "key");
+  const socket = sockets[0];
+  try {
+    await ready(relay, socket);
+    const outcome = relay.request(
+      "automations.receipt",
+      {},
+      { acceptStatus: true },
+    );
+    const rejection = { status: "rejected", error: "preview_expired" };
+    socket.reply("automations.receipt", rejection);
+    assert.deepEqual(await outcome, rejection);
+    const protocolError = relay.request(
+      "automations.receipt",
+      {},
+      { acceptStatus: true },
+    );
+    socket.reply("automations.receipt", { error: "unsupported_operation" });
+    await assert.rejects(protocolError, /unsupported_operation/);
+    const abort = relay.request("sessions.abort");
+    socket.reply("sessions.abort", {
+      status: "rejected",
+      error: "profile_not_served",
+    });
+    await assert.rejects(abort, /profile_not_served/);
+  } finally {
+    relay.disconnect();
+  }
+});
 test("old socket callbacks and negotiation cannot affect another server", async () => {
   const { relay, sockets } = harness();
   const observed: any[] = [];

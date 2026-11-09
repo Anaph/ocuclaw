@@ -21,6 +21,7 @@ export class Glasses {
   }
   onDevice: (connected: boolean) => void = () => {};
   private connecting: Promise<void> | null = null;
+  private displayGeneration = 0;
   private queue = Promise.resolve();
   private desired: HTMLCanvasElement | null = null;
   private pcm: Uint8Array[] = [];
@@ -41,8 +42,10 @@ export class Glasses {
     this.bridge = bridge;
     const connectDisplay = async () => {
       if (this.connecting) return this.connecting;
+      const generation = this.displayGeneration;
       const work = (async () => {
         const result = await bridge.createStartUpPageContainer(createPage());
+        if (generation !== this.displayGeneration) return;
         this.displayReady = result === StartUpPageCreateResult.success;
         this.onDevice(this.displayReady);
       })();
@@ -50,13 +53,15 @@ export class Glasses {
       try {
         await work;
       } finally {
-        this.connecting = null;
+        if (this.connecting === work) this.connecting = null;
       }
     };
     bridge.onDeviceStatusChanged?.((status) => {
       if (status.connectType === "connected")
         void connectDisplay().catch((error) => this.onError(error.message));
       else {
+        this.displayGeneration++;
+        this.connecting = null;
         this.displayReady = false;
         this.onDevice(false);
       }
@@ -95,6 +100,7 @@ export class Glasses {
         const next = this.desired;
         this.desired = null;
         if (!next || !this.bridge || !this.displayReady) return;
+        const generation = this.displayGeneration;
         for (let i = 0; i < 4; i++) {
           const tile = document.createElement("canvas");
           tile.width = 288;
@@ -118,13 +124,16 @@ export class Glasses {
               "image/png",
             ),
           );
+          const imageData = new Uint8Array(await blob.arrayBuffer());
+          if (generation !== this.displayGeneration) return;
           const result = await this.bridge.updateImageRawData(
             new ImageRawDataUpdate({
               containerID: 10 + i,
               containerName: `tile${i}`,
-              imageData: new Uint8Array(await blob.arrayBuffer()),
+              imageData,
             }),
           );
+          if (generation !== this.displayGeneration) return;
           if (!ImageRawDataUpdateResult.isSuccess(result))
             throw Error("G2 не приняли изображение");
         }

@@ -21,6 +21,7 @@ export class Relay {
       resolve: (v: any) => void;
       reject: (e: Error) => void;
       timer: ReturnType<typeof setTimeout>;
+      acceptStatus: boolean;
     }
   >();
   private reconnect?: ReturnType<typeof setTimeout>;
@@ -200,7 +201,11 @@ export class Relay {
         this.pending.delete(frame.id);
         if (frame.version !== 1)
           p.reject(Error("Неподдерживаемая версия Workspace"));
-        else if (frame.data?.error) p.reject(Error(String(frame.data.error)));
+        else if (
+          frame.data?.error &&
+          !(p.acceptStatus && typeof frame.data.status === "string")
+        )
+          p.reject(Error(String(frame.data.error)));
         else p.resolve(frame.data);
       }
     };
@@ -272,15 +277,20 @@ export class Relay {
     });
     return work;
   }
-  request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+  request(
+    method: string,
+    params: Record<string, unknown> = {},
+    options: { acceptStatus?: boolean } = {},
+  ): Promise<any> {
     return this.online
-      ? this.send(method, params)
+      ? this.send(method, params, this.timing.request, options.acceptStatus)
       : Promise.reject(Error("Workspace не подключён"));
   }
   private send(
     method: string,
     params: Record<string, unknown>,
     timeout = this.timing.request,
+    acceptStatus = false,
   ): Promise<any> {
     const socket = this.socket;
     if (!this.socketReady || !socket || socket.readyState !== 1)
@@ -291,7 +301,7 @@ export class Relay {
         this.pending.delete(id);
         reject(Error("Ответ сервера не получен; проверьте состояние"));
       }, timeout);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, acceptStatus });
       try {
         socket.send(
           JSON.stringify({

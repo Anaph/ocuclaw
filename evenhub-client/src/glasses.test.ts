@@ -1,7 +1,16 @@
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { validateEvenHubPageContainer } from "@evenrealities/even_hub_sdk";
-import { createPage, wavBase64 } from "./glasses";
+import {
+  AudioInputSource,
+  validateEvenHubPageContainer,
+} from "@evenrealities/even_hub_sdk";
+import { Glasses, createPage, wavBase64 } from "./glasses";
+beforeEach(() => {
+  Object.defineProperty(globalThis, "location", {
+    value: { search: "" },
+    configurable: true,
+  });
+});
 test("production HUD meets SDK layout validation and tile bounds", () => {
   const page = createPage();
   assert.deepEqual(validateEvenHubPageContainer(page), { valid: true });
@@ -23,10 +32,6 @@ test("captured bytes retain exact PCM and WAV rate/channel metadata", () => {
 });
 
 test("microphone stop is shared and retains tail PCM until host acknowledgment", async () => {
-  Object.defineProperty(globalThis, "location", {
-    value: { search: "" },
-    configurable: true,
-  });
   let emit: (event: any) => void = () => {},
     ack: (value: boolean) => void = () => {};
   let stops = 0;
@@ -42,7 +47,6 @@ test("microphone stop is shared and retains tail PCM until host acknowledgment",
       return await new Promise<boolean>((resolve) => (ack = resolve));
     },
   };
-  const { Glasses } = await import("./glasses");
   const glasses = new Glasses(async () => bridge as any);
   await glasses.init();
   await glasses.start();
@@ -56,10 +60,6 @@ test("microphone stop is shared and retains tail PCM until host acknowledgment",
   assert.equal(stops, 1);
 });
 test("failed microphone start disarms capture and attempts native cleanup", async () => {
-  Object.defineProperty(globalThis, "location", {
-    value: { search: "" },
-    configurable: true,
-  });
   let stops = 0;
   let first = true;
   const bridge = {
@@ -74,7 +74,6 @@ test("failed microphone start disarms capture and attempts native cleanup", asyn
       return true;
     },
   };
-  const { Glasses } = await import("./glasses");
   const glasses = new Glasses(async () => bridge as any);
   await glasses.init();
   await assert.rejects(glasses.start(), /native start failed/);
@@ -84,10 +83,6 @@ test("failed microphone start disarms capture and attempts native cleanup", asyn
 });
 
 test("phone microphone remains available when G2 refuses its display page", async () => {
-  Object.defineProperty(globalThis, "location", {
-    value: { search: "" },
-    configurable: true,
-  });
   const sources: any[] = [];
   const bridge = {
     createStartUpPageContainer: async () => 1,
@@ -97,8 +92,6 @@ test("phone microphone remains available when G2 refuses its display page", asyn
       return true;
     },
   };
-  const { Glasses } = await import("./glasses");
-  const { AudioInputSource } = await import("@evenrealities/even_hub_sdk");
   const glasses = new Glasses(async () => bridge as any);
   await glasses.init();
   assert(!glasses.displayReady);
@@ -106,4 +99,28 @@ test("phone microphone remains available when G2 refuses its display page", asyn
   await glasses.start(AudioInputSource.Phone);
   await glasses.stop();
   assert.deepEqual(sources, [AudioInputSource.Phone]);
+});
+test("a late page acknowledgment cannot revive a disconnected G2 display", async () => {
+  const connectPage: ((value: number) => void)[] = [];
+  let deviceStatus: (status: { connectType: string }) => void = () => {};
+  const bridge = {
+    createStartUpPageContainer: () =>
+      new Promise<number>((resolve) => connectPage.push(resolve)),
+    onDeviceStatusChanged: (listener: typeof deviceStatus) => {
+      deviceStatus = listener;
+    },
+    onEvenHubEvent: () => () => {},
+  };
+  const glasses = new Glasses(async () => bridge as any);
+  const initialized = glasses.init();
+  await Promise.resolve();
+  deviceStatus({ connectType: "disconnected" });
+  deviceStatus({ connectType: "connected" });
+  assert.equal(connectPage.length, 2);
+  connectPage[0](0);
+  await initialized;
+  assert.equal(glasses.displayReady, false);
+  connectPage[1](0);
+  await Promise.resolve();
+  assert.equal(glasses.displayReady, true);
 });
