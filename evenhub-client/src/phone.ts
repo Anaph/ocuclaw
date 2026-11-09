@@ -4,8 +4,8 @@ import { AudioInputSource } from "@evenrealities/even_hub_sdk";
 import {
   Workspace,
   messageText,
-  scheduleExpression,
   scheduleForm,
+  serializeSchedule,
   type ScheduleForm,
   statusText,
   type ScheduleFields,
@@ -46,6 +46,14 @@ const markdown = (text: string) =>
   });
 const date = (value?: string) =>
   value ? value.replace("T", " ").replace(/\.\d+/, "") : "—";
+const readSchedule = (data: FormData): ScheduleForm => ({
+  kind: String(data.get("kind")),
+  date: String(data.get("date")),
+  time: String(data.get("time")),
+  days: data.getAll("days").map(String),
+  interval: String(data.get("interval")),
+  cron: String(data.get("cron")),
+});
 export class PhoneApp {
   readonly data: Workspace;
   private tab: Tab = "chats";
@@ -69,6 +77,7 @@ export class PhoneApp {
     this.attachmentDrafts.set(this.data.scope + this.data.chatKey, files);
   }
   private busy = false;
+  private syncing = false;
   private notice = "";
   private recording = false;
   private recordTimer: ReturnType<typeof setTimeout> | undefined;
@@ -120,13 +129,7 @@ export class PhoneApp {
       error: (text) => this.message(text),
       state: (online) => {
         this.render();
-        if (online)
-          void (async () => {
-            await this.data.catalog();
-            await this.data.list(this.search, this.hidden);
-            if (this.data.chatKey) await this.data.openChat(this.data.chatKey);
-            if (this.tab === "schedule") await this.data.loadJobs();
-          })().catch((error) => this.message(error.message));
+        if (online) void this.syncWorkspace(true);
       },
     });
     const onDevice = glasses.onDevice;
@@ -135,16 +138,8 @@ export class PhoneApp {
       this.render();
     };
     setInterval(() => {
-      if (relay.online && !this.busy)
-        void this.run(async () => {
-          if (this.tab === "chats" && this.data.chatKey)
-            await this.data.openChat(this.data.chatKey, false);
-          else if (this.tab === "chats")
-            await this.data.list(this.search, this.hidden);
-          else if (this.tab === "schedule" && !this.fields && !this.historyJob)
-            await this.data.loadJobs();
-          await this.data.renewChat();
-        }, true);
+      if (relay.online && !this.busy && !this.syncing)
+        void this.syncWorkspace(false);
     }, 15000);
     window.addEventListener("pagehide", () => {
       if (this.recording) void this.stopRecording(true);
@@ -156,14 +151,33 @@ export class PhoneApp {
     this.notice = text;
     this.toast.textContent = text;
   }
-  private async run(action: () => void | Promise<unknown>, quiet = false) {
+  private async syncWorkspace(reconnected: boolean) {
+    const generation = this.data.generation;
+    this.syncing = true;
+    const requests = [this.data.refreshChat(undefined, true)];
+    if (reconnected || (this.tab === "chats" && !this.data.chatKey))
+      requests.push(this.data.list(this.search, this.hidden));
+    if (
+      this.tab === "schedule" &&
+      (reconnected || (!this.fields && !this.historyJob))
+    )
+      requests.push(this.data.loadJobs());
+    else if (reconnected)
+      requests.push(this.data.catalog(this.creationProfile));
+    const results = await Promise.allSettled(requests);
+    if (generation !== this.data.generation) return;
+    this.syncing = false;
+    const failure = results.find((result) => result.status === "rejected");
+    if (reconnected && failure) this.message(failure.reason.message);
+  }
+  private async run(action: () => void | Promise<unknown>) {
     if (this.busy) return;
     this.busy = true;
     this.panel.setAttribute("aria-busy", "true");
     try {
       await action();
     } catch (error) {
-      if (!quiet) this.message((error as Error).message);
+      this.message((error as Error).message);
     } finally {
       this.busy = false;
       this.panel.removeAttribute("aria-busy");
@@ -458,9 +472,7 @@ export class PhoneApp {
           : "Новый чат");
     this.panel.innerHTML = `<div class="heading"><button id="chat-back">‹ Чаты</button><h1>${esc(title)}</h1><button id="on-glasses">На очки</button></div><div class="row" id="chat-actions"></div><div class="messages" role="log" aria-label="Переписка">${this.data.hasMore ? '<button id="older">Предыдущие сообщения</button>' : ""}${this.data.messages.map((message, i) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-meta">${esc(message.role === "user" ? "Вы" : message.role === "assistant" ? "Hermes" : message.role)}${this.showContext ? `<label><input type="checkbox" data-context="${i}" ${this.contextIds.has(String(message.id ?? i)) ? "checked" : ""}> В контекст задачи</label>` : ""}</div><div class="markdown">${markdown(messageText(message.content))}</div><button class="schedule-from" data-index="${i}">В расписание</button></article>`).join("")}${this.data.liveText ? `<article class="message assistant streaming"><div class="message-meta">Hermes · отвечает…</div><div class="markdown">${markdown(this.data.liveText)}</div></article>` : ""}</div><button id="latest">К новым сообщениям ↓</button>${foreign ? '<p class="muted">Это история отдельной сессии. Продолжение и остановка доступны там, где она запущена.</p>' : `<form id="compose-chat"><textarea id="message-input" aria-label="Сообщение Hermes" rows="3" placeholder="Сообщение Hermes…">${esc(this.data.draft())}</textarea><div id="attachment-list" class="row"></div><div class="row"><label class="file-button">Файл<input type="file" id="files" multiple></label><button type="button" id="gallery">Фото</button><button type="button" id="camera">Камера</button><button type="button" id="dictate">${this.recording ? "Завершить диктовку" : "Диктовать"}</button><button type="submit">Отправить</button></div></form>`}`;
     this.bind("#chat-back", async () => {
-      this.data.chatKey = "";
-      this.data.messages = [];
-      await this.data.request("chat.unsubscribe");
+      await this.data.closeChat();
       await this.data.list(this.search, this.hidden);
     });
     this.bind("#on-glasses", () => this.hud.show({ kind: "chat", key, title }));
@@ -486,8 +498,11 @@ export class PhoneApp {
     if (this.data.pendingSend())
       actions.append(
         this.button("Проверить отправку", async () => {
+          const pending = this.data.pendingSend();
+          const edited = pending?.text !== this.data.draft();
           const receipt = await this.data.checkSend();
-          if (receipt?.status === "accepted") this.files = [];
+          if (receipt?.status === "accepted" && pending?.hadFiles && !edited)
+            this.files = [];
           this.message(
             receipt?.status === "not_found"
               ? "Hermes не получил операцию. Можно повторить исходное сообщение."
@@ -526,8 +541,11 @@ export class PhoneApp {
               ? "Вернуть чат в список?"
               : "Скрыть чат? Его активные вопросы останутся во Входящих.",
             async () => {
-              await this.data.request("sessions.patch", { key, hidden: true });
-              this.data.chatKey = "";
+              await this.data.request("sessions.patch", {
+                key,
+                hidden: !session.hidden,
+              });
+              await this.data.closeChat();
               await this.data.list(this.search, this.hidden);
             },
           );
@@ -583,11 +601,16 @@ export class PhoneApp {
       .querySelector("#compose-chat")!
       .addEventListener("submit", (event) => {
         event.preventDefault();
-        const text = this.composer!.value;
+        const text = this.composer!.value,
+          attachments = this.files,
+          files = [...attachments];
         void this.run(async () => {
           if (this.recording) throw Error("Завершите диктовку");
-          await this.data.send(text, this.files);
-          this.files = [];
+          await this.data.send(text, files);
+          for (const file of files) {
+            const index = attachments.indexOf(file);
+            if (index !== -1) attachments.splice(index, 1);
+          }
         });
       });
     const attachments = this.panel.querySelector("#attachment-list")!;
@@ -707,8 +730,7 @@ export class PhoneApp {
               : "Открыть чат",
             async () => {
               if (item.sessionKey.includes(":cron-run:") && item.jobId) {
-                this.data.profile = item.profileId || "default";
-                await this.data.loadJobs();
+                await this.data.loadJobs(item.profileId || "default");
                 const result = await this.data.schedule("jobs.history", {
                   jobId: item.jobId,
                 });
@@ -854,7 +876,6 @@ export class PhoneApp {
     this.preview = null;
     this.historyJob = "";
     const ns = this.data.chatKey.split(":")[1];
-    if (ns) this.data.profile = ns === "main" ? "default" : ns;
     this.fields = {
       name: "",
       prompt: context
@@ -862,7 +883,7 @@ export class PhoneApp {
         : "",
       schedule: "0 9 * * *",
     };
-    await this.data.loadJobs();
+    await this.data.loadJobs(ns ? (ns === "main" ? "default" : ns) : undefined);
     this.render();
   }
   private renderSchedule() {
@@ -1013,6 +1034,23 @@ export class PhoneApp {
   private renderScheduleEditor() {
     const fields = this.fields!;
     const state = this.editorState ?? scheduleForm(fields.schedule);
+    const original = this.job?.fields as ScheduleFields | undefined;
+    const modelValue = (fields: Pick<ScheduleFields, "model" | "provider">) =>
+      fields.model || fields.provider
+        ? `${fields.provider || ""}/${fields.model || ""}`
+        : "";
+    const savedModel = original ? modelValue(original) : "";
+    const availableModel = (value: string) =>
+      this.data.models.find((m) => `${m.provider}/${m.id}` === value);
+    const modelFields = (value: string) => {
+      const model = availableModel(value);
+      if (model) return { model: model.id, provider: model.provider };
+      if (original && savedModel && value === savedModel)
+        return { model: original.model, provider: original.provider };
+      return savedModel
+        ? { model: "", provider: "" }
+        : { model: undefined, provider: undefined };
+    };
     this.editorState = state;
     this.panel.innerHTML = `<button id="schedule-back">‹ Расписание</button><h1>${this.job ? "Изменить задачу" : "Новая задача"}</h1><p class="muted">Пояс Hermes: ${esc(this.data.options?.timezone || "загружается")}</p><form id="schedule-form"><label>Название<input id="job-name" name="name" required maxlength="160" value="${esc(fields.name)}"></label><label>Инструкция и выбранный контекст<textarea id="job-prompt" name="prompt" required rows="7" maxlength="16000">${esc(fields.prompt)}</textarea></label><label>Повтор<select id="schedule-kind" name="kind"><option value="cron">Расширенное / существующее</option><option value="once">Один раз</option><option value="daily">Ежедневно</option><option value="weekly">По дням недели</option><option value="interval">Через интервал</option></select></label><div id="schedule-inputs"><label data-schedule-for="once">Дата<input name="date" type="date" value="${esc(state.date)}"></label><label data-schedule-for="once daily weekly">Время Hermes<input name="time" type="time" value="${esc(state.time)}"></label><fieldset data-schedule-for="weekly"><legend>Дни недели</legend>${[
       [1, "Пн"],
@@ -1029,7 +1067,7 @@ export class PhoneApp {
       )
       .join(
         "",
-      )}</fieldset><label data-schedule-for="interval">Интервал<input name="interval" value="${esc(state.interval)}" placeholder="30m, 2h, 1d"></label><label data-schedule-for="cron">Выражение Hermes<input id="job-expression" name="cron" value="${esc(state.cron)}"></label></div><label>Модель<select name="model"><option value="">Настройка Hermes</option>${this.modelOptions(fields.model ? `${fields.provider}/${fields.model}` : "")}</select></label><button>Проверить расписание</button><button type="button" id="schedule-voice">${this.recording ? "Завершить диктовку" : "Задать голосом"}</button></form><div id="schedule-preview"></div>`;
+      )}</fieldset><label data-schedule-for="interval">Интервал<input name="interval" value="${esc(state.interval)}" placeholder="30m, 2h, 1d"></label><label data-schedule-for="cron">Выражение Hermes<input id="job-expression" name="cron" value="${esc(state.cron)}"></label></div><label>Модель<select name="model"><option value="">Настройка Hermes</option>${this.modelOptions(modelValue(fields))}${savedModel && !availableModel(savedModel) ? `<option value="${esc(savedModel)}" ${savedModel === modelValue(fields) ? "selected" : ""}>${esc(original?.model || original?.provider)} · текущая настройка</option>` : ""}</select></label><button>Проверить расписание</button><button type="button" id="schedule-voice">${this.recording ? "Завершить диктовку" : "Задать голосом"}</button></form><div id="schedule-preview"></div>`;
     this.bind("#schedule-back", () => {
       this.fields = null;
       this.job = null;
@@ -1051,20 +1089,13 @@ export class PhoneApp {
     updateVisibility();
     form.oninput = () => {
       const data = new FormData(form);
-      this.editorState = {
-        kind: String(data.get("kind")),
-        date: String(data.get("date")),
-        time: String(data.get("time")),
-        days: data.getAll("days").map(String),
-        interval: String(data.get("interval")),
-        cron: String(data.get("cron")),
-      };
+      this.editorState = readSchedule(data);
       updateVisibility();
       this.fields = {
         ...this.fields!,
         name: String(data.get("name")),
         prompt: String(data.get("prompt")),
-        schedule: String(data.get("cron")),
+        ...modelFields(String(data.get("model"))),
       };
       this.preview = null;
       this.panel.querySelector("#schedule-preview")?.replaceChildren();
@@ -1073,23 +1104,16 @@ export class PhoneApp {
       event.preventDefault();
       const data = new FormData(form);
       void this.run(async () => {
-        const expression = scheduleExpression(
-          String(data.get("kind")),
-          String(data.get("date")),
-          String(data.get("time")),
-          data.getAll("days").map(String),
-          String(data.get("interval")),
-          String(data.get("cron")),
-        );
-        const model = this.data.models.find(
-          (m) => `${m.provider}/${m.id}` === data.get("model"),
+        const expression = serializeSchedule(
+          readSchedule(data),
+          original?.schedule,
         );
         this.fields = {
           name: String(data.get("name")),
           prompt: String(data.get("prompt")),
           schedule: expression,
           deliver: this.fields?.deliver || "local",
-          ...(model ? { model: model.id, provider: model.provider } : {}),
+          ...modelFields(String(data.get("model"))),
         };
         this.preview = (
           await this.data.schedule("automations.preview", {

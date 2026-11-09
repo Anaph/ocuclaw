@@ -61,6 +61,11 @@ export interface ScheduleOptions {
   runNowPolicy: string;
   stopSupported: boolean;
 }
+interface PendingSend {
+  id: string;
+  text: string;
+  hadFiles: boolean;
+}
 export class Workspace {
   scope = "";
   generation = 0;
@@ -74,14 +79,25 @@ export class Workspace {
   jobs: Job[] = [];
   history: Execution[] = [];
   historyCursor: string | null = null;
-  profile = "default";
+  private selectedProfile = "default";
   options: ScheduleOptions | null = null;
   liveText = "";
   liveRun = "";
   liveSeq = -1;
   onChange = () => {};
   private chatEpoch = 0;
+  private openingChat = "";
+  private refreshEpoch = 0;
+  private sends = new Set<string>();
   private catalogProfile = "";
+  private catalogEpoch = 0;
+  private listEpoch = 0;
+  private jobsEpoch = 0;
+  private profileEpoch = 0;
+  private namespaces: Set<string> | null = null;
+  get profile() {
+    return this.selectedProfile;
+  }
   constructor(
     readonly relay: Relay,
     readonly inbox: InboxModel,
@@ -94,32 +110,32 @@ export class Workspace {
       snapshot: (snapshot) => {
         const allowed = snapshot.authorizedNamespaces;
         if (!Array.isArray(allowed)) return;
+        this.namespaces = new Set(allowed);
         let removed = false;
         const oldSessions = this.sessions.length,
           oldAgents = this.agents.length;
         this.sessions = this.sessions.filter((row) =>
-          allowed.includes(row.key.split(":")[1]),
+          this.canRead(row.key.split(":")[1]),
         );
-        this.agents = this.agents.filter((row) =>
-          allowed.includes(row.id === "default" ? "main" : row.id),
-        );
-        if (this.chatKey && !allowed.includes(this.chatKey.split(":")[1])) {
+        this.agents = this.agents.filter((row) => this.canRead(row.id));
+        if (this.catalogProfile && !this.canRead(this.catalogProfile)) {
+          this.catalogProfile = "";
+          this.models = [];
           removed = true;
-          this.chatEpoch++;
-          this.chatKey = "";
-          this.messages = [];
-          this.liveText = "";
         }
         if (
-          !allowed.includes(this.profile === "default" ? "main" : this.profile)
+          [this.chatKey, this.openingChat].some(
+            (key) => key && !this.canRead(key.split(":")[1]),
+          )
         ) {
-          removed = Boolean(
+          removed = true;
+          this.clearChat();
+        }
+        if (!this.canRead(this.profile)) {
+          removed ||= Boolean(
             this.jobs.length || this.history.length || this.options,
           );
-          this.jobs = [];
-          this.history = [];
-          this.options = null;
-          this.profile = "default";
+          this.selectProfile("default", true);
         }
         if (
           removed ||
@@ -145,29 +161,21 @@ export class Workspace {
           frame.event === "message" ||
           ["complete", "completed", "end", "error"].includes(data.phase)
         )
-          void this.openChat(this.chatKey, false).catch(() => {});
+          void this.refreshChat().catch(() => {});
       },
     });
   }
   reset(address: string) {
     this.generation++;
-    this.chatEpoch++;
+    this.clearChat();
     this.scope = endpointScope(address);
+    this.namespaces = null;
     this.agents = [];
     this.catalogProfile = "";
+    this.catalogEpoch++;
     this.models = [];
     this.sessions = [];
-    this.messages = [];
-    this.chatKey = "";
-    this.jobs = [];
-    this.history = [];
-    this.options = null;
-    this.profile = "default";
-    this.nextBeforeId = null;
-    this.hasMore = false;
-    this.liveText = "";
-    this.liveRun = "";
-    this.liveSeq = -1;
+    this.selectProfile("default", true);
   }
   async request<T = any>(
     method: string,
@@ -188,19 +196,34 @@ export class Workspace {
   saveDraft(text: string, key = this.chatKey) {
     if (key) this.storage.setItem(this.draftKey(key), text);
   }
+  private canRead(namespace: string) {
+    return (
+      this.namespaces?.has(namespace === "default" ? "main" : namespace) ?? true
+    );
+  }
   async catalog(profileId = "default") {
+    const epoch = ++this.catalogEpoch;
     const result = await this.request("workspace.catalog", { profileId });
-    this.catalogProfile = profileId;
-    this.agents = result.agents || [];
-    this.models = result.models || [];
+    if (epoch !== this.catalogEpoch) return;
+    this.agents = (result.agents || []).filter((agent: Agent) =>
+      this.canRead(agent.id),
+    );
+    if (this.canRead(profileId)) {
+      this.catalogProfile = profileId;
+      this.models = result.models || [];
+    }
     this.onChange();
   }
   async list(search = "", includeHidden = false) {
+    const epoch = ++this.listEpoch;
     const result = await this.request("sessions.list", {
       search,
       includeHidden,
     });
-    this.sessions = result.sessions || [];
+    if (epoch !== this.listEpoch) return;
+    this.sessions = (result.sessions || []).filter((session: Session) =>
+      this.canRead(session.key.split(":")[1]),
+    );
     this.onChange();
   }
   async create(profileId: string, model: string, provider: string) {
@@ -211,18 +234,72 @@ export class Workspace {
     await this.openChat(result.key);
     return result.key as string;
   }
-  async openChat(key: string, subscribe = true) {
+  private clearChat() {
+    this.chatEpoch++;
+    this.openingChat = "";
+    this.chatKey = "";
+    this.messages = [];
+    this.nextBeforeId = null;
+    this.hasMore = false;
+    this.liveText = "";
+    this.liveRun = "";
+    this.liveSeq = -1;
+  }
+  async closeChat() {
+    this.clearChat();
+    this.onChange();
+    if (this.relay.online) await this.request("chat.unsubscribe");
+  }
+  async openChat(key: string) {
     const epoch = ++this.chatEpoch;
-    const data = await this.request(
-      subscribe ? "chat.subscribe" : "chat.history",
-      { sessionKey: key, limit: 30 },
-    );
-    if (epoch !== this.chatEpoch) return;
-    const changed = this.chatKey !== key;
-    this.chatKey = key;
-    this.messages = data.messages || [];
-    this.hasMore = data.hasMore === true;
-    this.nextBeforeId = data.nextBeforeId ?? null;
+    this.openingChat = key;
+    try {
+      const data = await this.request("chat.subscribe", {
+        sessionKey: key,
+        limit: 30,
+      });
+      if (epoch !== this.chatEpoch) return;
+      const changed = this.chatKey !== key;
+      this.chatKey = key;
+      this.applyChatPage(data, changed);
+    } finally {
+      if (epoch === this.chatEpoch) this.openingChat = "";
+    }
+  }
+  async refreshChat(key = this.chatKey, renew = false) {
+    if (!key || key !== this.chatKey || this.openingChat) return;
+    const epoch = this.chatEpoch,
+      refresh = ++this.refreshEpoch;
+    const data = await this.request(renew ? "chat.subscribe" : "chat.history", {
+      sessionKey: key,
+      limit: 30,
+    });
+    if (epoch !== this.chatEpoch || refresh !== this.refreshEpoch) return;
+    this.applyChatPage(data, false);
+  }
+  private applyChatPage(
+    data: {
+      messages?: Message[];
+      hasMore?: boolean;
+      nextBeforeId?: string | number | null;
+      total?: number;
+    },
+    changed: boolean,
+  ) {
+    const page = data.messages || [];
+    const first = page[0]?.id;
+    const overlap =
+      changed || first == null
+        ? -1
+        : this.messages.findIndex((message) => message.id === first);
+    if (overlap > 0) {
+      this.messages = [...this.messages.slice(0, overlap), ...page];
+    } else {
+      this.messages = page;
+      const hasMore = data.hasMore ?? (data.total ?? 0) > page.length;
+      this.nextBeforeId = hasMore ? (data.nextBeforeId ?? first ?? null) : null;
+      this.hasMore = this.nextBeforeId !== null;
+    }
     if (
       changed ||
       (this.liveText &&
@@ -234,19 +311,26 @@ export class Workspace {
     ) {
       this.liveText = "";
       this.liveSeq = -1;
+      if (changed) this.liveRun = "";
     }
     this.onChange();
   }
   async older() {
     if (!this.hasMore || this.nextBeforeId === null) return;
     const key = this.chatKey,
-      epoch = this.chatEpoch;
+      epoch = this.chatEpoch,
+      cursor = this.nextBeforeId;
     const data = await this.request("chat.history", {
       sessionKey: key,
       limit: 30,
-      beforeId: this.nextBeforeId,
+      beforeId: cursor,
     });
-    if (epoch !== this.chatEpoch || key !== this.chatKey) return;
+    if (
+      epoch !== this.chatEpoch ||
+      key !== this.chatKey ||
+      cursor !== this.nextBeforeId
+    )
+      return;
     const ids = new Set(this.messages.map((x) => x.id));
     this.messages = [
       ...(data.messages || []).filter(
@@ -258,14 +342,8 @@ export class Workspace {
     this.nextBeforeId = data.nextBeforeId ?? null;
     this.onChange();
   }
-  async renewChat() {
-    if (this.chatKey)
-      await this.request("chat.subscribe", {
-        sessionKey: this.chatKey,
-        limit: 30,
-      });
-  }
   async upload(file: File) {
+    const generation = this.generation;
     const limits = this.relay.capabilities.uploads;
     if (!limits || file.size > limits.fileBytes || file.size === 0)
       throw Error("Файл превышает лимит сервера или пуст");
@@ -279,6 +357,8 @@ export class Workspace {
         const bytes = new Uint8Array(
           await file.slice(offset, offset + row.chunkBytes).arrayBuffer(),
         );
+        if (generation !== this.generation)
+          throw Error("Подключение изменилось");
         let binary = "";
         for (const byte of bytes) binary += String.fromCharCode(byte);
         await this.request("uploads.chunk", {
@@ -289,7 +369,8 @@ export class Workspace {
       }
       return row.id as string;
     } catch (error) {
-      void this.request("uploads.cancel", { id: row.id }).catch(() => {});
+      if (generation === this.generation)
+        void this.request("uploads.cancel", { id: row.id }).catch(() => {});
       throw error;
     }
   }
@@ -297,69 +378,96 @@ export class Workspace {
     const key = this.chatKey;
     if (!key || (!text.trim() && !files.length))
       throw Error("Добавьте сообщение или вложение");
-    const operationKey = `ocuclaw.send:${encodeURIComponent(this.scope)}:${encodeURIComponent(key)}`;
-    const prior = JSON.parse(this.storage.getItem(operationKey) || "null");
-    if (prior) {
-      const receipt = await this.checkSend();
-      if (receipt?.status === "accepted") return receipt;
-      if (receipt?.status !== "not_found")
-        throw Error(
-          "Предыдущая отправка не подтверждена. Проверьте историю и квитанцию.",
-        );
-      if (prior.text !== text || (prior.hadFiles && !files.length))
-        throw Error(
-          "Восстановите исходный текст и вложения перед повтором неподтверждённой отправки.",
-        );
-    }
-    const uploads = [];
-    for (const file of files) uploads.push(await this.upload(file));
-    const operationId = prior?.id || randomId();
-    this.storage.setItem(
-      operationKey,
-      JSON.stringify({ id: operationId, text, hadFiles: files.length > 0 }),
-    );
-    const result = await this.request("agent", {
-      sessionKey: key,
-      message: text,
-      idempotencyKey: operationId,
-      uploadIds: uploads,
-    });
-    if (result.status && result.status !== "accepted") {
-      if (result.status !== "uncertain") this.storage.removeItem(operationKey);
-      throw Error(errorText(result.error || result.status));
-    }
-    this.storage.removeItem(operationKey);
-    this.saveDraft("", key);
-    await this.openChat(key, false);
-    return result;
-  }
-  pendingSend() {
+    const operationKey = this.sendKey(key);
+    if (this.sends.has(operationKey)) throw Error("Сообщение уже отправляется");
+    this.sends.add(operationKey);
+    const generation = this.generation;
+    const uploads: string[] = [];
     try {
-      return JSON.parse(
-        this.storage.getItem(
-          `ocuclaw.send:${encodeURIComponent(this.scope)}:${encodeURIComponent(this.chatKey)}`,
-        ) || "null",
-      );
+      const prior = this.pendingSend(key);
+      if (prior) {
+        const receipt = await this.checkSend(key);
+        if (receipt?.status === "accepted") {
+          if (prior.text !== text || prior.hadFiles !== Boolean(files.length))
+            throw Error(
+              "Предыдущее сообщение принято. Отправьте новый черновик отдельно.",
+            );
+          return receipt;
+        }
+        if (receipt?.status === "rejected")
+          throw Error(
+            errorText(receipt.error || "Hermes отклонил предыдущую отправку"),
+          );
+        if (receipt?.status !== "not_found")
+          throw Error(
+            "Предыдущая отправка не подтверждена. Проверьте историю и квитанцию.",
+          );
+        if (prior.text !== text || prior.hadFiles !== Boolean(files.length))
+          throw Error(
+            "Восстановите исходный текст и вложения перед повтором неподтверждённой отправки.",
+          );
+      }
+      for (const file of files) uploads.push(await this.upload(file));
+      const pending = {
+        id: prior?.id || randomId(),
+        text,
+        hadFiles: files.length > 0,
+      };
+      this.storage.setItem(operationKey, JSON.stringify(pending));
+      const result = await this.request("agent", {
+        sessionKey: key,
+        message: text,
+        idempotencyKey: pending.id,
+        uploadIds: uploads,
+      });
+      uploads.length = 0; // The relay consumed the staged files before dispatching.
+      this.applySendReceipt(key, pending, result);
+      if (result.status !== "accepted")
+        throw Error(
+          errorText(
+            result.error || result.status || "Отправка не подтверждена",
+          ),
+        );
+      return result;
+    } finally {
+      this.sends.delete(operationKey);
+      if (generation === this.generation)
+        for (const id of uploads)
+          void this.request("uploads.cancel", { id }).catch(() => {});
+    }
+  }
+  private sendKey(key: string) {
+    return `ocuclaw.send:${encodeURIComponent(this.scope)}:${encodeURIComponent(key)}`;
+  }
+  pendingSend(key = this.chatKey): PendingSend | null {
+    try {
+      return JSON.parse(this.storage.getItem(this.sendKey(key)) || "null");
     } catch {
       return null;
     }
   }
-  async checkSend() {
-    const pending = this.pendingSend();
+  async checkSend(key = this.chatKey) {
+    const pending = this.pendingSend(key);
     if (!pending) return null;
-    const key = this.chatKey;
     const receipt = await this.request("workspace.send.receipt", {
       sessionKey: key,
       operationId: pending.id,
     });
-    if (receipt.status === "accepted") {
-      this.storage.removeItem(
-        `ocuclaw.send:${encodeURIComponent(this.scope)}:${encodeURIComponent(key)}`,
-      );
-      this.saveDraft("", key);
-      await this.openChat(key, false);
-    }
+    this.applySendReceipt(key, pending, receipt);
     return receipt;
+  }
+  private applySendReceipt(
+    key: string,
+    pending: PendingSend,
+    receipt: { status?: string },
+  ) {
+    if (this.pendingSend(key)?.id !== pending.id) return;
+    if (receipt.status === "accepted" || receipt.status === "rejected")
+      this.storage.removeItem(this.sendKey(key));
+    if (receipt.status === "accepted") {
+      if (this.draft(key) === pending.text) this.saveDraft("", key);
+      void this.refreshChat(key).catch(() => {});
+    }
   }
   async answer(item: Question, answer: Answer) {
     const current = await this.request("inbox.get", {
@@ -380,66 +488,106 @@ export class Workspace {
     if (result.status !== "accepted") throw Error(statusText(result.status));
   }
   async schedule(method: string, payload: Record<string, unknown> = {}) {
-    return this.request(method, { ...payload, profileId: this.profile });
+    const epoch = this.profileEpoch;
+    const result = await this.request(method, {
+      ...payload,
+      profileId: this.profile,
+    });
+    if (epoch !== this.profileEpoch) throw Error("Профиль изменился");
+    return result;
+  }
+  private selectProfile(profile: string, reset = false) {
+    if (profile === this.profile && !reset) return;
+    this.profileEpoch++;
+    this.jobsEpoch++;
+    this.selectedProfile = profile;
+    this.jobs = [];
+    this.history = [];
+    this.historyCursor = null;
+    this.options = null;
   }
   async loadJobs(profile = this.profile) {
-    this.profile = profile;
-    if (this.catalogProfile !== profile) await this.catalog(profile);
-    const generation = this.generation;
-    const options = await this.schedule("automations.options");
+    this.selectProfile(profile);
+    const epoch = ++this.jobsEpoch;
+    const options = await this.request("automations.options", {
+      profileId: profile,
+    });
+    if (epoch !== this.jobsEpoch) return;
     const data = options.supported
-      ? await this.schedule("jobs.list")
+      ? await this.request("jobs.list", { profileId: profile })
       : { jobs: [] };
-    if (generation !== this.generation || profile !== this.profile) return;
+    if (epoch !== this.jobsEpoch) return;
     this.options = options;
     this.jobs = data.jobs || [];
     this.onChange();
+    if (this.catalogProfile !== profile) await this.catalog(profile);
   }
   private receiptKey() {
     return `ocuclaw.scheduleOperation:${encodeURIComponent(this.scope)}:${this.profile}`;
   }
   async mutateSchedule(operation: string, params: Record<string, unknown>) {
-    if (this.storage.getItem(this.receiptKey()))
+    const key = this.receiptKey(),
+      profileId = this.profile;
+    if (this.storage.getItem(key))
       throw Error("Сначала проверьте предыдущую операцию расписания");
     const operationId = randomId();
-    this.storage.setItem(
-      this.receiptKey(),
-      JSON.stringify({ operationId, operation, params }),
-    );
-    const result = await this.schedule(operation, { ...params, operationId });
-    if (result.status !== "uncertain")
-      this.storage.removeItem(this.receiptKey());
+    const saved = JSON.stringify({ operationId, operation, params });
+    this.storage.setItem(key, saved);
+    return this.submitSchedule(key, saved, profileId);
+  }
+  private async submitSchedule(key: string, saved: string, profileId: string) {
+    const { operation, operationId, params } = JSON.parse(saved);
+    const result = await this.request(operation, {
+      ...params,
+      operationId,
+      profileId,
+    });
+    this.applyScheduleReceipt(key, saved, result);
     if (result.status === "rejected")
       throw Error(errorText(result.error || "Hermes отклонил изменение"));
-    if (result.status === "uncertain")
+    if (result.status === "uncertain" || !result.status)
       throw Error("Результат неизвестен. Проверьте операцию перед повтором.");
     return result;
   }
+  private applyScheduleReceipt(
+    key: string,
+    saved: string,
+    result: { status?: string },
+  ) {
+    if (
+      result.status &&
+      !["uncertain", "not_found"].includes(result.status) &&
+      this.storage.getItem(key) === saved
+    )
+      this.storage.removeItem(key);
+  }
   async retrySchedule() {
-    const saved = JSON.parse(this.storage.getItem(this.receiptKey()) || "null");
+    const key = this.receiptKey(),
+      profileId = this.profile,
+      epoch = this.profileEpoch;
+    const saved = this.storage.getItem(key);
     if (!saved) return;
-    const receipt = await this.schedule("automations.receipt", {
-      operationId: saved.operationId,
+    const receipt = await this.request("automations.receipt", {
+      operationId: JSON.parse(saved).operationId,
+      profileId,
     });
+    this.applyScheduleReceipt(key, saved, receipt);
     if (receipt.status !== "not_found")
       throw Error("Операция уже известна Hermes; повтор не отправлен");
-    const result = await this.schedule(saved.operation, {
-      ...saved.params,
-      operationId: saved.operationId,
-    });
-    if (result.status !== "uncertain")
-      this.storage.removeItem(this.receiptKey());
-    if (result.error) throw Error(result.error);
-    return result;
+    if (epoch !== this.profileEpoch || this.storage.getItem(key) !== saved)
+      throw Error("Операция или профиль изменились. Повтор не отправлен.");
+    return this.submitSchedule(key, saved, profileId);
   }
   async reconcileSchedule() {
-    const saved = JSON.parse(this.storage.getItem(this.receiptKey()) || "null");
+    const key = this.receiptKey(),
+      profileId = this.profile;
+    const saved = this.storage.getItem(key);
     if (!saved) return null;
-    const result = await this.schedule("automations.receipt", {
-      operationId: saved.operationId,
+    const result = await this.request("automations.receipt", {
+      operationId: JSON.parse(saved).operationId,
+      profileId,
     });
-    if (result.status !== "uncertain" && result.status !== "not_found")
-      this.storage.removeItem(this.receiptKey());
+    this.applyScheduleReceipt(key, saved, result);
     return result;
   }
 }
@@ -545,7 +693,7 @@ export function scheduleForm(expression: string): ScheduleForm {
     cron: expression,
   };
   const interval = /^every (\d+[mhd])$/.exec(expression);
-  const once = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d)/.exec(expression);
+  const once = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d)(?::00)?$/.exec(expression);
   const simple = /^(\d{1,2}) (\d{1,2}) \* \* ([0-6](?:,[0-6])*|\*)$/.exec(
     expression,
   );
@@ -562,4 +710,12 @@ export function scheduleForm(expression: string): ScheduleForm {
     form.days = simple[3] === "*" ? [] : simple[3].split(",");
   }
   return form;
+}
+export function serializeSchedule(form: ScheduleForm, original?: string) {
+  const encode = ({ kind, date, time, days, interval, cron }: ScheduleForm) =>
+    scheduleExpression(kind, date, time, [...days].sort(), interval, cron);
+  const expression = encode(form);
+  return original && expression === encode(scheduleForm(original))
+    ? original
+    : expression;
 }

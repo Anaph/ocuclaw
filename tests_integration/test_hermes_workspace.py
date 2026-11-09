@@ -6,6 +6,7 @@ Never connects to a VPS or inference provider.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -13,11 +14,22 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest.mock import patch
 
 
 class HermesWorkspaceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parents[1]
+        package = types.ModuleType("ocuclaw")
+        package.__path__ = [str(root)]
+        sys.modules["ocuclaw"] = package
+        from ocuclaw.workspace_schedule import WorkspaceSchedule
+
+        cls.WorkspaceSchedule = WorkspaceSchedule
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -101,6 +113,27 @@ class HermesWorkspaceTest(unittest.TestCase):
             self.assertEqual(self.api.handle("jobs.run", params)["status"], "uncertain")
             self.assertEqual(action.call_count, 1)
         self.assertEqual(self.api.receipt("uncertain-1")["status"], "uncertain")
+
+    def test_editing_interval_metadata_keeps_native_next_run(self):
+        native = self.jobs.create_job(
+            name="Отчёт", prompt="Собрать данные", schedule="every 2h"
+        )
+        current = self.api.handle("automations.read", {"jobId": native["id"]})["job"]
+        params = {
+            "jobId": native["id"],
+            "revision": current["revision"],
+            "fields": {**current["fields"], "name": "Новый отчёт"},
+        }
+        preview = self.api.handle("automations.preview", params)["preview"]
+        self.assertEqual(len(preview["nextRuns"]), 5)
+        self.assertEqual(preview["nextRuns"][0], native["next_run_at"])
+        result = self.api.handle(
+            "automations.update",
+            {**params, "reviewHash": preview["reviewHash"], "operationId": "rename-1"},
+        )
+        self.assertEqual(result["status"], "saved", result)
+        self.assertEqual(result["job"]["name"], "Новый отчёт")
+        self.assertEqual(result["job"]["nextRunAt"], native["next_run_at"])
 
     def test_question_from_another_process_and_dead_owner(self):
         job, _ = self.create()
@@ -232,14 +265,6 @@ print(json.dumps({'answer':answer},ensure_ascii=False),flush=True)
         self.assertEqual(self.jobs.get_job(first["id"])["state"], "scheduled")
 
     def test_plugin_models_resolve_the_selected_profile(self):
-        import asyncio
-        import types
-
-        root = Path(__file__).resolve().parents[1]
-        package = types.ModuleType("ocuclaw")
-        package.__path__ = [str(root)]
-        sys.modules["ocuclaw"] = package
-        from ocuclaw.workspace_schedule import WorkspaceSchedule
         from hermes_cli.config import load_config_readonly
 
         with tempfile.TemporaryDirectory() as directory:
@@ -261,13 +286,38 @@ print(json.dumps({'answer':answer},ensure_ascii=False),flush=True)
                     }
 
             self_outer = self
-            api = WorkspaceSchedule(Rpc())
+            api = self.WorkspaceSchedule(Rpc())
             result = asyncio.run(api.models({"profileId": "research"}))
             self.assertEqual(result["models"][0]["id"], "research-model")
             result = asyncio.run(api.models({"profileId": "default"}))
             self.assertEqual(result["models"][0]["id"], "test-model")
             with self.assertRaisesRegex(ValueError, "profile_not_served"):
                 asyncio.run(api.models({"profileId": "private"}))
+
+    def test_oversized_cron_history_message_keeps_a_pagination_cursor(self):
+        from cron.executions import create_execution
+
+        job, _ = self.create()
+        execution = create_execution(job["id"], source="integration")
+        self.api.record_session(job["id"], execution["id"], "cron_large_message")
+        rpc = types.SimpleNamespace(
+            _routing_snapshot=lambda: (True, {"main": Path(self.directory.name)})
+        )
+        transcript = types.SimpleNamespace(
+            conversation_by_id=lambda session, limit: [
+                {"id": 1, "role": "user", "content": "Начало"},
+                {"id": 2, "role": "assistant", "content": "А" * 200_000},
+            ]
+        )
+        api = self.WorkspaceSchedule(rpc, transcript)
+        params = {"sessionKey": "hermes:main:x:cron:cron_large_message", "limit": 1}
+        page = asyncio.run(api.chat_history(params))
+        self.assertTrue(page["hasMore"])
+        self.assertIn("сообщение сокращено", page["messages"][0]["content"])
+        previous = asyncio.run(
+            api.chat_history({**params, "beforeId": page["nextBeforeId"]})
+        )
+        self.assertEqual(previous["messages"][0]["content"], "Начало")
 
     def test_preview_is_native_and_read_only(self):
         for schedule in ["every 2h", "0 9 * * *", "0 9 * * 1-5"]:

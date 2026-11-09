@@ -4,6 +4,7 @@ const { isForeignHermesSessionKey } = require("./hermes-session-keys.cjs");
 function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
   const subscribers = new Map();
   const chatSubscribers = new Map();
+  const pendingChatSubscriptions = new Map();
   const uploads = createWorkspaceUploads(now);
   const off = ["streaming", "message", "activity"]
     .map((name) =>
@@ -123,13 +124,13 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         return;
       }
       const data = await snapshot();
+      const revoked = (sub) =>
+        Array.isArray(data.authorizedNamespaces) &&
+        !data.authorizedNamespaces.includes(sub.key.split(":")[1]);
       for (const [id, sub] of chatSubscribers)
-        if (
-          sub.until < now() ||
-          (Array.isArray(data.authorizedNamespaces) &&
-            !data.authorizedNamespaces.includes(sub.key.split(":")[1]))
-        )
-          chatSubscribers.delete(id);
+        if (sub.until < now() || revoked(sub)) chatSubscribers.delete(id);
+      for (const [id, sub] of pendingChatSubscriptions)
+        if (revoked(sub)) pendingChatSubscriptions.delete(id);
       const fingerprint = JSON.stringify([
         data.pending,
         data.completed,
@@ -233,19 +234,33 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         )
           throw Error("invalid_session");
         // Reading first is also the live admission check. No global selected chat changes.
-        const history = await bridge.request(
-          /:x:cron:/.test(p.sessionKey)
-            ? "workspace.cron.history"
-            : "chat.history",
-          { sessionKey: p.sessionKey, limit: 30 },
-        );
-        chatSubscribers.set(clientId, {
+        const subscription = {
           key: p.sessionKey,
           until: now() + 45000,
-        });
-        return reply(history);
+        };
+        pendingChatSubscriptions.set(clientId, subscription);
+        try {
+          const history = await bridge.request(
+            /:x:cron:/.test(p.sessionKey)
+              ? "workspace.cron.history"
+              : "chat.history",
+            { sessionKey: p.sessionKey, limit: 30 },
+          );
+          if (
+            pendingChatSubscriptions.get(clientId) === subscription &&
+            !history?.error
+          ) {
+            subscription.until = now() + 45000;
+            chatSubscribers.set(clientId, subscription);
+          }
+          return reply(history);
+        } finally {
+          if (pendingChatSubscriptions.get(clientId) === subscription)
+            pendingChatSubscriptions.delete(clientId);
+        }
       }
       if (frame.method === "chat.unsubscribe") {
+        pendingChatSubscriptions.delete(clientId);
         chatSubscribers.delete(clientId);
         return reply({ ok: true });
       }
@@ -257,10 +272,20 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
       if (frame.method === "agent") {
         if (p.attachments !== undefined)
           throw Error("use_authenticated_uploads");
+        if (
+          typeof p.idempotencyKey !== "string" ||
+          !/^[A-Za-z0-9_-]{1,128}$/.test(p.idempotencyKey)
+        )
+          throw Error("invalid_operation_id");
         return reply(
           await bridge.request("workspace.send", {
-            ...p,
-            attachments: uploads.descriptors(clientId, p.uploadIds || []),
+            sessionKey: p.sessionKey,
+            message: p.message,
+            idempotencyKey: p.idempotencyKey,
+            attachments: uploads.take(
+              clientId,
+              p.uploadIds === undefined ? [] : p.uploadIds,
+            ),
           }),
         );
       }
@@ -347,12 +372,14 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
     disconnect(id) {
       subscribers.delete(id);
       chatSubscribers.delete(id);
+      pendingChatSubscriptions.delete(id);
       uploads.release(id);
     },
     close() {
       closed = true;
       for (const unsubscribe of off) unsubscribe();
       chatSubscribers.clear();
+      pendingChatSubscriptions.clear();
       uploads.close();
       titleQueue.clear();
       titles.clear();

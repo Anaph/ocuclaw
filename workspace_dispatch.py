@@ -22,7 +22,6 @@ class WorkspaceDispatch:
             "CREATE TABLE IF NOT EXISTS sends (id TEXT PRIMARY KEY,session TEXT NOT NULL,fingerprint TEXT NOT NULL,result TEXT NOT NULL,created REAL NOT NULL)"
         )
         self.db.commit()
-        self.lock = asyncio.Lock()
 
     @staticmethod
     def fingerprint(params):
@@ -59,51 +58,50 @@ class WorkspaceDispatch:
         if not isinstance(operation, str) or not re.fullmatch(
             r"[A-Za-z0-9_-]{1,128}", operation
         ):
+            discard(params.get("attachments"))
             raise ValueError("invalid_operation_id")
         try:
             fingerprint = await asyncio.to_thread(self.fingerprint, params)
         except Exception:
             discard(params.get("attachments"))
             raise
-        async with self.lock:
+        with self.db:
+            inserted = self.db.execute(
+                "INSERT INTO sends VALUES (?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+                (
+                    operation,
+                    params.get("sessionKey", ""),
+                    fingerprint,
+                    json.dumps({"status": "uncertain"}),
+                    time.time(),
+                ),
+            ).rowcount
+        if not inserted:
             previous = self.db.execute(
-                "SELECT session,fingerprint,result FROM sends WHERE id=?", (operation,)
+                "SELECT fingerprint,result FROM sends WHERE id=?", (operation,)
             ).fetchone()
-            if previous:
-                discard(params.get("attachments"))
-                if previous[1] != fingerprint:
-                    raise ValueError("operation_conflict")
-                return json.loads(previous[2])
-            with self.db:
-                self.db.execute(
-                    "INSERT INTO sends VALUES (?,?,?,?,?)",
-                    (
-                        operation,
-                        params.get("sessionKey", ""),
-                        fingerprint,
-                        json.dumps({"status": "uncertain"}),
-                        time.time(),
-                    ),
-                )
-            forwarded = {k: v for k, v in params.items() if k != "workspaceOperationId"}
-            try:
-                result = await dispatch(forwarded)
-            except Exception:
-                discard(params.get("attachments"))
-                return {"status": "uncertain"}
-            with self.db:
-                self.db.execute(
-                    "UPDATE sends SET result=? WHERE id=?",
-                    (json.dumps(result), operation),
-                )
-            return result
+            discard(params.get("attachments"))
+            if previous[0] != fingerprint:
+                raise ValueError("operation_conflict")
+            return json.loads(previous[1])
+        forwarded = {k: v for k, v in params.items() if k != "workspaceOperationId"}
+        try:
+            result = await dispatch(forwarded)
+        except Exception:
+            discard(params.get("attachments"))
+            return {"status": "uncertain"}
+        with self.db:
+            self.db.execute(
+                "UPDATE sends SET result=? WHERE id=?",
+                (json.dumps(result), operation),
+            )
+        return result
 
     async def receipt(self, params):
-        async with self.lock:
-            row = self.db.execute(
-                "SELECT session,result FROM sends WHERE id=?",
-                (params.get("operationId"),),
-            ).fetchone()
-            if not row or row[0] != params.get("sessionKey"):
-                return {"status": "not_found"}
-            return json.loads(row[1])
+        row = self.db.execute(
+            "SELECT session,result FROM sends WHERE id=?",
+            (params.get("operationId"),),
+        ).fetchone()
+        if not row or row[0] != params.get("sessionKey"):
+            return {"status": "not_found"}
+        return json.loads(row[1])

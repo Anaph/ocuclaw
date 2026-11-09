@@ -18,6 +18,36 @@ const {createHermesGatewayBridge}=require('../dist-cjs/runtime/hermes-gateway-br
  assert.equal(calls.at(-1).params.workspaceOperationId,'send-id');
  await request('a','workspace.send.receipt',{sessionKey:'hermes:main:a',operationId:'send-id'});assert.equal(calls.at(-1).method,'workspace.send.receipt');assert.deepEqual(calls.at(-1).params.target,{ns:'main',chatId:'a'});
  const denied=await request('a','agent',{sessionKey:'hermes:main:a',message:'x',attachments:[{path:'/private'}]});assert.equal(denied.error,'use_authenticated_uploads');
+ assert.equal((await request('a','agent',{sessionKey:'hermes:main:a',message:'x'})).error,'invalid_operation_id');
  service.disconnect('a');dispatchBackendEvent('streaming',{sessionKey:'hermes:main:a',text:'After disconnect'});assert.equal(events.length,1);
  service.close();console.log('test_workspace_phone OK');
 })().catch(error=>{console.error(error);process.exitCode=1;});
+
+(async () => {
+ const readers = [], events = [];
+ let stream;
+ const service = createWorkspaceService({
+   bridge: {
+     request: () => new Promise(resolve => readers.push(resolve)),
+     on(event, listener) { if (event === 'streaming') stream = listener; },
+   },
+   send: (_, event) => events.push(event.data.sessionKey),
+ });
+ const request = (method, sessionKey) =>
+   service.request('phone', { version: 1, id: 'req', method, params: { sessionKey } });
+ const old = request('chat.subscribe', 'hermes:main:a');
+ const latest = request('chat.subscribe', 'hermes:main:b');
+ readers[1]({ messages: [] });
+ await latest;
+ readers[0]({ messages: [] });
+ await old;
+ stream({ sessionKey: 'hermes:main:a' });
+ stream({ sessionKey: 'hermes:main:b' });
+ const closing = request('chat.subscribe', 'hermes:main:c');
+ await request('chat.unsubscribe');
+ readers[2]({ messages: [] });
+ await closing;
+ stream({ sessionKey: 'hermes:main:c' });
+ assert.deepEqual(events, ['hermes:main:b']);
+ service.close();
+})().catch(error => { console.error(error); process.exitCode = 1; });

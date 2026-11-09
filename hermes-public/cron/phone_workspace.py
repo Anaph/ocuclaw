@@ -326,20 +326,24 @@ def preview(params):
 
     fields = _fields(params.get("fields"))
     job_id = params.get("jobId")
-    revision = _job(jobs.get_job(job_id))["revision"] if job_id else None
+    current = jobs.get_job(job_id) if job_id else None
+    revision = _job(current)["revision"] if job_id else None
     if job_id and revision != params.get("revision"):
         raise ValueError("stale_edit")
-    parsed = jobs.parse_schedule(fields["schedule"])
-    runs, previous = [], None
-    for _ in range(5):
-        next_run = jobs.compute_next_run(parsed, previous)
-        if not next_run or next_run in runs:
-            break
+    unchanged = current and fields["schedule"] == _editable(current)["schedule"]
+    parsed = (
+        current["schedule"] if unchanged else jobs.parse_schedule(fields["schedule"])
+    )
+    next_run = (
+        current.get("next_run_at") if unchanged else jobs.compute_next_run(parsed)
+    )
+    runs = []
+    while next_run and next_run not in runs:
         runs.append(next_run)
-        previous = next_run
-        if parsed.get("kind") == "once":
+        if len(runs) == 5 or parsed.get("kind") == "once":
             break
-    if not runs:
+        next_run = jobs.compute_next_run(parsed, next_run)
+    if not runs and not unchanged:
         raise ValueError("schedule_has_no_future_run")
     meta = options()
     review = digest(
@@ -436,6 +440,8 @@ def _mutate(operation, p):
             except Exception:
                 return {"status": "saved", "registration": "failed", "job": _job(job)}
         else:
+            if fields["schedule"] == _editable(current)["schedule"]:
+                fields.pop("schedule")
             job = jobs.update_job(job_id, fields)
         resolve_cron_scheduler().on_jobs_changed()
         return {"status": "saved", "registration": "registered", "job": _job(job)}

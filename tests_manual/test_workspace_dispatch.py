@@ -64,6 +64,39 @@ async def check():
             "status"
         ] == "uncertain"
         assert len(calls) == 2
+        admitted, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(params):
+            admitted.set()
+            await release.wait()
+            return {"status": "accepted"}
+
+        inflight = dict(params, workspaceOperationId="slow")
+        task = asyncio.create_task(store.send(inflight, slow, lambda _: None))
+        await asyncio.wait_for(admitted.wait(), 1)
+        try:
+            receipt = await asyncio.wait_for(
+                store.receipt(
+                    {"operationId": "slow", "sessionKey": params["sessionKey"]}
+                ),
+                1,
+            )
+            assert receipt["status"] == "uncertain"
+            replay = await asyncio.wait_for(
+                store.send(inflight, dispatch, lambda _: None), 1
+            )
+            assert replay["status"] == "uncertain"
+            other = dict(
+                params, workspaceOperationId="other", sessionKey="hermes:main:b"
+            )
+            result = await asyncio.wait_for(
+                store.send(other, dispatch, lambda _: None), 1
+            )
+            assert result["status"] == "accepted"
+            assert len(calls) == 3
+        finally:
+            release.set()
+            await task
         store.db.close()
 
 

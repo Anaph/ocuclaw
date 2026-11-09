@@ -81,14 +81,14 @@ function createWorkspaceUploads(now = Date.now) {
       row.until = now() + 300000;
       return { id: p.id, offset: row.bytes, complete: row.bytes === row.size };
     },
-    descriptors(owner, ids) {
+    take(owner, ids) {
       if (
         !Array.isArray(ids) ||
         ids.length > LIMITS.files ||
         new Set(ids).size !== ids.length
       )
         throw Error("invalid_attachments");
-      return ids.map((id) => {
+      const descriptors = ids.map((id) => {
         const row = own(owner, id);
         if (row.bytes !== row.size) throw Error("upload_incomplete");
         return {
@@ -98,6 +98,8 @@ function createWorkspaceUploads(now = Date.now) {
           content: Buffer.concat(row.parts).toString("base64"),
         };
       });
+      for (const id of ids) uploads.delete(id);
+      return descriptors;
     },
     release(owner) {
       for (const [id, row] of uploads)
