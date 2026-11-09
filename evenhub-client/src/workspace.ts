@@ -70,6 +70,9 @@ interface PendingSend {
 export interface SendAttempt {
   pending?: PendingSend;
 }
+export interface AnswerAttempt {
+  operationId?: string;
+}
 const activeSends = new Set<string>();
 const terminalAnswers = new Set([
   "accepted",
@@ -502,37 +505,54 @@ export class Workspace {
       void this.refreshChat(key).catch(() => {});
     }
   }
-  async answer(item: Question, answer: Answer) {
+  async checkAnswer(item: Question, attempt: AnswerAttempt) {
     const store = new ReceiptStore(sessionStorage, this.scope);
-    const identity = { id: item.id, sessionKey: item.sessionKey };
-    const pending = () =>
-      store
-        .list()
-        .find(
-          (entry) =>
-            entry.id === identity.id &&
-            entry.sessionKey === identity.sessionKey,
-        );
-    const previous = pending();
-    if (previous) {
+    if (attempt.operationId) {
       const receipt = await this.outcome("inbox.operation", {
-        operationId: previous.operationId,
+        operationId: attempt.operationId,
       });
       if (receipt.status !== "not_found") {
         if (terminalAnswers.has(receipt.status))
-          store.clear(previous.operationId);
+          store.clear(attempt.operationId);
         return receipt;
       }
     }
-    const current = await this.request("inbox.get", identity);
-    if (current.status !== "pending") {
-      if (previous && terminalAnswers.has(current.status))
-        store.clear(previous.operationId);
-      return current;
-    }
+    const current = await this.request("inbox.get", {
+      id: item.id,
+      sessionKey: item.sessionKey,
+    });
+    if (attempt.operationId && terminalAnswers.has(current.status))
+      store.clear(attempt.operationId);
+    return current;
+  }
+  private answerReceipt(store: ReceiptStore, item: Question) {
+    return store
+      .list()
+      .find(
+        (entry) => entry.id === item.id && entry.sessionKey === item.sessionKey,
+      );
+  }
+  answerAttempt(item: Question): AnswerAttempt {
+    return {
+      operationId: this.answerReceipt(
+        new ReceiptStore(sessionStorage, this.scope),
+        item,
+      )?.operationId,
+    };
+  }
+  async answer(item: Question, answer: Answer, attempt: AnswerAttempt = {}) {
+    const store = new ReceiptStore(sessionStorage, this.scope);
+    const identity = { id: item.id, sessionKey: item.sessionKey };
+    const pending = () => this.answerReceipt(store, item);
+    const previous = pending();
+    attempt.operationId ??= previous?.operationId;
+    if (previous && previous.operationId !== attempt.operationId)
+      return { status: "uncertain" };
+    const current = await this.checkAnswer(item, attempt);
+    if (current.status !== "pending") return current;
     if (pending()?.operationId !== previous?.operationId)
       return { status: "uncertain" };
-    const operationId = previous?.operationId ?? randomId();
+    const operationId = (attempt.operationId ??= randomId());
     store.save({ ...identity, operationId });
     const result = await this.outcome("inbox.answer", {
       ...identity,

@@ -2,9 +2,15 @@ import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import {
   AudioInputSource,
+  EventSourceType,
+  List_ItemEvent,
+  OsEventTypeList,
+  Sys_ItemEvent,
+  Text_ItemEvent,
   validateEvenHubPageContainer,
 } from "@evenrealities/even_hub_sdk";
 import { Glasses, createPage, wavBase64 } from "./glasses";
+import { gesture } from "./hud-input";
 beforeEach(() => {
   Object.defineProperty(globalThis, "location", {
     value: { search: "" },
@@ -20,6 +26,49 @@ test("production HUD meets SDK layout validation and tile bounds", () => {
     assert(tile.xPosition! + tile.width! <= 576);
     assert(tile.yPosition! + tile.height! <= 288);
   }
+});
+test("ring gestures accept protobuf click defaults and ignore system lifecycle events", () => {
+  const ring = EventSourceType.TOUCH_EVENT_FROM_RING;
+  assert.equal(
+    gesture({ sysEvent: new Sys_ItemEvent({ eventSource: ring }) }),
+    "select",
+  );
+  assert.equal(
+    gesture({
+      sysEvent: new Sys_ItemEvent({
+        eventSource: ring,
+        eventType: OsEventTypeList.DOUBLE_CLICK_EVENT,
+      }),
+    }),
+    "back",
+  );
+  assert.equal(
+    gesture({
+      textEvent: new Text_ItemEvent({
+        eventType: OsEventTypeList.SCROLL_BOTTOM_EVENT,
+      }),
+    }),
+    "down",
+  );
+  assert.equal(gesture({ listEvent: new List_ItemEvent() }), "select");
+  assert.equal(
+    gesture({
+      sysEvent: new Sys_ItemEvent({
+        eventSource: ring,
+        eventType: OsEventTypeList.LONG_PRESS_EVENT,
+      }),
+    }),
+    undefined,
+  );
+  assert.equal(
+    gesture({
+      sysEvent: new Sys_ItemEvent({
+        eventType: OsEventTypeList.FOREGROUND_EXIT_EVENT,
+      }),
+    }),
+    undefined,
+  );
+  assert.equal(gesture({ sysEvent: new Sys_ItemEvent() }), undefined);
 });
 test("captured bytes retain exact PCM and WAV rate/channel metadata", () => {
   const pcm = new Uint8Array([1, 2, 253, 254]);

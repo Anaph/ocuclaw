@@ -13,6 +13,8 @@ import {
   type Job,
 } from "./workspace";
 import {
+  canSend,
+  orderedQuestions,
   sessionStatus,
   type InboxModel,
   type Question,
@@ -55,6 +57,25 @@ const readSchedule = (data: FormData): ScheduleForm => ({
   interval: String(data.get("interval")),
   cron: String(data.get("cron")),
 });
+type ScheduleDraft = {
+  fields: ScheduleFields;
+  form: ScheduleForm | null;
+  revision?: string;
+  original?: Job["fields"];
+};
+type SchedulePreview = {
+  reviewHash: string;
+  scheduleDisplay?: string;
+  timezone: string;
+  nextRuns: string[];
+};
+const deadline = (expiresAt: number | null) => {
+  if (expiresAt === null) return "Без срока";
+  const seconds = Math.ceil((expiresAt - Date.now()) / 1000);
+  if (seconds <= 0) return "Срок истёк";
+  if (seconds < 60) return `Осталось ${seconds} с`;
+  return `Осталось ${Math.ceil(seconds / 60)} мин`;
+};
 export class PhoneApp {
   readonly data: Workspace;
   private tab: Tab = "chats";
@@ -84,7 +105,9 @@ export class PhoneApp {
   private recordTimer: ReturnType<typeof setTimeout> | undefined;
   private jobFilter = "all";
   private job: Job | null = null;
-  private preview: any = null;
+  private preview: SchedulePreview | null = null;
+  private previewUntil = 0;
+  private scheduleDraftProfile = "";
   private fields: ScheduleFields | null = null;
   private editorState: ScheduleForm | null = null;
   private historyJob = "";
@@ -102,6 +125,10 @@ export class PhoneApp {
   private answerDraft = "";
   private contextIds = new Set<string>();
   private showContext = false;
+  private renderedChatKey = "";
+  private renderedMessages: Workspace["messages"] | null = null;
+  private renderedStream = "";
+  private keepHistoryAnchor = false;
   constructor(
     private root: HTMLElement,
     private relay: Relay,
@@ -116,16 +143,14 @@ export class PhoneApp {
     this.status = root.querySelector("#phone-status")!;
     this.toast = root.querySelector("#phone-notice")!;
     this.bottom = root.querySelector(".bottom-nav")!;
-    this.data.onChange = () => this.render();
+    this.data.onChange = () => {
+      if (!this.updateChatStream()) this.render();
+    };
     relay.observe({
       snapshot: () => {
-        if (
-          this.tab === "inbox" &&
-          !this.fields &&
-          !this.recording &&
-          !this.confirmation
-        )
+        if (this.tab === "inbox" && !this.recording && !this.confirmation)
           this.render();
+        else this.renderTabs();
       },
       error: (text) => this.message(text),
       state: (online) => {
@@ -145,6 +170,21 @@ export class PhoneApp {
     window.addEventListener("pagehide", () => {
       if (this.recording) void this.stopRecording(true);
     });
+    const viewport = window.visualViewport;
+    const fitViewport = () => {
+      if (!viewport || viewport.scale !== 1) return;
+      this.root.style.setProperty(
+        "--phone-visible-height",
+        `${viewport.height}px`,
+      );
+      this.root.classList.toggle(
+        "keyboard-open",
+        window.innerHeight - viewport.height > 100,
+      );
+    };
+    viewport?.addEventListener("resize", fitViewport);
+    fitViewport();
+    setInterval(() => this.refreshInboxClock(), 1000);
     this.render();
     void this.restoreConnection();
   }
@@ -241,6 +281,8 @@ export class PhoneApp {
     this.renameSession = null;
     this.fields = null;
     this.job = null;
+    this.editorState = null;
+    this.scheduleDraftProfile = "";
     this.attachmentDrafts.clear();
     this.preview = null;
     this.confirmation = null;
@@ -255,18 +297,76 @@ export class PhoneApp {
     this.relay.connect(address, token);
   }
   private navigate(tab: Tab) {
+    if (tab === this.tab || this.busy) return;
     if (this.recording) return this.message("Завершите диктовку");
+    if (this.tab === "schedule") this.preview = null;
     this.tab = tab;
     this.question = null;
     this.renameSession = null;
-    this.fields = null;
-    this.historyJob = "";
     this.confirmation = null;
     return this.run(async () => {
-      if (tab === "schedule" && this.relay.online) await this.data.loadJobs();
+      if (tab === "schedule" && this.relay.online)
+        await this.data.loadJobs(
+          this.fields ? this.scheduleDraftProfile : undefined,
+        );
       if (tab === "chats" && this.relay.online)
         await this.data.list(this.search, this.hidden);
     });
+  }
+  private renderTabs() {
+    for (const [id, label] of [
+      ["chats", "Чаты"],
+      ["inbox", "Входящие"],
+      ["schedule", "Расписание"],
+      ["settings", "Настройки"],
+    ] as const) {
+      let button = this.bottom.querySelector<HTMLButtonElement>(
+        `[data-tab="${id}"]`,
+      );
+      if (!button) {
+        button = this.button(label, () => this.navigate(id));
+        button.dataset.tab = id;
+        button.onclick = () => void this.navigate(id);
+        if (id === "inbox") {
+          const badge = document.createElement("span");
+          badge.className = "inbox-badge";
+          badge.setAttribute("aria-hidden", "true");
+          button.append(badge);
+        }
+        this.bottom.append(button);
+      }
+      button.classList.toggle("active", this.tab === id);
+      button.setAttribute("aria-current", this.tab === id ? "page" : "false");
+      button.disabled = this.recording;
+    }
+    const badge = this.bottom.querySelector<HTMLElement>(".inbox-badge")!;
+    const count = this.inbox.snapshot.pending.filter((item) =>
+      canSend(item),
+    ).length;
+    badge.hidden = count === 0;
+    badge.textContent = count > 99 ? "99+" : String(count);
+    badge.classList.toggle(
+      "stale",
+      !this.relay.online || !this.inbox.snapshot.available,
+    );
+    badge.parentElement!.setAttribute(
+      "aria-description",
+      `Нужен ответ · ${count}${badge.classList.contains("stale") ? " · ждёт сверки" : ""}`,
+    );
+  }
+  private refreshInboxClock() {
+    this.renderTabs();
+    const pendingTab = this.panel.querySelector("#pending");
+    if (pendingTab)
+      pendingTab.textContent = `Нужен ответ · ${orderedQuestions(this.inbox.snapshot.pending).length}`;
+    for (const element of this.panel.querySelectorAll<HTMLElement>(
+      "[data-deadline]",
+    )) {
+      const expiresAt = element.dataset.deadline
+        ? Number(element.dataset.deadline)
+        : null;
+      element.textContent = deadline(expiresAt);
+    }
   }
   private render() {
     this.glasses.phoneInteracting = Boolean(
@@ -274,21 +374,38 @@ export class PhoneApp {
     );
     this.status.textContent = `${this.relay.online ? "● Hermes" : "○ Нет связи"} · ${this.glasses.displayReady ? "G2 подключены" : "Без очков"}`;
     this.toast.textContent = this.notice;
-    this.bottom.replaceChildren();
-    for (const [id, label] of [
-      ["chats", "Чаты"],
-      ["inbox", "Входящие"],
-      ["schedule", "Расписание"],
-      ["settings", "Настройки"],
-    ] as const) {
-      const button = this.button(
-        label,
-        () => this.navigate(id),
-        this.tab === id ? "active" : "",
-      );
-      button.onclick = () => void this.navigate(id);
-      this.bottom.append(button);
-    }
+    this.renderTabs();
+    const chatKey =
+      this.tab === "chats" &&
+      !this.confirmation &&
+      !this.renameSession &&
+      !this.showNew
+        ? this.data.chatKey
+        : "";
+    this.status
+      .closest(".phone")
+      ?.classList.toggle("chat-open", Boolean(chatKey));
+    const oldLog = this.panel.querySelector<HTMLElement>(".messages");
+    const oldScroll = oldLog?.scrollTop ?? 0;
+    const sameChat = chatKey && chatKey === this.renderedChatKey;
+    const follow =
+      !sameChat || (!this.keepHistoryAnchor && this.atNewest(oldLog));
+    const anchor =
+      sameChat && !follow && oldLog
+        ? [...oldLog.querySelectorAll<HTMLElement>("[data-message-id]")].find(
+            (row) =>
+              row.getBoundingClientRect().bottom >
+              oldLog.getBoundingClientRect().top,
+          )
+        : undefined;
+    const anchorTop =
+      anchor && oldLog
+        ? anchor.getBoundingClientRect().top -
+          oldLog.getBoundingClientRect().top
+        : 0;
+    this.renderedChatKey = chatKey;
+    this.renderedMessages = chatKey ? this.data.messages : null;
+    this.renderedStream = this.data.liveText;
     // Preserve unsent text and selection across stream updates.
     const connectionForm =
       this.panel.querySelector<HTMLFormElement>("#phone-connect");
@@ -303,11 +420,6 @@ export class PhoneApp {
       focus?.id && this.panel.contains(focus)
         ? { id: focus.id, start: focus.selectionStart, end: focus.selectionEnd }
         : null;
-    const scroll = this.panel.querySelector(".messages")?.scrollTop;
-    const nearBottom = (() => {
-      const el = this.panel.querySelector(".messages");
-      return !el || el.scrollHeight - el.scrollTop - el.clientHeight < 90;
-    })();
     if (this.confirmation) this.renderConfirmation();
     else if (this.renameSession) this.renderRename();
     else if (this.tab === "chats") this.renderChats();
@@ -330,23 +442,36 @@ export class PhoneApp {
       const next = this.panel.querySelector<
         HTMLInputElement | HTMLTextAreaElement
       >(`#${active.id}`);
-      next?.focus();
+      next?.focus({ preventScroll: true });
       if (next && next.type !== "number")
         try {
           next.setSelectionRange(active.start, active.end);
         } catch {}
     }
-    const messages = this.panel.querySelector(".messages");
+    const messages = this.panel.querySelector<HTMLElement>(".messages");
     if (messages) {
-      messages.scrollTop = nearBottom ? messages.scrollHeight : (scroll ?? 0);
+      messages.scrollTop = follow ? messages.scrollHeight : oldScroll;
+      const restored =
+        anchor &&
+        [...messages.querySelectorAll<HTMLElement>("[data-message-id]")].find(
+          (row) => row.dataset.messageId === anchor.dataset.messageId,
+        );
+      if (restored)
+        messages.scrollTop +=
+          restored.getBoundingClientRect().top -
+          messages.getBoundingClientRect().top -
+          anchorTop;
+      this.updateLatest(messages);
+      messages.onscroll = () => this.updateLatest(messages);
     }
-    this.panel
-      .querySelectorAll<HTMLAnchorElement>(".markdown a")
-      .forEach((link) => {
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-      });
-    this.panel.querySelectorAll("pre").forEach((pre) =>
+    this.decorateMarkdown(this.panel);
+  }
+  private decorateMarkdown(root: HTMLElement) {
+    root.querySelectorAll<HTMLAnchorElement>(".markdown a").forEach((link) => {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    });
+    root.querySelectorAll("pre").forEach((pre) =>
       pre.append(
         this.button(
           "Копировать",
@@ -458,6 +583,45 @@ export class PhoneApp {
       )
       .join("");
   }
+  private atNewest(log?: HTMLElement | null) {
+    return !log || log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+  }
+  private updateLatest(log: HTMLElement) {
+    this.panel.querySelector<HTMLButtonElement>("#latest")!.hidden =
+      this.atNewest(log);
+  }
+  private updateChatStream() {
+    const log = this.panel.querySelector<HTMLElement>(".messages");
+    if (
+      !log ||
+      this.data.chatKey !== this.renderedChatKey ||
+      this.data.messages !== this.renderedMessages ||
+      this.renderedStream === this.data.liveText
+    )
+      return false;
+    const follow = this.atNewest(log);
+    const stream = log.querySelector<HTMLElement>(".streaming");
+    if (this.data.liveText) {
+      if (stream) {
+        stream.querySelector(".markdown")!.innerHTML = markdown(
+          this.data.liveText,
+        );
+        this.decorateMarkdown(stream);
+      } else {
+        log.insertAdjacentHTML("beforeend", this.streamHTML());
+        this.decorateMarkdown(log.lastElementChild as HTMLElement);
+      }
+    } else stream?.remove();
+    this.renderedStream = this.data.liveText;
+    if (follow) log.scrollTop = log.scrollHeight;
+    this.updateLatest(log);
+    return true;
+  }
+  private streamHTML() {
+    return this.data.liveText
+      ? `<article class="message assistant streaming"><div class="message-meta">Hermes · отвечает…</div><div class="markdown">${markdown(this.data.liveText)}</div></article>`
+      : "";
+  }
   private renderChat() {
     const key = this.data.chatKey,
       session = this.data.sessions.find((x) => x.key === key),
@@ -471,13 +635,20 @@ export class PhoneApp {
         : foreign
           ? "Чат Hermes"
           : "Новый чат");
-    this.panel.innerHTML = `<div class="heading"><button id="chat-back">‹ Чаты</button><h1>${esc(title)}</h1><button id="on-glasses">На очки</button></div><div class="row" id="chat-actions"></div><div class="messages" role="log" aria-label="Переписка">${this.data.hasMore ? '<button id="older">Предыдущие сообщения</button>' : ""}${this.data.messages.map((message, i) => `<article class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-meta">${esc(message.role === "user" ? "Вы" : message.role === "assistant" ? "Hermes" : message.role)}${this.showContext ? `<label><input type="checkbox" data-context="${i}" ${this.contextIds.has(String(message.id ?? i)) ? "checked" : ""}> В контекст задачи</label>` : ""}</div><div class="markdown">${markdown(messageText(message.content))}</div><button class="schedule-from" data-index="${i}">В расписание</button></article>`).join("")}${this.data.liveText ? `<article class="message assistant streaming"><div class="message-meta">Hermes · отвечает…</div><div class="markdown">${markdown(this.data.liveText)}</div></article>` : ""}</div><button id="latest">К новым сообщениям ↓</button>${foreign ? '<p class="muted">Это история отдельной сессии. Продолжение и остановка доступны там, где она запущена.</p>' : `<form id="compose-chat"><textarea id="message-input" aria-label="Сообщение Hermes" rows="3" placeholder="Сообщение Hermes…">${esc(this.data.draft())}</textarea><div id="attachment-list" class="row"></div><div class="row"><label class="file-button">Файл<input type="file" id="files" multiple></label><button type="button" id="gallery">Фото</button><button type="button" id="camera">Камера</button><button type="button" id="dictate">${this.recording ? "Завершить диктовку" : "Диктовать"}</button><button type="submit">Отправить</button></div></form>`}`;
+    this.panel.innerHTML = `<div class="heading"><button id="chat-back">‹ Чаты</button><h1>${esc(title)}</h1><button id="on-glasses">На очки</button></div><div class="row" id="chat-actions"></div><div class="messages" role="log" aria-label="Переписка">${this.data.hasMore ? '<button id="older">Предыдущие сообщения</button>' : ""}${this.data.messages.map((message, i) => `<article data-message-id="${esc(message.id ?? "")}" class="message ${message.role === "user" ? "user" : "assistant"}"><div class="message-meta">${esc(message.role === "user" ? "Вы" : message.role === "assistant" ? "Hermes" : message.role)}${this.showContext ? `<label><input type="checkbox" data-context="${i}" ${this.contextIds.has(String(message.id ?? i)) ? "checked" : ""}> В контекст задачи</label>` : ""}</div><div class="markdown">${markdown(messageText(message.content))}</div><button class="schedule-from" data-index="${i}">В расписание</button></article>`).join("")}${this.streamHTML()}</div><button id="latest">К новым сообщениям ↓</button>${foreign ? '<p class="muted">Это история отдельной сессии. Продолжение и остановка доступны там, где она запущена.</p>' : `<form id="compose-chat"><div id="attachment-list" class="row"></div><div class="compose-line"><textarea id="message-input" aria-label="Сообщение Hermes" rows="2" placeholder="Сообщение Hermes…">${esc(this.data.draft())}</textarea><button type="submit">Отправить</button></div><div class="row compose-tools"><label class="file-button">Файл<input type="file" id="files" multiple></label><button type="button" id="gallery">Фото</button><button type="button" id="camera">Камера</button><button type="button" id="dictate">${this.recording ? "Завершить диктовку" : "Диктовать"}</button></div></form>`}`;
     this.bind("#chat-back", async () => {
       await this.data.closeChat();
       await this.data.list(this.search, this.hidden);
     });
     this.bind("#on-glasses", () => this.hud.show({ kind: "chat", key, title }));
-    this.bind("#older", () => this.data.older());
+    this.bind("#older", async () => {
+      this.keepHistoryAnchor = true;
+      try {
+        await this.data.older();
+      } finally {
+        this.keepHistoryAnchor = false;
+      }
+    });
     this.bind("#latest", () => {
       const el = this.panel.querySelector(".messages")!;
       el.scrollTop = el.scrollHeight;
@@ -700,7 +871,12 @@ export class PhoneApp {
       this.renderQuestion();
       return;
     }
-    this.panel.innerHTML = `<h1>Входящие</h1><div class="row"><button id="pending">Нужен ответ · ${this.inbox.snapshot.pending.length}</button><button id="completed">Результаты · ${this.inbox.snapshot.unreadCompleted ?? this.inbox.snapshot.completed.filter((x) => !x.read).length}</button></div><div class="cards" id="inbox-list"></div>`;
+    const pending = orderedQuestions(this.inbox.snapshot.pending);
+    const stale = !this.relay.online || !this.inbox.snapshot.available;
+    const unavailable = this.relay.online
+      ? "Источник вопросов недоступен"
+      : "Нет связи с Hermes";
+    this.panel.innerHTML = `<h1>Входящие</h1><div class="row"><button id="pending" aria-pressed="${this.inboxTab === "pending"}" class="${this.inboxTab === "pending" ? "active" : ""}">Нужен ответ · ${pending.length}</button><button id="completed" aria-pressed="${this.inboxTab === "completed"}" class="${this.inboxTab === "completed" ? "active" : ""}">Результаты · ${this.inbox.snapshot.unreadCompleted ?? this.inbox.snapshot.completed.filter((x) => !x.read).length}</button></div>${stale ? `<p class="inbox-unavailable" role="status">${unavailable}. Сохранённые данные ждут сверки.</p>` : ""}<div class="cards" id="inbox-list"></div>`;
     this.bind("#pending", () => {
       this.inboxTab = "pending";
     });
@@ -709,23 +885,34 @@ export class PhoneApp {
     });
     const list = this.panel.querySelector("#inbox-list")!;
     if (this.inboxTab === "pending")
-      for (const item of this.inbox.snapshot.pending)
-        list.append(
-          this.button(
-            `${item.agentName} / ${item.sessionTitle}\n${item.question}\n${item.kind === "permission" ? "Разрешение" : "Вопрос"}`,
-            () => {
-              this.question = item;
-              this.selected.clear();
-              this.answerDraft = "";
-            },
-            "card",
-          ),
+      for (const item of pending) {
+        const card = this.button(
+          `${item.agentName} / ${item.sessionTitle}\n${item.question}`,
+          () => {
+            this.question = item;
+            this.selected.clear();
+            this.answerDraft = "";
+          },
+          "card",
         );
+        const meta = document.createElement("span");
+        meta.className = "inbox-card-meta";
+        const expires = document.createElement("span");
+        expires.dataset.deadline = String(item.expiresAtMs ?? "");
+        expires.textContent = deadline(item.expiresAtMs);
+        meta.append(
+          item.kind === "permission" ? "Разрешение · " : "Вопрос · ",
+          expires,
+        );
+        if (stale) meta.append(" · Ждёт сверки");
+        card.append(meta);
+        list.append(card);
+      }
     else
       for (const item of this.inbox.snapshot.completed) {
         const card = document.createElement("article");
         card.className = "card";
-        card.innerHTML = `<h2>${item.read ? "" : "● "}${esc(item.sessionTitle)}</h2><p class="muted">${esc(item.agentName)} · ${esc(new Date(item.createdAtMs).toLocaleString("ru-RU"))}</p><div class="markdown">${markdown(item.summary)}</div>`;
+        card.innerHTML = `<h2>${item.read ? "" : "● "}${esc(item.sessionTitle)}</h2><p class="muted">${esc(item.agentName)} · ${esc(new Date(item.createdAtMs).toLocaleString("ru-RU"))}${stale ? " · Ждёт сверки" : ""}</p><div class="markdown">${markdown(item.summary)}</div>`;
         card.append(
           this.button(
             item.sessionKey.includes(":cron-run:")
@@ -739,6 +926,7 @@ export class PhoneApp {
                 });
                 this.data.history = result.history || [];
                 this.data.historyCursor = result.nextBefore || null;
+                this.closeScheduleEditor();
                 this.historyJob = item.jobId;
                 this.tab = "schedule";
                 return;
@@ -762,7 +950,7 @@ export class PhoneApp {
         list.append(card);
       }
     if (!list.childElementCount)
-      list.innerHTML = '<p class="empty">Здесь пока ничего нет.</p>';
+      list.innerHTML = `<p class="empty">${stale ? "Данные появятся после подключения и сверки." : "Здесь пока ничего нет."}</p>`;
     if (
       this.inboxTab === "completed" &&
       this.inbox.snapshot.completedNextBefore
@@ -796,7 +984,17 @@ export class PhoneApp {
       this.question = null;
     });
     const options = this.panel.querySelector("#answer-options")!;
-    const prepare = (answer: Answer, label: string) =>
+    const blocked =
+      !this.relay.online || !this.inbox.snapshot.available || !canSend(item);
+    if (blocked) {
+      options.textContent = !canSend(item)
+        ? "Срок ответа истёк."
+        : "Ответ будет доступен после сверки с Hermes.";
+      this.panel.querySelector<HTMLFormElement>("#answer-form")!.hidden = true;
+      return;
+    }
+    const prepare = (answer: Answer, label: string) => {
+      if (!canSend(item)) return this.message("Срок ответа истёк");
       this.confirm(
         `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}`,
         async () => {
@@ -813,23 +1011,22 @@ export class PhoneApp {
           this.message("Ответ принят");
         },
       );
+    };
     if (item.kind === "permission")
-      for (const decision of item.allowedDecisions || [])
-        options.append(
-          this.button(
-            (
-              {
-                deny: "Запретить",
-                allow: "Разрешить",
-                once: "Разрешить один раз",
-                "allow-once": "Разрешить один раз",
-                session: "Разрешить для сессии",
-                "allow-session": "Разрешить для сессии",
-              } as Record<string, string>
-            )[decision] || decision,
-            () => prepare({ decision }, decision),
-          ),
-        );
+      for (const decision of item.allowedDecisions || []) {
+        const label =
+          (
+            {
+              deny: "Запретить",
+              allow: "Разрешить",
+              once: "Разрешить один раз",
+              "allow-once": "Разрешить один раз",
+              session: "Разрешить для сессии",
+              "allow-session": "Разрешить для сессии",
+            } as Record<string, string>
+          )[decision] || decision;
+        options.append(this.button(label, () => prepare({ decision }, label)));
+      }
     else
       for (const [index, choice] of (item.choices || []).entries())
         options.append(
@@ -880,22 +1077,104 @@ export class PhoneApp {
   }
   private async newSchedule(context = "") {
     this.tab = "schedule";
+    const ns = context ? this.data.chatKey.split(":")[1] : "";
+    if (ns) await this.data.loadJobs(ns === "main" ? "default" : ns);
+    this.openScheduleEditor(
+      null,
+      {
+        name: "",
+        prompt: "",
+        schedule: "0 9 * * *",
+      },
+      context,
+    );
+  }
+  private scheduleDraftKey() {
+    return `ocuclaw.scheduleDraft:${encodeURIComponent(
+      JSON.stringify([
+        this.data.scope,
+        this.scheduleDraftProfile,
+        this.job?.id ?? null,
+      ]),
+    )}`;
+  }
+  private saveScheduleDraft() {
+    const draft: ScheduleDraft = {
+      fields: this.fields!,
+      form: this.editorState,
+      revision: this.job?.revision,
+      original: this.job?.fields,
+    };
+    localStorage.setItem(this.scheduleDraftKey(), JSON.stringify(draft));
+  }
+  private openScheduleEditor(
+    job: Job | null,
+    fields: ScheduleFields,
+    context = "",
+  ) {
+    this.historyJob = "";
+    this.job = job;
+    this.scheduleDraftProfile = this.data.profile;
+    this.preview = null;
+    this.fields = fields;
+    this.editorState = null;
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem(this.scheduleDraftKey()) || "null",
+      ) as ScheduleDraft | null;
+      if (saved?.fields && typeof saved.fields.schedule === "string") {
+        this.fields = saved.fields;
+        this.editorState = saved.form;
+        if (job && saved.revision)
+          this.job = {
+            ...job,
+            revision: saved.revision,
+            fields: saved.original || job.fields,
+          };
+      }
+    } catch {}
+    if (context) {
+      const addition = `Контекст, выбранный пользователем:\n${context}`;
+      if (!this.fields.prompt.includes(addition)) {
+        this.fields.prompt = [this.fields.prompt || "Задача:\n", addition].join(
+          "\n\n",
+        );
+        this.saveScheduleDraft();
+      }
+    }
+  }
+  private closeScheduleEditor() {
+    this.fields = null;
     this.job = null;
     this.editorState = null;
     this.preview = null;
-    this.historyJob = "";
-    const ns = this.data.chatKey.split(":")[1];
-    this.fields = {
-      name: "",
-      prompt: context
-        ? `Задача:\n\n\nКонтекст, выбранный пользователем:\n${context}`
-        : "",
-      schedule: "0 9 * * *",
-    };
-    await this.data.loadJobs(ns ? (ns === "main" ? "default" : ns) : undefined);
-    this.render();
+    this.scheduleDraftProfile = "";
+  }
+  private scheduleTarget() {
+    if (this.scheduleDraftProfile !== this.data.profile)
+      throw Error("Профиль изменился. Откройте черновик в исходном профиле.");
+    return this.job ? { jobId: this.job.id, revision: this.job.revision } : {};
+  }
+  private async previewSchedule(fields: ScheduleFields) {
+    const requestedAt = performance.now();
+    const { preview } = await this.data.schedule("automations.preview", {
+      fields,
+      ...this.scheduleTarget(),
+    });
+    if (this.fields === fields) {
+      this.preview = preview;
+      this.previewUntil = requestedAt + 115000;
+    }
   }
   private renderSchedule() {
+    if (this.fields && this.data.profile !== this.scheduleDraftProfile) {
+      const allowed = this.inbox.snapshot.authorizedNamespaces;
+      const ns =
+        this.scheduleDraftProfile === "default"
+          ? "main"
+          : this.scheduleDraftProfile;
+      if (allowed && !allowed.includes(ns)) this.closeScheduleEditor();
+    }
     if (this.fields) {
       this.renderScheduleEditor();
       return;
@@ -969,10 +1248,7 @@ export class PhoneApp {
           const result = await this.data.schedule("automations.read", {
             jobId: job.id,
           });
-          this.job = result.job;
-          this.editorState = null;
-          this.fields = { ...result.job.fields };
-          this.preview = null;
+          this.openScheduleEditor(result.job, { ...result.job.fields });
         }),
         this.button(job.paused ? "Возобновить" : "Пауза", () =>
           this.confirm(
@@ -1063,7 +1339,7 @@ export class PhoneApp {
         : { model: undefined, provider: undefined };
     };
     this.editorState = state;
-    this.panel.innerHTML = `<button id="schedule-back">‹ Расписание</button><h1>${this.job ? "Изменить задачу" : "Новая задача"}</h1><p class="muted">Пояс Hermes: ${esc(this.data.options?.timezone || "загружается")}</p><form id="schedule-form"><label>Название<input id="job-name" name="name" required maxlength="160" value="${esc(fields.name)}"></label><label>Инструкция и выбранный контекст<textarea id="job-prompt" name="prompt" required rows="7" maxlength="16000">${esc(fields.prompt)}</textarea></label><label>Повтор<select id="schedule-kind" name="kind"><option value="cron">Расширенное / существующее</option><option value="once">Один раз</option><option value="daily">Ежедневно</option><option value="weekly">По дням недели</option><option value="interval">Через интервал</option></select></label><div id="schedule-inputs"><label data-schedule-for="once">Дата<input name="date" type="date" value="${esc(state.date)}"></label><label data-schedule-for="once daily weekly">Время Hermes<input name="time" type="time" value="${esc(state.time)}"></label><fieldset data-schedule-for="weekly"><legend>Дни недели</legend>${[
+    this.panel.innerHTML = `<div class="row"><button id="schedule-back">‹ Расписание</button><button id="discard-schedule">Удалить черновик</button></div><h1>${this.job ? "Изменить задачу" : "Новая задача"}</h1><p class="muted">Пояс Hermes: ${esc(this.data.options?.timezone || "загружается")}</p><form id="schedule-form"><label>Название<input id="job-name" name="name" required maxlength="160" value="${esc(fields.name)}"></label><label>Инструкция и выбранный контекст<textarea id="job-prompt" name="prompt" required rows="7" maxlength="16000">${esc(fields.prompt)}</textarea></label><label>Повтор<select id="schedule-kind" name="kind"><option value="cron">Расширенное / существующее</option><option value="once">Один раз</option><option value="daily">Ежедневно</option><option value="weekly">По дням недели</option><option value="interval">Через интервал</option></select></label><div id="schedule-inputs"><label data-schedule-for="once">Дата<input name="date" type="date" value="${esc(state.date)}"></label><label data-schedule-for="once daily weekly">Время Hermes<input name="time" type="time" value="${esc(state.time)}"></label><fieldset data-schedule-for="weekly"><legend>Дни недели</legend>${[
       [1, "Пн"],
       [2, "Вт"],
       [3, "Ср"],
@@ -1079,10 +1355,12 @@ export class PhoneApp {
       .join(
         "",
       )}</fieldset><label data-schedule-for="interval">Интервал<input name="interval" value="${esc(state.interval)}" placeholder="30m, 2h, 1d"></label><label data-schedule-for="cron">Выражение Hermes<input id="job-expression" name="cron" value="${esc(state.cron)}"></label></div><label>Модель<select name="model"><option value="">Настройка Hermes</option>${this.modelOptions(modelValue(fields))}${savedModel && !availableModel(savedModel) ? `<option value="${esc(savedModel)}" ${savedModel === modelValue(fields) ? "selected" : ""}>${esc(original?.model || original?.provider)} · текущая настройка</option>` : ""}</select></label><button>Проверить расписание</button><button type="button" id="schedule-voice">${this.recording ? "Завершить диктовку" : "Задать голосом"}</button></form><div id="schedule-preview"></div>`;
-    this.bind("#schedule-back", () => {
-      this.fields = null;
-      this.job = null;
-      this.preview = null;
+    this.bind("#schedule-back", () => this.closeScheduleEditor());
+    this.bind("#discard-schedule", () => {
+      this.confirm("Удалить черновик задачи?", async () => {
+        localStorage.removeItem(this.scheduleDraftKey());
+        this.closeScheduleEditor();
+      });
     });
     const form = this.panel.querySelector<HTMLFormElement>("#schedule-form")!;
     (form.elements.namedItem("kind") as HTMLSelectElement).value = state.kind;
@@ -1109,6 +1387,7 @@ export class PhoneApp {
         ...modelFields(String(data.get("model"))),
       };
       this.preview = null;
+      this.saveScheduleDraft();
       this.panel.querySelector("#schedule-preview")?.replaceChildren();
     };
     form.onsubmit = (event) => {
@@ -1126,14 +1405,8 @@ export class PhoneApp {
           deliver: this.fields?.deliver || "local",
           ...modelFields(String(data.get("model"))),
         };
-        this.preview = (
-          await this.data.schedule("automations.preview", {
-            fields: this.fields,
-            ...(this.job
-              ? { jobId: this.job.id, revision: this.job.revision }
-              : {}),
-          })
-        ).preview;
+        this.saveScheduleDraft();
+        await this.previewSchedule(this.fields);
       });
     };
     this.bind("#schedule-voice", () =>
@@ -1144,19 +1417,33 @@ export class PhoneApp {
       box.innerHTML = `<section class="card"><h2>Проверьте задачу</h2><h3>${esc(this.fields!.name)}</h3><p class="preserve">${esc(this.fields!.prompt)}</p><p>${esc(this.preview.scheduleDisplay || this.fields!.schedule)} · ${esc(this.preview.timezone)}</p><h3>Ближайшие запуски по Hermes</h3><ol>${(this.preview.nextRuns || []).map((x: string) => `<li>${esc(date(x))}</li>`).join("")}</ol></section>`;
       box.append(
         this.button("Подтвердить и сохранить", async () => {
-          await this.data.mutateSchedule(
-            this.job ? "automations.update" : "automations.create",
-            {
-              fields: this.fields,
-              reviewHash: this.preview.reviewHash,
-              ...(this.job
-                ? { jobId: this.job.id, revision: this.job.revision }
-                : {}),
-            },
-          );
-          this.fields = null;
-          this.job = null;
-          this.preview = null;
+          const fields = this.fields!;
+          const preview = this.preview;
+          if (!preview) return;
+          const refresh = async () => {
+            this.preview = null;
+            await this.previewSchedule(fields);
+            this.message(
+              "Расписание проверено заново. Подтвердите новый список запусков.",
+            );
+          };
+          if (performance.now() >= this.previewUntil) return refresh();
+          try {
+            await this.data.mutateSchedule(
+              this.job ? "automations.update" : "automations.create",
+              {
+                fields,
+                reviewHash: preview.reviewHash,
+                ...this.scheduleTarget(),
+              },
+            );
+          } catch (error) {
+            if ((error as Error).message === errorText("preview_expired"))
+              return refresh();
+            throw error;
+          }
+          localStorage.removeItem(this.scheduleDraftKey());
+          this.closeScheduleEditor();
           await this.data.loadJobs();
         }),
       );
@@ -1274,6 +1561,7 @@ export class PhoneApp {
         this.fields = result.fields;
         this.editorState = null;
         this.preview = null;
+        this.saveScheduleDraft();
       }
       this.message("Текст распознан. Проверьте перед отправкой.");
     } finally {

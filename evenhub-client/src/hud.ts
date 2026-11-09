@@ -20,6 +20,7 @@ import {
   type SendAttempt,
 } from "./workspace";
 import { Glasses, wavBase64 } from "./glasses";
+import type { Input } from "./hud-input";
 type Screen =
   | "jobs"
   | "job"
@@ -43,7 +44,18 @@ interface Action {
 interface View {
   title: string;
   body?: string;
+  bodyLines?: string[];
   actions: Action[];
+}
+interface Confirmation {
+  id: number;
+  text: string;
+  bodyLines?: string[];
+  label: string;
+  back: Screen;
+  send: () => Promise<void>;
+  check?: () => Promise<void>;
+  phase: "review" | "check" | "retry";
 }
 export function mountHud(
   relay: Relay,
@@ -61,10 +73,10 @@ export function mountHud(
     chatTitle = "",
     messages: any[] = [],
     total = 0;
-  let confirmAction: (() => Promise<void>) | null = null,
-    confirmText = "",
-    confirmLabel = "Отправить",
-    confirmReturn: Screen = "question";
+  let confirmation: Confirmation | null = null;
+  let confirmationId = 0,
+    shownAction = "",
+    lastTap = -Infinity;
   type Target =
     | { kind: "question"; id: string; key: string }
     | { kind: "message"; key: string; context?: string; attempt?: SendAttempt }
@@ -112,8 +124,9 @@ export function mountHud(
     chatTitle = "";
     questionId = "";
     completionId = "";
-    confirmAction = null;
-    confirmText = "";
+    confirmation = null;
+    shownAction = "";
+    lastTap = -Infinity;
     target = null;
     draft = "";
     textField.value = "";
@@ -177,7 +190,6 @@ export function mountHud(
   }
   function go(next: Screen) {
     notice = "";
-    positions.set(screen, current.actions[selected]?.id || "");
     screen = next;
     selected = 0;
     if (next === "pending") model.enter();
@@ -187,13 +199,20 @@ export function mountHud(
     text: string,
     action: () => Promise<void>,
     back: Screen = screen,
-    label = "Отправить",
+    options: Partial<Pick<Confirmation, "label" | "phase" | "bodyLines">> = {},
   ) {
-    confirmText = text;
-    confirmAction = action;
-    confirmLabel = label;
-    confirmReturn = back;
+    confirmation = {
+      id: ++confirmationId,
+      text,
+      label: options.label ?? "Отправить",
+      bodyLines: options.bodyLines,
+      back,
+      send: action,
+      phase: options.phase ?? "review",
+    };
+    positions.delete("confirm");
     go("confirm");
+    return confirmation;
   }
   function full(text: string) {
     readText = text;
@@ -234,7 +253,7 @@ export function mountHud(
     total = data.total ?? messages.length;
     go("chat");
   }
-  function questionAnswer(answer: Answer) {
+  function questionAnswer(answer: Answer, back: Screen = "question") {
     const item = q();
     if (!item || !canSend(item)) return message("Вопрос уже не актуален");
     const shown =
@@ -243,22 +262,41 @@ export function mountHud(
         : "decision" in answer
           ? decisionLabel(answer.decision)
           : answer.indices.map((i) => item.choices![i]).join(", ");
-    confirm(
-      `${item.agentName} / ${item.sessionTitle}\n\nОтправить: «${shown}»?`,
-      async () => {
-        const reply = await workspace.answer(item, answer);
-        if (
-          ["accepted", "already_answered", "expired", "not_found"].includes(
-            reply.status,
-          )
-        ) {
-          go("pending");
-          await refreshInbox().catch(() => {});
-        }
-        message(reply.error || statusLabel(reply.status));
-      },
-      "question",
-    );
+    const attempt = workspace.answerAttempt(item);
+    const context = `${item.agentName} / ${item.sessionTitle}`;
+    const submit = async () => {
+      try {
+        if (!attempt.operationId && !canSend(item))
+          return showOutcome({ status: "expired" });
+        showOutcome(await workspace.answer(item, answer, attempt));
+      } catch (error) {
+        flow.phase = "check";
+        throw error;
+      }
+    };
+    const flow = confirm(`«${shown}»\n${context}`, submit, back, {
+      phase: attempt.operationId ? "check" : "review",
+    });
+    function showOutcome(reply: { status: string; error?: string }) {
+      if (
+        ["accepted", "already_answered", "expired", "not_found"].includes(
+          reply.status,
+        )
+      ) {
+        go("pending");
+        void refreshInbox().catch(() => {});
+      } else {
+        flow.phase = reply.status === "rejected" ? "review" : "check";
+        if (reply.status === "rejected") attempt.operationId = undefined;
+      }
+      message(reply.error || statusLabel(reply.status));
+    }
+    flow.check = async () => {
+      const reply = await workspace.checkAnswer(item, attempt);
+      if (reply.status !== "pending") return showOutcome(reply);
+      flow.phase = "retry";
+      message("Hermes ждёт ответ. Можно отправить.");
+    };
   }
   function statusLabel(status: string) {
     return (
@@ -269,6 +307,7 @@ export function mountHud(
           already_answered: "Вопрос уже закрыт",
           source_unavailable: "Hermes недоступен",
           not_found: "Запрос не найден",
+          rejected: "Hermes отклонил ответ",
           uncertain:
             "Отправка не подтверждена. Проверьте состояние после подключения.",
         } as Record<string, string>
@@ -769,7 +808,7 @@ export function mountHud(
           id: "hide",
           label: "Скрыть из списка",
           run: () =>
-            confirm(
+            void confirm(
               "Скрыть сессию? Вопросы останутся во Входящих.",
               async () => {
                 await relay.request("sessions.patch", {
@@ -786,7 +825,7 @@ export function mountHud(
           id: "stop",
           label: "Остановить задачу",
           run: () =>
-            confirm("Запросить остановку задачи?", async () => {
+            void confirm("Запросить остановку задачи?", async () => {
               await relay.request("sessions.abort", { key: chatKey });
               stopping.add(chatKey);
               go("sessions");
@@ -800,31 +839,42 @@ export function mountHud(
         actions: [...acts, close],
       };
     }
-    if (screen === "confirm")
+    if (screen === "confirm" && confirmation) {
+      const flow = confirmation;
       return {
         title: "Подтверждение",
-        body: confirmText,
+        body: flow.text,
+        bodyLines: flow.bodyLines,
         actions: [
           {
-            id: "send",
-            label: confirmLabel,
-            run: async () => {
-              await confirmAction?.();
-            },
+            id:
+              flow.phase === "check"
+                ? "check"
+                : flow.phase === "retry"
+                  ? "retry"
+                  : "send",
+            label:
+              flow.phase === "check"
+                ? "Проверить отправку"
+                : flow.phase === "retry"
+                  ? "Повторить отправку"
+                  : flow.label,
+            run: flow.phase === "check" && flow.check ? flow.check : flow.send,
           },
           {
             id: "full",
             label: "Прочитать ответ полностью",
-            run: () => full(confirmText),
+            run: () => full(flow.text),
           },
           {
             id: "edit",
             label: "Изменить / перезаписать",
-            run: () => go(confirmReturn),
+            run: () => go(flow.back),
           },
-          { id: "cancel", label: "Отмена", run: () => go(confirmReturn) },
+          { id: "cancel", label: "Отмена", run: () => go(flow.back) },
         ],
       };
+    }
     if (screen === "compose")
       return {
         title:
@@ -837,12 +887,19 @@ export function mountHud(
                 : "Ответ агенту",
         body: draft || "Введите текст на телефоне или включите микрофон.",
         actions: [
+          ...(draft
+            ? [{ id: "use", label: "Продолжить с текстом", run: useDraft }]
+            : []),
           {
             id: "voice",
-            label: "Надиктовать · до 17 секунд",
+            label: draft
+              ? "Перезаписать · до 17 секунд"
+              : "Надиктовать · до 17 секунд",
             run: startRecording,
           },
-          { id: "use", label: "Продолжить с текстом", run: useDraft },
+          ...(!draft
+            ? [{ id: "use", label: "Продолжить с текстом", run: useDraft }]
+            : []),
           close,
         ],
       };
@@ -907,8 +964,9 @@ export function mountHud(
           fields,
         });
         const nextRun = preview.nextRuns[0]?.replace("T", " ") || "—";
+        const nearest = `Ближайший запуск: ${nextRun}`;
         confirm(
-          `${fields.name}\nБлижайший запуск: ${nextRun}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
+          `${fields.name}\n${nearest}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
           async () => {
             await workspace.mutateSchedule("automations.create", {
               fields,
@@ -918,7 +976,7 @@ export function mountHud(
             go("jobs");
           },
           "compose",
-          "Создать задачу",
+          { label: "Создать задачу", bodyLines: [fields.name, nearest] },
         );
       })();
     }
@@ -927,8 +985,7 @@ export function mountHud(
       const item = q();
       if (!item || item.sessionKey !== boundTarget.key)
         return message("Вопрос закрыт");
-      questionAnswer({ text: boundDraft });
-      confirmReturn = "compose";
+      questionAnswer({ text: boundDraft }, "compose");
     } else if (boundTarget.kind === "search")
       return refreshSessions(boundDraft).then(() => go("sessions"));
     else
@@ -963,6 +1020,7 @@ export function mountHud(
   async function startRecording() {
     if (glasses.phoneInteracting) throw Error("Завершите действие на телефоне");
     await glasses.start();
+    positions.delete("record");
     go("record");
     recordTimer = setTimeout(() => run(finishRecording), 17000);
   }
@@ -989,6 +1047,7 @@ export function mountHud(
         throw Error(reply.error || "Не удалось распознать речь");
       draft = reply.transcript;
       textField.value = draft;
+      positions.set("compose", "use");
       message("Проверьте текст перед отправкой");
     } finally {
       transcribing = false;
@@ -1013,7 +1072,7 @@ export function mountHud(
       return;
     }
     if (screen === "confirm") {
-      go(confirmReturn);
+      go(confirmation?.back ?? "question");
       return;
     }
     if (screen === "compose") {
@@ -1042,7 +1101,8 @@ export function mountHud(
       go("sessions");
       return;
     }
-    go("home");
+    if (screen === "home") run(() => glasses.exit());
+    else go("home");
   }
   function clearNotification() {
     notification = null;
@@ -1148,7 +1208,10 @@ export function mountHud(
     render();
     showNotification();
   }
-  glasses.onDevice = () => render();
+  glasses.onDevice = () => {
+    shownAction = "";
+    render();
+  };
   relay.onSnapshot = applySnapshot;
   relay.onError = message;
   relay.onState = (online) => {
@@ -1159,7 +1222,20 @@ export function mountHud(
     else available = false;
     render();
   };
-  glasses.onInput = (input) => {
+  function actionKey() {
+    return JSON.stringify([
+      screen,
+      notification?.id,
+      questionId,
+      chatKey,
+      currentJob?.id,
+      confirmation?.id,
+      current.actions[selected]?.id,
+    ]);
+  }
+  function handleInput(input: Input, device: boolean) {
+    const previousTap = lastTap;
+    if (device && input === "select") lastTap = performance.now();
     if (busy) return;
     if (input === "back") return back();
     if (input === "menu") {
@@ -1170,18 +1246,47 @@ export function mountHud(
     }
     if (input === "select") {
       const action = current.actions[selected];
+      if (device && (!glasses.displayReady || shownAction !== actionKey()))
+        return;
+      // A quick second event must not confirm the screen opened by the first.
+      if (
+        device &&
+        screen === "confirm" &&
+        action &&
+        ["send", "retry"].includes(action.id) &&
+        lastTap - previousTap < 250
+      )
+        return;
       if (action) run(action.run);
       return;
     }
-    selected =
-      (selected + (input === "up" ? -1 : 1) + current.actions.length) %
-      Math.max(1, current.actions.length);
-    positions.set(screen, current.actions[selected]?.id || "");
+    if (screen === "read" && !notification) {
+      readPage = Math.max(
+        0,
+        Math.min(
+          readChunks(readText).length - 1,
+          readPage + (input === "up" ? -1 : 1),
+        ),
+      );
+      render(false);
+      return;
+    }
+    selected = Math.max(
+      0,
+      Math.min(
+        current.actions.length - 1,
+        selected + (input === "up" ? -1 : 1),
+      ),
+    );
+    if (!notification)
+      positions.set(screen, current.actions[selected]?.id || "");
     render(false);
-  };
+  }
+  glasses.onInput = (input) => handleInput(input, true);
   glasses.onMenu = (id) => {
     if (busy || ["record", "confirm"].includes(screen)) return;
-    if (id === 102)
+    if (id === 101) go("pending");
+    else if (id === 102)
       run(async () => {
         await refreshSessions();
         go("sessions");
@@ -1196,7 +1301,7 @@ export function mountHud(
     else go("home");
   };
   glasses.onError = (text) => {
-    app.querySelector("#notice")!.textContent = text;
+    if (notice !== text) message(text);
   };
   glasses.onLimit = () => run(finishRecording);
   function wrap(text: string, width: number, size: number) {
@@ -1251,16 +1356,16 @@ export function mountHud(
     c.fillRect(0, 0, 576, 288);
     c.fillStyle = "#fff";
     c.font = "20px 'Noto Sans'";
-    c.fillText(v.title.slice(0, 45), 12, 25);
+    c.fillText(clip(v.title, 552, 20), 12, 25);
     c.fillRect(12, 35, 552, 1);
     let y = 60;
     if (v.body) {
       c.font = "19px 'Noto Sans'";
-      for (const line of wrap(v.body, 548, 19).slice(
-        0,
-        screen === "read" ? 6 : 2,
-      )) {
-        c.fillText(line, 12, y);
+      const lines = v.bodyLines ?? wrap(v.body, 548, 19);
+      const limit = screen === "read" ? 6 : 2;
+      for (const [index, line] of lines.slice(0, limit).entries()) {
+        const truncated = index === limit - 1 && lines.length > limit;
+        c.fillText(clip(truncated ? line + " …" : line, 548, 19), 12, y);
         y += 25;
       }
     }
@@ -1295,9 +1400,18 @@ export function mountHud(
     }
     c.font = "13px 'Noto Sans'";
     c.fillText(
-      busy
-        ? "Ожидаю подтверждение сервера…"
-        : `${Math.min(selected + 1, v.actions.length)}/${v.actions.length} · двойное нажатие — назад`,
+      clip(
+        busy
+          ? screen === "confirm" && confirmation?.phase !== "check"
+            ? "Отправляем…"
+            : "Ожидаю ответ сервера…"
+          : notice ||
+              (screen === "read"
+                ? "Свайп — страница · двойное касание — назад"
+                : `${Math.min(selected + 1, v.actions.length)}/${v.actions.length} · двойное касание — ${screen === "home" ? "выход" : "назад"}`),
+        552,
+        13,
+      ),
       12,
       282,
     );
@@ -1305,7 +1419,8 @@ export function mountHud(
   }
   function render(restore = true) {
     current = view();
-    if (restore) {
+    if (notification) selected = 0;
+    else if (restore) {
       const id = positions.get(screen),
         i = current.actions.findIndex((x) => x.id === id);
       if (i >= 0) selected = i;
@@ -1314,6 +1429,8 @@ export function mountHud(
       Math.max(selected, 0),
       Math.max(0, current.actions.length - 1),
     );
+    if (!notification)
+      positions.set(screen, current.actions[selected]?.id || "");
     app.querySelector("#title")!.textContent = current.title;
     app.querySelector("#body")!.textContent = current.body || "";
     app.querySelector("#notice")!.textContent = notice;
@@ -1339,7 +1456,10 @@ export function mountHud(
       .querySelector<HTMLCanvasElement>("#display")!
       .getContext("2d")!
       .drawImage(canvas, 0, 0);
-    glasses.paint(canvas);
+    const key = actionKey();
+    glasses.paint(canvas, () => {
+      shownAction = key;
+    });
     if (["home", "pending", "completed", "sessions"].includes(screen))
       localStorage.setItem(
         uiKey(),
@@ -1348,7 +1468,7 @@ export function mountHud(
   }
   app.querySelector("#controls")!.addEventListener("click", (event) => {
     const input = (event.target as HTMLElement).dataset.input;
-    if (input) glasses.onInput(input as any);
+    if (input) handleInput(input as Input, false);
   });
   app.querySelector("#connect")!.addEventListener("submit", (event) => {
     event.preventDefault();

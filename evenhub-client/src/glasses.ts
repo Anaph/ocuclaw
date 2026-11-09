@@ -4,14 +4,13 @@ import {
   TextContainerProperty,
   ImageContainerProperty,
   ImageRawDataUpdate,
-  OsEventTypeList,
   AudioInputSource,
   StartUpPageCreateResult,
   ImageRawDataUpdateResult,
   MenuContainerProperty,
   MenuItemProperty,
 } from "@evenrealities/even_hub_sdk";
-export type Input = "up" | "down" | "select" | "back" | "menu";
+import { gesture, type Input } from "./hud-input";
 export class Glasses {
   bridge: Awaited<ReturnType<typeof waitForEvenAppBridge>> | null = null;
   displayReady = false;
@@ -23,7 +22,8 @@ export class Glasses {
   private connecting: Promise<void> | null = null;
   private displayGeneration = 0;
   private queue = Promise.resolve();
-  private desired: HTMLCanvasElement | null = null;
+  private desired: { canvas: HTMLCanvasElement; shown?: () => void } | null =
+    null;
   private pcm: Uint8Array[] = [];
   private bytes = 0;
   private recording = false;
@@ -80,21 +80,16 @@ export class Glasses {
         this.pcm.push(part);
         this.bytes += part.length;
       }
-      const input = event.textEvent ?? event.listEvent ?? event.sysEvent;
-      if (!input) return;
-      const type = input.eventType;
-      if (type === OsEventTypeList.SCROLL_TOP_EVENT) this.onInput("up");
-      else if (type === OsEventTypeList.SCROLL_BOTTOM_EVENT)
-        this.onInput("down");
-      else if (type === OsEventTypeList.DOUBLE_CLICK_EVENT)
-        this.onInput("back");
-      else if (type === OsEventTypeList.CLICK_EVENT || type === undefined)
-        this.onInput("select");
+      const input = gesture(event);
+      if (input) this.onInput(input);
     });
     await connectDisplay();
   }
-  paint(canvas: HTMLCanvasElement) {
-    this.desired = canvas;
+  async exit() {
+    await this.bridge?.shutDownPageContainer(1);
+  }
+  paint(canvas: HTMLCanvasElement, shown?: () => void) {
+    this.desired = { canvas, shown };
     this.queue = this.queue
       .then(async () => {
         const next = this.desired;
@@ -108,7 +103,7 @@ export class Glasses {
           tile
             .getContext("2d")!
             .drawImage(
-              next,
+              next.canvas,
               (i % 2) * 288,
               Math.floor(i / 2) * 144,
               288,
@@ -137,6 +132,7 @@ export class Glasses {
           if (!ImageRawDataUpdateResult.isSuccess(result))
             throw Error("G2 не приняли изображение");
         }
+        next.shown?.();
       })
       .catch((e) => this.onError(String(e.message)));
   }

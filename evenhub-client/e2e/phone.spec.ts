@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import type { Question } from "../src/model";
 async function server(page: Page) {
   const calls: any[] = [];
   const sendReceipts = new Map<string, any>();
@@ -8,7 +9,7 @@ async function server(page: Page) {
   const dropReplies = new Set<string>();
   let peer: any;
   let jobs: any[] = [];
-  let pending = [
+  let pending: Question[] = [
     {
       id: "question-1",
       sessionKey: "hermes:main:b",
@@ -236,17 +237,20 @@ async function server(page: Page) {
   });
   return {
     calls,
+    replacePending: (items: typeof pending) => {
+      pending = items;
+    },
     replyNext: (method: string, data: unknown) => nextReply.set(method, data),
     dropNextReply: (method: string) => dropReplies.add(method),
     resolveExternal: () => {
       pending = [];
     },
-    update: () =>
+    update: (patch: Partial<ReturnType<typeof snapshot>> = {}) =>
       peer.send(
         JSON.stringify({
           type: "ocuclaw.workspace.changed",
           version: 1,
-          data: snapshot(),
+          data: { ...snapshot(), ...patch },
         }),
       ),
     emit: (event: string, data: any) =>
@@ -417,8 +421,14 @@ test("a rejected schedule mutation can be corrected and submitted as a new opera
   });
   await save.click();
   await expect(page.locator("#phone-notice")).toContainText(
-    "Проверка расписания устарела",
+    "Расписание проверено заново",
   );
+  expect(
+    calls.filter((frame) => frame.method === "automations.create"),
+  ).toHaveLength(1);
+  expect(
+    calls.filter((frame) => frame.method === "automations.preview"),
+  ).toHaveLength(2);
   await name.fill("Новая сводка");
   await preview.click();
   await save.click();
@@ -483,10 +493,7 @@ test("a schedule saved before socket loss is reconciled without a second create"
   expect(receipt.params.operationId).toBe(creates[0].params.operationId);
 });
 
-test("simulated G2 microphone creates a native schedule preview and requires a tap to save", async ({
-  page,
-}) => {
-  const { calls } = await server(page);
+async function simulateG2(page: Page) {
   await page.route("**/src/main.ts", (route) =>
     route.fulfill({
       contentType: "application/javascript",
@@ -496,7 +503,35 @@ test("simulated G2 microphone creates a native schedule preview and requires a t
         import { InboxModel } from "/src/model.ts";
         import { mountHud } from "/src/hud.ts";
         import "/src/style.css";
-        const simulated = window.simulatedG2 = { tiles: {}, audio: [] };
+        const simulated = window.simulatedG2 = { tiles: {}, audio: [], exits: [], shown: [] };
+        const captions = new WeakMap();
+        const fill = CanvasRenderingContext2D.prototype.fillText;
+        CanvasRenderingContext2D.prototype.fillText = function(text, x, y, ...rest) {
+          if (this.canvas.width === 576 && this.canvas.height === 288) {
+            if (!captions.has(this.canvas)) captions.set(this.canvas, []);
+            captions.get(this.canvas).push(text);
+          }
+          return fill.call(this, text, x, y, ...rest);
+        };
+        const drawImage = CanvasRenderingContext2D.prototype.drawImage;
+        CanvasRenderingContext2D.prototype.drawImage = function(source, ...args) {
+          if (this.canvas.width === 288 && this.canvas.height === 144)
+            captions.set(this.canvas, captions.get(source));
+          return drawImage.call(this, source, ...args);
+        };
+        const toBlob = HTMLCanvasElement.prototype.toBlob;
+        HTMLCanvasElement.prototype.toBlob = function(callback, ...args) {
+          return toBlob.call(this, blob => {
+            if (blob && captions.has(this)) captions.set(blob, captions.get(this));
+            callback(blob);
+          }, ...args);
+        };
+        const arrayBuffer = Blob.prototype.arrayBuffer;
+        Blob.prototype.arrayBuffer = async function() {
+          const bytes = await arrayBuffer.call(this);
+          if (captions.has(this)) captions.set(bytes, captions.get(this));
+          return bytes;
+        };
         const bridge = {
           createStartUpPageContainer: async () => 0,
           onEvenHubEvent: listener => {
@@ -504,8 +539,14 @@ test("simulated G2 microphone creates a native schedule preview and requires a t
             return () => {};
           },
           updateImageRawData: async ({ containerID, imageData }) => {
+            if (simulated.block) await new Promise(resolve => { simulated.release = resolve; });
             simulated.tiles[containerID] = Array.from(new Uint8Array(imageData).slice(0, 8));
+            if (containerID === 13) simulated.shown = captions.get(imageData.buffer) || [];
             return "success";
+          },
+          shutDownPageContainer: async (mode) => {
+            simulated.exits.push(mode);
+            return true;
           },
           audioControl: async (open, source) => {
             simulated.audio.push({ open, source });
@@ -526,17 +567,42 @@ test("simulated G2 microphone creates a native schedule preview and requires a t
   await expect(hud.locator("#connection")).toHaveText("VPS подключён");
   const event = (data: unknown) =>
     page.evaluate((event) => (window as any).simulatedG2.emit(event), data);
-  const tap = () => event({ sysEvent: {} });
+  const ring = (eventType = 0) =>
+    event({ sysEvent: { eventSource: 2, eventType } });
+  const shown = (text: string) =>
+    expect
+      .poll(() =>
+        page.evaluate(() => (window as any).simulatedG2.shown.join("\n")),
+      )
+      .toContain(text);
+  return { hud, event, ring, shown };
+}
+
+test("simulated G2 microphone creates a native schedule preview and requires a tap to save", async ({
+  page,
+}) => {
+  const { calls, replyNext } = await server(page);
+  const { hud, event, ring, shown } = await simulateG2(page);
   await event({ menuItemClickEvent: { itemID: 104 } });
   await expect(
     hud.getByRole("button", { name: "+ Новая задача голосом" }),
   ).toBeEnabled();
-  await tap();
+  await shown("> + Новая задача голосом");
+  await ring();
   await expect(hud.locator("#title")).toHaveText("Новая задача по расписанию");
-  await tap();
+  await shown("> Надиктовать");
+  await ring();
+  await expect(hud.locator("#title")).toHaveText("Слушаю…");
+  await ring(3);
+  await shown("> Надиктовать");
+  expect(calls.some((call) => call.method === "workspace.stt.transcribe")).toBe(
+    false,
+  );
+  await ring();
   await expect(hud.locator("#title")).toHaveText("Слушаю…");
   await event({ audioEvent: { audioPcm: [1, 2, 3, 4] } });
-  await tap();
+  await shown("> Завершить запись");
+  await ring();
   await expect(hud.locator("#text")).toHaveValue(
     "Каждый день в девять собирай сводку",
   );
@@ -544,19 +610,24 @@ test("simulated G2 microphone creates a native schedule preview and requires a t
   expect(audio.map((entry: { open: boolean }) => entry.open)).toEqual([
     true,
     false,
+    true,
+    false,
   ]);
   const stt = calls.find((call) => call.method === "workspace.stt.transcribe");
   expect([...Buffer.from(stt.params.wav, "base64").subarray(44)]).toEqual([
     1, 2, 3, 4,
   ]);
-  await hud.getByRole("button", { name: "Продолжить с текстом" }).click();
+  const taskName =
+    "Голосовая сводка по всем отделам и дополнительным проектам с расшифровкой итогов";
+  replyNext("automations.draft", {
+    fields: { name: taskName, prompt: "Собрать сводку", schedule: "0 9 * * *" },
+  });
+  await shown("> Продолжить с текстом");
+  await ring();
   await expect(hud.locator("#body")).toContainText("Europe/Istanbul");
   expect(
     (await hud.locator("#body").textContent())?.split("\n").slice(0, 2),
-  ).toEqual([
-    "Голосовая сводка",
-    "Ближайший запуск: 2026-11-10 09:00:00+03:00",
-  ]);
+  ).toEqual([taskName, "Ближайший запуск: 2026-11-10 09:00:00+03:00"]);
   await expect(
     hud.getByRole("button", { name: "Создать задачу", exact: true }),
   ).toBeEnabled();
@@ -575,13 +646,297 @@ test("simulated G2 microphone creates a native schedule preview and requires a t
   await hud
     .locator("#display")
     .screenshot({ path: "test-results/g2-schedule-simulation.png" });
-  await tap();
+  await shown("> Создать задачу");
+  await shown("Ближайший запуск: 2026-11-10 09:00:00+03:00");
+  await page.waitForTimeout(250);
+  await ring();
   await expect(
     hud.getByRole("button", { name: /Голосовая сводка/ }),
   ).toBeVisible();
   const creates = calls.filter((call) => call.method === "automations.create");
   expect(creates).toHaveLength(1);
   expect(creates[0].params.reviewHash).toBe("a".repeat(64));
+});
+
+test("R1 shows the exact answer and checks an unconfirmed operation before retrying", async ({
+  page,
+}) => {
+  const { calls, replyNext } = await server(page);
+  const { hud, ring, shown } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Другой чат");
+  await ring();
+  await shown("> Квартал");
+  await page.evaluate(() => {
+    (window as any).simulatedG2.block = true;
+  });
+  await ring();
+  await ring();
+  await expect(hud.locator("#title")).toHaveText("Подтверждение");
+  expect(calls.filter((call) => call.method === "inbox.answer")).toHaveLength(
+    0,
+  );
+  await page.evaluate(() => {
+    const g2 = (window as any).simulatedG2;
+    g2.block = false;
+    g2.release?.();
+  });
+  await shown("«Квартал»");
+  await hud
+    .locator("#display")
+    .screenshot({ path: "test-results/g2-answer-simulation.png" });
+  replyNext("inbox.answer", { status: "uncertain" });
+  await page.waitForTimeout(250);
+  await ring();
+  await shown("Отправка не подтверждена");
+  await shown("> Проверить отправку");
+  replyNext("inbox.operation", { status: "not_found" });
+  await ring();
+  await shown("> Повторить отправку");
+  expect(calls.filter((call) => call.method === "inbox.answer")).toHaveLength(
+    1,
+  );
+  replyNext("inbox.operation", { status: "not_found" });
+  await page.waitForTimeout(250);
+  await ring();
+  await shown("Ответ принят");
+  const answers = calls.filter((call) => call.method === "inbox.answer");
+  expect(answers).toHaveLength(2);
+  expect(answers[1].params).toEqual(answers[0].params);
+});
+
+test("R1 reads long permission context, cancels, then uses the system exit at the root", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  fixture.replacePending([
+    {
+      id: "permission",
+      sessionKey: "hermes:main:b",
+      sessionTitle: "Разрешение",
+      agentName: "Hermes",
+      kind: "permission",
+      question: "Команда агента. ".repeat(45),
+      choices: [],
+      multiSelect: false,
+      allowOther: false,
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60000,
+      allowedDecisions: ["allow-once", "deny"],
+    },
+  ]);
+  const { ring, shown } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Разрешение");
+  await ring();
+  await shown("> Разрешить один раз");
+  await ring(2);
+  await shown("> Отклонить");
+  await ring(2);
+  await shown("> Полный текст вопроса");
+  await ring();
+  await shown("Текст · 1/");
+  await ring(2);
+  await shown("Текст · 2/");
+  await ring(3);
+  await shown("> Полный текст вопроса");
+  await ring(1);
+  await shown("> Отклонить");
+  await ring(1);
+  await shown("> Разрешить один раз");
+  await ring();
+  await shown("«Разрешить один раз»");
+  await ring(3);
+  await shown("> Разрешить один раз");
+  await ring(3);
+  await shown("Нужен ответ · 1");
+  await ring(3);
+  await shown("OcuClaw");
+  await ring(3);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).simulatedG2.exits))
+    .toEqual([1]);
+  expect(
+    fixture.calls.filter((call) => call.method === "inbox.answer"),
+  ).toHaveLength(0);
+});
+
+test("R1 recovers a committed answer after the link drops without resending", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  const { hud, ring, shown } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Другой чат");
+  await ring();
+  await shown("> Квартал");
+  await ring();
+  await shown("«Квартал»");
+  fixture.dropNextReply("inbox.answer");
+  await page.waitForTimeout(250);
+  await ring();
+  await shown("> Проверить отправку");
+  await expect(hud.locator("#connection")).toHaveText("VPS подключён", {
+    timeout: 10000,
+  });
+  await shown("Предыдущий ответ принят Hermes");
+  await ring();
+  await shown("Ответ принят");
+  expect(
+    fixture.calls.filter((call) => call.method === "inbox.answer"),
+  ).toHaveLength(1);
+});
+
+test("R1 pages a long selected answer and refuses to send after its deadline", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  fixture.replacePending([
+    {
+      id: "question-1",
+      sessionKey: "hermes:main:b",
+      sessionTitle: "Другой чат",
+      agentName: "Hermes",
+      kind: "question",
+      question: "Какой период?",
+      choices: [
+        "Последний квартал. " + "Проверить каждую запись отдельно. ".repeat(40),
+      ],
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 600000,
+    },
+  ]);
+  const { ring, shown } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Другой чат");
+  await ring();
+  await shown("> Последний квартал");
+  await ring();
+  await shown("«Последний квартал");
+  await ring(2);
+  await shown("> Прочитать ответ полностью");
+  await ring();
+  await shown("Текст · 1/");
+  await ring(2);
+  await shown("Текст · 2/");
+  await ring(3);
+  await shown("> Прочитать ответ полностью");
+  await ring(1);
+  await shown("> Отправить");
+  await page.evaluate(() => {
+    const now = Date.now.bind(Date);
+    Date.now = () => now() + 11 * 60 * 1000;
+  });
+  await page.waitForTimeout(250);
+  await ring();
+  await shown("Время ответа истекло");
+  expect(
+    fixture.calls.filter((call) => call.method === "inbox.answer"),
+  ).toHaveLength(0);
+});
+
+test("phone restores a schedule draft and marks cached Inbox questions during source loss", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  await page.setViewportSize({ width: 320, height: 720 });
+  await connect(page);
+  const schedule = page.getByRole("button", {
+    name: "Расписание",
+    exact: true,
+  });
+  const newJob = page.getByRole("button", { name: "＋ Задача", exact: true });
+  const name = page.locator("#job-name");
+  const prompt = page.locator("#job-prompt");
+  await schedule.click();
+  await newJob.click();
+  await name.fill("Черновик по расписанию");
+  await prompt.fill("Собрать отчёт");
+  await schedule.click();
+  await expect(name).toHaveValue("Черновик по расписанию");
+  await page.getByRole("button", { name: "Входящие", exact: true }).click();
+  await expect(page.locator(".inbox-badge")).toHaveText("1");
+  await expect(page.locator("#inbox-list")).toContainText("Осталось");
+  fixture.update({ available: false, pending: [] });
+  await expect(page.locator(".inbox-unavailable")).toContainText(
+    "Источник вопросов недоступен",
+  );
+  await expect(page.locator("#inbox-list")).toContainText("Ждёт сверки");
+  await expect(page.locator("#pending")).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await schedule.click();
+  await expect(prompt).toHaveValue("Собрать отчёт");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
+    320,
+  );
+  await connect(page);
+  await schedule.click();
+  await newJob.click();
+  await expect(name).toHaveValue("Черновик по расписанию");
+  await expect(prompt).toHaveValue("Собрать отчёт");
+  await expect(page.locator("#schedule-preview")).toBeEmpty();
+  await page.getByRole("button", { name: "‹ Расписание", exact: true }).click();
+  await page.locator("#job-profile").selectOption("research");
+  await newJob.click();
+  await expect(name).toHaveValue("");
+});
+
+test("phone keeps the composer visible, anchors older history, and leaves reading position during streaming", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await connect(page);
+  const row = (id: number) => ({
+    id,
+    role: "assistant",
+    content: `Сообщение ${id}. ` + "Текст отчёта. ".repeat(16),
+  });
+  fixture.replyNext("chat.subscribe", {
+    messages: Array.from({ length: 14 }, (_, i) => row(i + 11)),
+    total: 24,
+  });
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  const composer = page.locator("#message-input");
+  const send = page.locator("#compose-chat [type=submit]");
+  await expect(composer).toBeInViewport();
+  await expect(send).toBeInViewport();
+  await page.screenshot({ path: "test-results/phone-chat-layout.png" });
+  const log = page.locator(".messages");
+  await log.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  fixture.replyNext("chat.history", {
+    messages: Array.from({ length: 10 }, (_, i) => row(i + 1)),
+    hasMore: false,
+  });
+  const anchor = page.locator('[data-message-id="11"]');
+  const offset = async () =>
+    (await anchor.boundingBox())!.y - (await log.boundingBox())!.y;
+  const before = await offset();
+  await page.getByRole("button", { name: "Предыдущие сообщения" }).click();
+  await expect(page.locator('[data-message-id="1"]')).toHaveCount(1);
+  expect(Math.abs((await offset()) - before)).toBeLessThanOrEqual(2);
+  await composer.fill("Мой черновик");
+  const position = await log.evaluate((element) => element.scrollTop);
+  fixture.emit("streaming", {
+    sessionKey: "hermes:main:a",
+    runId: "one",
+    seq: 1,
+    text: "Продолжаю отчёт",
+  });
+  await expect(page.locator(".streaming")).toContainText("Продолжаю отчёт");
+  await expect(composer).toBeFocused();
+  expect(await log.evaluate((element) => element.scrollTop)).toBe(position);
+  await expect(page.getByRole("button", { name: /К новым/ })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 500 });
+  await expect(send).toBeInViewport();
 });
 
 test("phone without G2: streaming, draft, attachment upload, addressed Inbox and independent HUD", async ({

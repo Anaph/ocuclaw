@@ -176,10 +176,35 @@ details p {
   margin: 0;
 }
 .bottom-nav button {
+  position: relative;
+  min-width: 0;
   text-align: center;
   padding: 14px 6px;
   border-color: transparent;
   background: transparent;
+}
+.inbox-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  min-width: 17px;
+  padding: 1px 3px;
+  border-radius: 10px;
+  background: #a6e3c1;
+  color: #0b1313;
+  font-size: 10px;
+}
+.inbox-badge.stale {
+  background: #f5d6a1;
+}
+.inbox-unavailable {
+  color: #f5d6a1;
+}
+.inbox-card-meta {
+  display: block;
+  margin-top: 8px;
+  color: #b6eacb;
+  font-size: 13px;
 }
 .active {
   border-color: #a6e3c1 !important;
@@ -262,6 +287,90 @@ input[type="checkbox"] {
   min-height: 25vh;
   padding: 10px 3px;
   scrollbar-gutter: stable;
+}
+.phone.chat-open {
+  height: var(--phone-visible-height, 100dvh);
+  padding-top: 8px;
+  padding-bottom: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+.chat-open header {
+  padding: 4px 0 8px;
+}
+.chat-open header small {
+  display: none;
+}
+.chat-open #phone-notice {
+  margin: 4px 0;
+  font-size: 13px;
+}
+.chat-open #phone-notice:empty {
+  margin: 0;
+}
+.chat-open #phone-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+}
+.chat-open .heading {
+  margin: 6px 0;
+}
+.chat-open .heading h1 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.chat-open #chat-actions,
+.chat-open .compose-tools {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  flex-shrink: 0;
+  scrollbar-width: thin;
+}
+.chat-open #chat-actions button,
+.chat-open .compose-tools > * {
+  flex-shrink: 0;
+}
+.chat-open .messages {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  overflow-anchor: none;
+}
+.chat-open #latest {
+  align-self: center;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.chat-open .bottom-nav {
+  position: static;
+}
+.keyboard-open .chat-open .bottom-nav {
+  display: none;
+}
+#compose-chat {
+  margin: 0;
+  gap: 6px;
+  border-top: 1px solid #355043;
+  padding: 6px 0;
+}
+.compose-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+}
+#message-input {
+  resize: none;
+  padding: 6px 8px;
+}
+#attachment-list {
+  max-height: 80px;
+  overflow: auto;
+}
+.chat-open .compose-tools > * {
+  padding: 6px 10px;
 }
 .message {
   padding: 16px;
@@ -375,6 +484,11 @@ fieldset {
   }
   .messages {
     max-height: 52vh;
+  }
+  .chat-open .heading button,
+  .chat-open #chat-actions button {
+    font-size: 13px;
+    padding: 7px 8px;
   }
   .message {
     max-width: 100%;
