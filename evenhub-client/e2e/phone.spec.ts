@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import type { Question } from "../src/model";
+import type { Completion, Question } from "../src/model";
 async function server(page: Page) {
   const calls: any[] = [];
   const sendReceipts = new Map<string, any>();
@@ -9,6 +9,7 @@ async function server(page: Page) {
   const dropReplies = new Set<string>();
   let peer: any;
   let jobs: any[] = [];
+  let completed: Completion[] = [];
   let pending: Question[] = [
     {
       id: "question-1",
@@ -58,7 +59,7 @@ async function server(page: Page) {
       permissions: "gateway",
     },
     pending,
-    completed: [],
+    completed,
   });
   const options = {
     supported: true,
@@ -98,6 +99,13 @@ async function server(page: Page) {
         };
       if (["inbox.subscribe", "inbox.snapshot"].includes(frame.method))
         data = snapshot();
+      if (frame.method === "inbox.completed")
+        data = {
+          items: completed.filter(
+            (item) =>
+              !p.id || (item.id === p.id && item.sessionKey === p.sessionKey),
+          ),
+        };
       if (frame.method === "workspace.catalog")
         data = {
           agents: [
@@ -127,10 +135,14 @@ async function server(page: Page) {
       }
       if (frame.method === "workspace.send.receipt")
         data = sendReceipts.get(p.operationId) ?? { status: "not_found" };
-      if (frame.method === "inbox.get")
-        data = pending.some((x) => x.id === p.id)
-          ? { status: "pending", item: pending[0] }
+      if (frame.method === "inbox.get") {
+        const item = pending.find(
+          (x) => x.id === p.id && x.sessionKey === p.sessionKey,
+        );
+        data = item
+          ? { status: "pending", item }
           : { status: "already_answered" };
+      }
       if (frame.method === "inbox.answer") {
         data = nextReply.get(frame.method) ?? { status: "accepted" };
         if (data.status === "accepted")
@@ -239,6 +251,9 @@ async function server(page: Page) {
     calls,
     replacePending: (items: typeof pending) => {
       pending = items;
+    },
+    replaceCompleted: (items: Completion[]) => {
+      completed = items;
     },
     replyNext: (method: string, data: unknown) => nextReply.set(method, data),
     dropNextReply: (method: string) => dropReplies.add(method),
@@ -611,6 +626,12 @@ test("R1 dictates and confirms a schedule, then recovers a lost save acknowledgm
   await expect(hud.locator("#title")).toHaveText("Слушаю…");
   await event({ audioEvent: { audioPcm: [1, 2, 3, 4] } });
   await shown("> Завершить запись");
+  replyNext("workspace.stt.transcribe", {
+    success: false,
+    error: "Распознавание временно недоступно",
+  });
+  await ring();
+  await shown("> Повторить распознавание");
   await ring();
   await expect(hud.locator("#text")).toHaveValue(
     "Каждый день в девять собирай сводку",
@@ -622,8 +643,12 @@ test("R1 dictates and confirms a schedule, then recovers a lost save acknowledgm
     true,
     false,
   ]);
-  const stt = calls.find((call) => call.method === "workspace.stt.transcribe");
-  expect([...Buffer.from(stt.params.wav, "base64").subarray(44)]).toEqual([
+  const stt = calls.filter(
+    (call) => call.method === "workspace.stt.transcribe",
+  );
+  expect(stt).toHaveLength(2);
+  expect(stt[1].params.wav).toBe(stt[0].params.wav);
+  expect([...Buffer.from(stt[0].params.wav, "base64").subarray(44)]).toEqual([
     1, 2, 3, 4,
   ]);
   const taskName =
@@ -687,9 +712,34 @@ test("R1 dictates and confirms a schedule, then recovers a lost save acknowledgm
 test("R1 shows the exact answer and checks an unconfirmed operation before retrying", async ({
   page,
 }) => {
-  const { calls, replyNext } = await server(page);
+  const { calls, replyNext, replacePending } = await server(page);
+  const start = Date.now();
+  replacePending([
+    {
+      id: "question-1",
+      sessionKey: "hermes:main:b",
+      sessionTitle: "Другой чат",
+      agentName: "Hermes",
+      kind: "question",
+      question: "Какой период?",
+      choices: ["Квартал"],
+      createdAtMs: start,
+      expiresAtMs: start + 60000,
+    },
+    {
+      id: "question-2",
+      sessionKey: "hermes:main:a",
+      sessionTitle: "Следующая сессия",
+      agentName: "Hermes",
+      kind: "question",
+      question: "Какой формат?",
+      choices: ["PDF"],
+      createdAtMs: start,
+      expiresAtMs: start + 120000,
+    },
+  ]);
   const { hud, ring, shown } = await simulateG2(page);
-  await shown("> Нужен ответ · 1");
+  await shown("> Нужен ответ · 2");
   await ring();
   await shown("> Hermes / Другой чат");
   await ring();
@@ -730,6 +780,13 @@ test("R1 shows the exact answer and checks an unconfirmed operation before retry
   const answers = calls.filter((call) => call.method === "inbox.answer");
   expect(answers).toHaveLength(2);
   expect(answers[1].params).toEqual(answers[0].params);
+  await shown("> Следующий вопрос");
+  await ring();
+  await shown("Hermes / Следующая сессия");
+  await shown("> PDF");
+  expect(calls.filter((call) => call.method === "inbox.answer")).toHaveLength(
+    2,
+  );
 });
 
 test("R1 reads long permission context, cancels, then uses the system exit at the root", async ({
@@ -749,6 +806,8 @@ test("R1 reads long permission context, cancels, then uses the system exit at th
     createdAtMs: Date.now(),
     expiresAtMs: Date.now() + 60000,
     allowedDecisions: ["allow-once", "deny"],
+    permissionCommand: "git status --short",
+    permissionDescription: "Подробности запроса. ".repeat(60),
   };
   fixture.replacePending([permission]);
   const { ring, shown } = await simulateG2(page);
@@ -787,6 +846,7 @@ test("R1 reads long permission context, cancels, then uses the system exit at th
   await shown("> Разрешить один раз");
   await ring();
   await shown("«Разрешить один раз»");
+  await shown("git status --short");
   await ring(3);
   await shown("> Разрешить один раз");
   await ring(3);
@@ -1106,6 +1166,152 @@ test("phone without G2: streaming, draft, attachment upload, addressed Inbox and
     path: "test-results/phone-inbox.png",
     fullPage: true,
   });
+});
+
+test("a G2 handoff survives reopening and loads the exact question or older result", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  const older: Completion = {
+    id: "older-result",
+    sessionKey: "hermes:main:a",
+    sessionTitle: "Отчёт за октябрь",
+    agentName: "Hermes",
+    summary: "Итог именно выбранного запуска",
+    read: false,
+    createdAtMs: Date.now() - 60_000,
+  };
+  const latest: Completion = {
+    ...older,
+    id: "latest-result",
+    sessionKey: "hermes:main:b",
+    sessionTitle: "Другой результат",
+    summary: "Свежий отчёт",
+    createdAtMs: Date.now(),
+  };
+  fixture.replaceCompleted([latest, older]);
+  await connect(page);
+  const hud = page.locator("#hud-panel");
+  const tabs = page.getByRole("navigation", { name: "Разделы" });
+  const revealHUD = async () => {
+    await tabs.getByRole("button", { name: "Настройки", exact: true }).click();
+    await page.locator("#hud-toggle").click();
+    await expect(hud).toBeVisible();
+  };
+  await tabs.getByRole("button", { name: "Входящие", exact: true }).click();
+  await page.locator("#inbox-list button").click();
+  await page
+    .locator("#question-links")
+    .getByRole("button", { name: "На очки", exact: true })
+    .click();
+  await revealHUD();
+  await hud.getByRole("button", { name: "На телефон", exact: true }).click();
+  await expect(page.locator("#phone-handoff")).toContainText("Другой чат");
+  await connect(page);
+  await page
+    .getByRole("button", { name: "Открыть на телефоне", exact: true })
+    .click();
+  await expect(page.locator("#phone-content")).toContainText("Какой период?");
+  expect(
+    fixture.calls.filter((call) => call.method === "inbox.get").at(-1)?.params,
+  ).toEqual({ id: "question-1", sessionKey: "hermes:main:b" });
+  expect(
+    fixture.calls.filter((call) => call.method === "inbox.answer"),
+  ).toHaveLength(0);
+
+  await page.locator("#question-back").click();
+  await page.locator("#completed").click();
+  await page
+    .locator("#inbox-list article")
+    .filter({ hasText: older.sessionTitle })
+    .getByRole("button", { name: "На очки", exact: true })
+    .click();
+  await revealHUD();
+  await hud.getByRole("button", { name: "На телефон", exact: true }).click();
+  fixture.replaceCompleted([latest]);
+  await connect(page);
+  fixture.replyNext("inbox.completed", { items: [older] });
+  await page
+    .getByRole("button", { name: "Открыть на телефоне", exact: true })
+    .click();
+  await expect(page.locator("#phone-content")).toContainText(older.summary);
+  await expect(page.locator("#phone-content")).not.toContainText(
+    latest.summary,
+  );
+  expect(
+    fixture.calls.filter((call) => call.method === "inbox.completed").at(-1)
+      ?.params,
+  ).toEqual({ id: older.id, sessionKey: older.sessionKey });
+});
+
+test("phone gathers unresolved receipts for the active server and verifies without resending", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  await connect(page);
+  await page.evaluate(() => {
+    const scope = encodeURIComponent("ws://127.0.0.1:47801/");
+    const send = (scope: string, key: string, id: string) =>
+      localStorage.setItem(
+        `ocuclaw.send:${scope}:${encodeURIComponent(key)}`,
+        JSON.stringify({ id, text: "Черновик" }),
+      );
+    send(scope, "hermes:main:a", "message-op");
+    send(encodeURIComponent("ws://other.test/"), "hermes:main:a", "other-op");
+    sessionStorage.setItem(
+      `ocuclaw.pendingOperation:${scope}`,
+      JSON.stringify([
+        {
+          id: "question-1",
+          sessionKey: "hermes:main:b",
+          operationId: "answer-op",
+        },
+      ]),
+    );
+    localStorage.setItem(
+      `ocuclaw.scheduleOperation:${scope}:research`,
+      JSON.stringify({
+        operationId: "job-op",
+        operation: "jobs.run",
+        params: { jobId: "job-a" },
+      }),
+    );
+  });
+  await page
+    .getByRole("button", { name: "Нужна проверка · 3", exact: true })
+    .click();
+  const center = page.locator("#verification-list");
+  await expect(center.locator("article")).toHaveCount(3);
+  fixture.replyNext("workspace.send.receipt", { status: "accepted" });
+  await center
+    .locator("article")
+    .filter({ hasText: "Сообщение" })
+    .getByRole("button", { name: "Проверить", exact: true })
+    .click();
+  await expect(center.locator("article")).toHaveCount(2);
+  fixture.replyNext("inbox.operation", { status: "accepted" });
+  await center
+    .locator("article")
+    .filter({ hasText: "Ответ агенту" })
+    .getByRole("button", { name: "Проверить", exact: true })
+    .click();
+  await expect(center.locator("article")).toHaveCount(1);
+  fixture.replyNext("automations.receipt", { status: "applied" });
+  await center
+    .locator("article")
+    .filter({ hasText: "Расписание" })
+    .getByRole("button", { name: "Проверить", exact: true })
+    .click();
+  await expect(page.locator("#phone-notice")).toContainText("Выполнено");
+  expect(
+    fixture.calls.filter((call) => call.method === "automations.receipt").at(-1)
+      ?.params,
+  ).toEqual({ operationId: "job-op", profileId: "research" });
+  expect(
+    fixture.calls.filter((call) =>
+      ["agent", "inbox.answer", "jobs.run"].includes(call.method),
+    ),
+  ).toHaveLength(0);
 });
 
 test("schedule uses server preview before save, native pause/run and execution history", async ({

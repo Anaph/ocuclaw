@@ -53,6 +53,22 @@ async def test():
         page = await inbox.completed({})
         assert page["total"] == page["unread"] == 1
         assert [x["sessionKey"] for x in page["items"]] == ["hermes:main:session"]
+        assert (
+            len(
+                (
+                    await inbox.completed(
+                        {"id": "0", "sessionKey": "hermes:main:session"}
+                    )
+                )["items"]
+            )
+            == 1
+        )
+        assert not (
+            await inbox.completed({"id": "0", "sessionKey": "hermes:main:other"})
+        )["items"]
+        assert not (
+            await inbox.completed({"id": "1", "sessionKey": "hermes:private:session"})
+        )["items"]
         await inbox.read({"id": "1"})
         assert (
             inbox.db.execute('SELECT read FROM completions WHERE id="1"').fetchone()[0]

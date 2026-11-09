@@ -66,6 +66,10 @@ interface ScheduleOperation {
   operation: string;
   params: Record<string, unknown>;
 }
+export type UnconfirmedOperation =
+  | { kind: "message"; sessionKey: string; operationId: string }
+  | { kind: "answer"; sessionKey: string; id: string; operationId: string }
+  | { kind: "schedule"; profile: string; operationId: string };
 export class ScheduleRejected extends Error {
   constructor(readonly code: string) {
     super(errorText(code));
@@ -125,10 +129,8 @@ export class Workspace {
   constructor(
     readonly relay: Relay,
     readonly inbox: InboxModel,
-    private storage: Pick<
-      Storage,
-      "getItem" | "setItem" | "removeItem"
-    > = localStorage,
+    private storage: Pick<Storage, "getItem" | "setItem" | "removeItem"> &
+      Partial<Pick<Storage, "length" | "key">> = localStorage,
   ) {
     relay.observe({
       snapshot: (snapshot) => {
@@ -482,8 +484,11 @@ export class Workspace {
           void this.request("uploads.cancel", { id }).catch(() => {});
     }
   }
+  private sendPrefix() {
+    return `ocuclaw.send:${encodeURIComponent(this.scope)}:`;
+  }
   private sendKey(key: string) {
-    return `ocuclaw.send:${encodeURIComponent(this.scope)}:${encodeURIComponent(key)}`;
+    return this.sendPrefix() + encodeURIComponent(key);
   }
   pendingSend(key = this.chatKey): PendingSend | null {
     try {
@@ -515,7 +520,10 @@ export class Workspace {
       void this.refreshChat(key).catch(() => {});
     }
   }
-  async checkAnswer(item: Question, attempt: AnswerAttempt) {
+  async checkAnswer(
+    item: Pick<Question, "id" | "sessionKey">,
+    attempt: AnswerAttempt,
+  ) {
     const store = new ReceiptStore(sessionStorage, this.scope);
     if (attempt.operationId) {
       const receipt = await this.outcome("inbox.operation", {
@@ -607,16 +615,56 @@ export class Workspace {
     this.onChange();
     if (this.catalogProfile !== profile) await this.catalog(profile);
   }
-  private receiptKey() {
-    return `ocuclaw.scheduleOperation:${encodeURIComponent(this.scope)}:${this.profile}`;
+  private schedulePrefix() {
+    return `ocuclaw.scheduleOperation:${encodeURIComponent(this.scope)}:`;
   }
-  pendingSchedule(): ScheduleOperation | null {
-    const saved = this.storage.getItem(this.receiptKey());
+  private receiptKey(profile = this.profile) {
+    return this.schedulePrefix() + profile;
+  }
+  pendingSchedule(profile = this.profile): ScheduleOperation | null {
+    const saved = this.storage.getItem(this.receiptKey(profile));
     try {
       return saved ? JSON.parse(saved) : null;
     } catch {
       return null;
     }
+  }
+  unconfirmed(): UnconfirmedOperation[] {
+    if (!this.scope) return [];
+    const items: UnconfirmedOperation[] = new ReceiptStore(
+      sessionStorage,
+      this.scope,
+    )
+      .list()
+      .filter((entry) => this.canRead(entry.sessionKey.split(":")[1]))
+      .map((entry) => ({ ...entry, kind: "answer" }));
+    const sends = this.sendPrefix();
+    const schedules = this.schedulePrefix();
+    for (let i = 0; i < (this.storage.length ?? 0); i++) {
+      const key = this.storage.key?.(i);
+      if (!key) continue;
+      if (key.startsWith(sends)) {
+        let sessionKey: string;
+        try {
+          sessionKey = decodeURIComponent(key.slice(sends.length));
+        } catch {
+          continue;
+        }
+        const pending = this.pendingSend(sessionKey);
+        if (pending?.id && this.canRead(sessionKey.split(":")[1]))
+          items.push({ kind: "message", sessionKey, operationId: pending.id });
+      } else if (key.startsWith(schedules)) {
+        const profile = key.slice(schedules.length);
+        const pending = this.pendingSchedule(profile);
+        if (pending?.operationId && this.canRead(profile))
+          items.push({
+            kind: "schedule",
+            profile,
+            operationId: pending.operationId,
+          });
+      }
+    }
+    return items;
   }
   async mutateSchedule(
     operation: string,

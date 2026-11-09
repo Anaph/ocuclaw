@@ -135,6 +135,8 @@ class NativeInboxSource:
                         "sessionTitle": key,
                         "kind": "permission",
                         "question": entry["command"] or entry["description"],
+                        "permissionCommand": entry["command"] or None,
+                        "permissionDescription": entry.get("description") or None,
                         "allowedDecisions": list(entry["allowedDecisions"]),
                         "expiresAtMs": entry["expiresAtMs"],
                         "createdAtMs": 0,
@@ -168,6 +170,8 @@ class NativeInboxSource:
                             "question": entry.get("command")
                             or entry.get("description")
                             or "Approval required",
+                            "permissionCommand": entry.get("command") or None,
+                            "permissionDescription": entry.get("description") or None,
                             "allowedDecisions": ["allow-once", "deny"],
                             "expiresAtMs": entry.get("expires_at_ms"),
                             "createdAtMs": entry.get("created_at_ms", 0),

@@ -2952,7 +2952,13 @@ the native resolver twice; after a lost acknowledgment query the original receip
 `inbox.py` persists results/receipts in `state/ocuclaw-inbox.sqlite` (0600), retained
 seven days. Questions are rechecked against the public native source. Known
 original deadlines classify expirations without re-registering a request.
-Results are newest-first in pages of 100. `inbox.completed {before?}` returns items, total/unread counts and a nextBefore cursor; read state is independent of session unread.
+Results are newest-first in pages of 100. `inbox.completed {before?}` returns
+items, total/unread counts and a `nextBefore` cursor. Read state is independent
+of session unread. `inbox.completed {id,sessionKey}` returns zero or one item
+within the live profile scope. The exact lookup supports opening the result
+selected on G2 on the phone, including results outside the first page.
+Permission items can include `permissionCommand` and `permissionDescription`
+from the native request.
 
 Workspace also allows `sessions.list`, `sessions.patch`, `sessions.abort`,
 `chat.history`, `agent`, plus `sessions.pin`, `sessions.create` (detached key,

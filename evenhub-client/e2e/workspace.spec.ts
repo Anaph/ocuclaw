@@ -137,21 +137,22 @@ test("three sessions, explicit confirmation, voice-text address, external resolu
   expect(answers).toHaveLength(0);
   await expect(page.locator("#title")).toHaveText("Подтверждение");
   await page.getByRole("button", { name: "Отправить", exact: true }).click();
-  await expect(page.locator("#title")).toHaveText("Нужен ответ · 2");
+  await expect(page.locator("#title")).toHaveText("Ответ принят");
   expect(answers[0]).toMatchObject({
     id: "q1",
     sessionKey: "hermes:main:a",
     answer: { indices: [1] },
   });
   await page
-    .locator("#actions button")
-    .filter({ hasText: "Код / Исправление" })
+    .getByRole("button", { name: "Следующий вопрос", exact: true })
     .click();
+  await expect(page.locator("#title")).toHaveText("Код / Исправление");
   await page.getByRole("button", { name: "☐ Типы", exact: true }).click();
   await page.getByRole("button", { name: "☐ Сборка", exact: true }).click();
   await page.getByRole("button", { name: "Продолжить", exact: true }).click();
   expect(answers).toHaveLength(1);
   await page.getByRole("button", { name: "Отправить", exact: true }).click();
+  await page.getByRole("button", { name: "К списку", exact: true }).click();
   await expect(page.locator("#title")).toHaveText("Нужен ответ · 1");
   expect(answers[1].answer.indices).toEqual([0, 2]);
   await page.locator("#actions button").first().click();

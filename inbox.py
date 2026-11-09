@@ -155,7 +155,28 @@ class Inbox:
     async def completed(self, params):
         self._prune()
         before = params.get("before")
+        identity = params.get("id")
+        session_key = params.get("sessionKey")
         scope, scope_args = self._scope()
+        if identity is not None or session_key is not None:
+            if before is not None or not all(
+                isinstance(value, str) and 0 < len(value) <= 512
+                for value in (identity, session_key)
+            ):
+                raise ValueError("invalid_result_identity")
+            with self._lock:
+                row = self.db.execute(
+                    "SELECT payload,read,created FROM completions WHERE id=? AND "
+                    + scope,
+                    [identity, *scope_args],
+                ).fetchone()
+            if row:
+                item = json.loads(row[0])
+                if item.get("sessionKey") == session_key:
+                    return {
+                        "items": [dict(item, read=bool(row[1]), createdAtMs=row[2])]
+                    }
+            return {"items": []}
         args = list(scope_args)
         where = " WHERE " + scope
         if before is not None:

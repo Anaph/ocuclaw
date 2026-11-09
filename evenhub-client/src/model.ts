@@ -13,6 +13,8 @@ export interface Question {
   multiSelect?: boolean;
   allowOther?: boolean;
   allowedDecisions?: string[];
+  permissionCommand?: string | null;
+  permissionDescription?: string | null;
   expiresAtMs: number | null;
   createdAtMs: number;
 }

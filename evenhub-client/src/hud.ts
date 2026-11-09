@@ -4,6 +4,7 @@ import "./style.css";
 import {
   InboxModel,
   canSend,
+  orderedQuestions,
   sessionStatus,
   type Question,
   type Completion,
@@ -24,11 +25,13 @@ import {
 } from "./workspace";
 import { Glasses, wavBase64 } from "./glasses";
 import type { Input } from "./hud-input";
+import { sendHandoff, type Handoff } from "./handoff";
 type Screen =
   | "jobs"
   | "job"
   | "home"
   | "pending"
+  | "answered"
   | "completed"
   | "sessions"
   | "question"
@@ -90,6 +93,7 @@ export function mountHud(
     | { kind: "schedule"; recovery?: Confirmation };
   let target: Target | null = null,
     draft = "",
+    voiceRetry: Uint8Array | null = null,
     readText = "",
     readPage = 0,
     readReturn: Screen = "question",
@@ -134,6 +138,7 @@ export function mountHud(
     lastTap = -Infinity;
     target = null;
     draft = "";
+    voiceRetry = null;
     textField.value = "";
     readText = "";
     readPage = 0;
@@ -237,8 +242,23 @@ export function mountHud(
   function compose(next: Target) {
     target = next;
     draft = "";
+    voiceRetry = null;
     textField.value = "";
     go("compose");
+  }
+  function openQuestion(item: Question) {
+    questionId = item.id;
+    choices.clear();
+    go("question");
+  }
+  function handoff(kind: Handoff["kind"], item: Question | Completion) {
+    if (!connectionScope) return message("Сначала подключитесь к Hermes");
+    sendHandoff(connectionScope, {
+      kind,
+      id: item.id,
+      sessionKey: item.sessionKey,
+    });
+    message("Готово к открытию на телефоне");
   }
   async function refreshSessions(search = sessionSearch) {
     const generation = connectionGeneration;
@@ -278,6 +298,8 @@ export function mountHud(
           : answer.indices.map((i) => item.choices![i]).join(", ");
     const attempt = workspace.answerAttempt(item);
     const context = `${item.agentName} / ${item.sessionTitle}`;
+    const action = "decision" in answer ? item.permissionCommand : null;
+    const summary = [`«${shown}»`, action, context].filter(Boolean).join("\n");
     const submit = async () => {
       try {
         if (!attempt.operationId && !canSend(item))
@@ -288,7 +310,7 @@ export function mountHud(
         throw error;
       }
     };
-    const flow = confirm(`«${shown}»\n${context}`, submit, back, {
+    const flow = confirm(summary, submit, back, {
       phase: attempt.operationId ? "check" : "review",
     });
     function showOutcome(reply: { status: string; error?: string }) {
@@ -297,7 +319,10 @@ export function mountHud(
           reply.status,
         )
       ) {
-        go("pending");
+        if (reply.status === "accepted") {
+          positions.delete("answered");
+          go("answered");
+        } else go("pending");
         void refreshInbox().catch(() => {});
       } else {
         flow.phase = reply.status === "rejected" ? "review" : "check";
@@ -576,13 +601,49 @@ export function mountHud(
           .map((item) => ({
             id: item.id,
             label: `${item.agentName} / ${item.sessionTitle}\n${item.question}\n${item.kind === "permission" ? "Разрешение" : "Вопрос"} · ${remaining(item)}`,
-            run: () => {
-              questionId = item.id;
-              choices.clear();
-              go("question");
-            },
+            run: () => openQuestion(item),
           })),
       };
+    if (screen === "answered") {
+      const next =
+        available && relay.online
+          ? orderedQuestions(
+              model.snapshot.pending.filter((item) => item.id !== questionId),
+            )[0]
+          : undefined;
+      return {
+        title: "Ответ принят",
+        body: next
+          ? `${next.agentName} / ${next.sessionTitle}\n${next.question}`
+          : "Список вопросов можно открыть ниже.",
+        actions: [
+          ...(next
+            ? [
+                {
+                  id: `next:${next.id}`,
+                  label: "Следующий вопрос",
+                  run: () => {
+                    const current = model.snapshot.pending.find(
+                      (item) =>
+                        item.id === next.id &&
+                        item.sessionKey === next.sessionKey,
+                    );
+                    if (
+                      current &&
+                      canSend(current) &&
+                      relay.online &&
+                      available
+                    )
+                      openQuestion(current);
+                    else message("Вопрос больше не актуален");
+                  },
+                },
+              ]
+            : []),
+          { id: "all-questions", label: "К списку", run: () => go("pending") },
+        ],
+      };
+    }
     if (screen === "completed")
       return {
         title: "Готово",
@@ -706,7 +767,22 @@ export function mountHud(
         {
           id: "read",
           label: "Полный текст вопроса",
-          run: () => full(item.question),
+          run: () =>
+            full(
+              [
+                item.permissionDescription,
+                item.permissionCommand || item.question,
+              ]
+                .filter(
+                  (line, index, lines) => line && lines.indexOf(line) === index,
+                )
+                .join("\n\n"),
+            ),
+        },
+        {
+          id: "handoff",
+          label: "На телефон",
+          run: () => handoff("question", item),
         },
         {
           id: "chat",
@@ -717,6 +793,13 @@ export function mountHud(
       return {
         title: `${item.agentName} / ${item.sessionTitle}`,
         body: `${item.question}\n${remaining(item)}`,
+        bodyLines:
+          item.kind === "permission"
+            ? [
+                `Разрешение · ${remaining(item)}`,
+                item.permissionCommand || item.question,
+              ]
+            : undefined,
         actions,
       };
     }
@@ -731,6 +814,11 @@ export function mountHud(
             id: "read",
             label: "Прочитать результат",
             run: () => full(item.summary),
+          },
+          {
+            id: "handoff",
+            label: "На телефон",
+            run: () => handoff("result", item),
           },
           {
             id: "chat",
@@ -956,6 +1044,15 @@ export function mountHud(
                 : "Ответ агенту",
         body: draft || "Введите текст на телефоне или включите микрофон.",
         actions: [
+          ...(voiceRetry
+            ? [
+                {
+                  id: "retry-voice",
+                  label: "Повторить распознавание",
+                  run: transcribeRecording,
+                },
+              ]
+            : []),
           ...(draft
             ? [{ id: "use", label: "Продолжить с текстом", run: useDraft }]
             : []),
@@ -1087,6 +1184,7 @@ export function mountHud(
     draft = textField.value.trim() || draft;
     if (!draft) return message("Введите или надиктуйте текст");
     if (!target) return;
+    voiceRetry = null;
     const boundTarget = target,
       boundDraft =
         target?.kind === "message" && target.context
@@ -1134,6 +1232,7 @@ export function mountHud(
   async function startRecording() {
     if (glasses.phoneInteracting) throw Error("Завершите действие на телефоне");
     await glasses.start();
+    voiceRetry = null;
     positions.delete("record");
     go("record");
     recordTimer = setTimeout(() => run(finishRecording), 17000);
@@ -1144,28 +1243,39 @@ export function mountHud(
     clearTimeout(recordTimer);
     try {
       const pcm = await glasses.stop();
+      voiceRetry = pcm.length ? pcm : null;
+      if (voiceRetry) positions.set("compose", "retry-voice");
       go("compose");
-      if (!pcm.length) throw Error("Запись пуста");
-      let provider = providerField.value.trim();
-      if (!provider) {
-        const listing = await relay.request("workspace.stt.providers");
-        provider = listing.providers?.find((x: any) => x.available)?.id;
-      }
-      if (!provider) throw Error("На VPS не настроено распознавание речи");
-      const reply = await relay.request("workspace.stt.transcribe", {
-        wav: wavBase64(pcm),
-        provider,
-        language: "ru",
-      });
-      if (!reply.success)
-        throw Error(reply.error || "Не удалось распознать речь");
-      draft = reply.transcript;
-      textField.value = draft;
-      positions.set("compose", "use");
-      message("Проверьте текст перед отправкой");
+      await transcribeRecording();
     } finally {
       transcribing = false;
     }
+  }
+  async function transcribeRecording() {
+    const pcm = voiceRetry;
+    if (!pcm) throw Error("Запись пуста");
+    let provider = providerField.value.trim();
+    if (!provider) {
+      const listing = await relay.request("workspace.stt.providers");
+      provider = listing.providers?.find(
+        (item: { available?: boolean; id: string }) => item.available,
+      )?.id;
+    }
+    if (!provider) throw Error("На VPS не настроено распознавание речи");
+    const reply = await relay.request("workspace.stt.transcribe", {
+      wav: wavBase64(pcm),
+      provider,
+      language: "ru",
+    });
+    const transcript =
+      typeof reply.transcript === "string" ? reply.transcript.trim() : "";
+    if (!reply.success || !transcript)
+      throw Error(reply.error || "Не удалось распознать речь");
+    voiceRetry = null;
+    draft = transcript;
+    textField.value = draft;
+    positions.set("compose", "use");
+    message("Проверьте текст перед отправкой");
   }
   function back() {
     if (notification) {
@@ -1190,6 +1300,7 @@ export function mountHud(
       return;
     }
     if (screen === "compose") {
+      voiceRetry = null;
       go(
         target?.kind === "question"
           ? "question"
@@ -1199,7 +1310,7 @@ export function mountHud(
       );
       return;
     }
-    if (screen === "question") {
+    if (screen === "question" || screen === "answered") {
       go("pending");
       return;
     }
@@ -1228,7 +1339,9 @@ export function mountHud(
       notification ||
       glasses.isRecording ||
       glasses.phoneInteracting ||
-      ["record", "confirm", "compose", "read", "question"].includes(screen) ||
+      ["record", "confirm", "compose", "read", "question", "answered"].includes(
+        screen,
+      ) ||
       busy
     )
       return;
@@ -1625,6 +1738,7 @@ export function mountHud(
   });
   window.addEventListener("pagehide", () => {
     clearTimeout(recordTimer);
+    voiceRetry = null;
     void glasses
       .stop()
       .catch((error) => glasses.onError(String(error.message)));
@@ -1660,8 +1774,11 @@ export function mountHud(
         throw Error("Завершите действие на очках");
       if (item.kind === "chat") await openChat(item.key, item.title);
       else if (item.kind === "question") {
-        questionId = item.id || "";
-        go("question");
+        const question = model.snapshot.pending.find(
+          (row) => row.id === item.id && row.sessionKey === item.key,
+        );
+        if (!question) throw Error("Вопрос уже закрыт");
+        openQuestion(question);
       } else {
         completionId = item.id || "";
         go("result");

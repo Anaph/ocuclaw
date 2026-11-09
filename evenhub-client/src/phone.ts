@@ -12,6 +12,7 @@ import {
   statusText,
   type ScheduleFields,
   type Job,
+  type UnconfirmedOperation,
 } from "./workspace";
 import {
   canSend,
@@ -20,10 +21,13 @@ import {
   type InboxModel,
   type Question,
   type Answer,
+  type Completion,
 } from "./model";
-import { endpointScope } from "./protocol";
+import { endpointScope, isCompletion, isQuestion } from "./protocol";
 import type { Relay } from "./transport";
 import { wavBase64, type Glasses } from "./glasses";
+import { clearHandoff, onHandoff, readHandoff, type Handoff } from "./handoff";
+import { scheduledTime, upcomingJobs } from "./schedule-view";
 type Tab = "chats" | "inbox" | "schedule" | "settings";
 type Hud = {
   reset: (scope: string) => void;
@@ -91,6 +95,7 @@ export class PhoneApp {
   private inboxTab = "pending";
   private inboxSession: { key: string; title: string } | null = null;
   private question: Question | null = null;
+  private resultDetail: Handoff | null = null;
   private renameSession: { key: string; title: string } | null = null;
   private selected = new Set<number>();
   private attachmentDrafts = new Map<string, File[]>();
@@ -128,6 +133,8 @@ export class PhoneApp {
   private panel: HTMLElement;
   private status: HTMLElement;
   private toast: HTMLElement;
+  private handoffBanner: HTMLElement;
+  private verificationButton: HTMLButtonElement;
   private bottom: HTMLElement;
   private composer?: HTMLTextAreaElement;
   private dictationTarget: "chat" | "answer" | "schedule" = "chat";
@@ -149,16 +156,32 @@ export class PhoneApp {
     private hudRoot: HTMLElement,
   ) {
     this.data = new Workspace(relay, inbox);
-    root.innerHTML = `<main class="phone"><header><div><span class="brand">OCUCLAW</span><small>Hermes · Even Hub</small></div><div id="phone-status" role="status"></div></header><p id="phone-notice" role="status"></p><section id="phone-content"></section><nav class="bottom-nav" aria-label="Разделы"></nav></main>`;
+    root.innerHTML = `<main class="phone"><header><div><span class="brand">OCUCLAW</span><small>Hermes · Even Hub</small></div><div id="phone-status" role="status"></div></header><div class="phone-feedback"><p id="phone-notice" role="status"></p><section id="phone-handoff" class="row" aria-label="Передача с очков" hidden></section><button id="verification-open" hidden>Нужна проверка</button></div><section id="phone-content"></section><nav class="bottom-nav" aria-label="Разделы"></nav></main>`;
     this.panel = root.querySelector("#phone-content")!;
     this.status = root.querySelector("#phone-status")!;
     this.toast = root.querySelector("#phone-notice")!;
+    this.handoffBanner = root.querySelector("#phone-handoff")!;
+    this.verificationButton = root.querySelector("#verification-open")!;
+    this.verificationButton.onclick = () =>
+      void this.run(() => {
+        if (this.recording || this.confirmation)
+          throw Error("Завершите текущее действие на телефоне");
+        this.preview = null;
+        this.question = null;
+        this.resultDetail = null;
+        this.renameSession = null;
+        this.inboxSession = null;
+        this.tab = "inbox";
+        this.inboxTab = "verification";
+      });
     this.bottom = root.querySelector(".bottom-nav")!;
+    onHandoff(() => this.renderHandoff());
     this.data.onChange = () => {
       if (!this.updateChatStream()) this.render();
     };
     relay.observe({
       snapshot: () => {
+        this.renderHandoff();
         if (this.tab === "inbox" && !this.recording && !this.confirmation)
           this.render();
         else this.renderTabs();
@@ -289,6 +312,7 @@ export class PhoneApp {
     this.data.reset(address);
     this.hud.reset(scope);
     this.question = null;
+    this.resultDetail = null;
     this.renameSession = null;
     this.fields = null;
     this.job = null;
@@ -318,6 +342,7 @@ export class PhoneApp {
     if (tab === "inbox") this.inboxSession = null;
     this.tab = tab;
     this.question = null;
+    this.resultDetail = null;
     this.renameSession = null;
     this.confirmation = null;
     return this.run(async () => {
@@ -370,8 +395,212 @@ export class PhoneApp {
       `Нужен ответ · ${count}${badge.classList.contains("stale") ? " · ждёт сверки" : ""}`,
     );
   }
+  private renderHandoff() {
+    const scope = this.data.scope;
+    const ticket = readHandoff(scope);
+    this.handoffBanner.hidden = !ticket;
+    this.handoffBanner.replaceChildren();
+    if (!ticket) return;
+    const rows =
+      ticket.kind === "question"
+        ? this.inbox.snapshot.pending
+        : this.inbox.snapshot.completed;
+    const item = rows.find(
+      (row) => row.id === ticket.id && row.sessionKey === ticket.sessionKey,
+    );
+    const text = document.createElement("span");
+    text.textContent = item?.sessionTitle
+      ? `С очков · ${item.sessionTitle}`
+      : "Передано с очков";
+    const open = this.button("Открыть на телефоне", () =>
+      this.openInboxTarget(ticket, () => clearHandoff(scope, ticket)),
+    );
+    open.disabled = this.recording || !this.relay.online;
+    this.handoffBanner.append(
+      text,
+      open,
+      this.button("Убрать", () => clearHandoff(scope, ticket)),
+    );
+  }
+  private async openInboxTarget(ticket: Handoff, consume = () => {}) {
+    if (this.recording || this.confirmation)
+      throw Error("Завершите текущее действие на телефоне");
+    const identity = { id: ticket.id, sessionKey: ticket.sessionKey };
+    if (ticket.kind === "question") {
+      if (!this.inbox.snapshot.available)
+        throw Error("Входящие ждут сверки с Hermes");
+      const reply = await this.data.request<{ status: string; item?: unknown }>(
+        "inbox.get",
+        identity,
+      );
+      if (reply.status === "source_unavailable")
+        throw Error("Источник вопросов недоступен");
+      const item = reply.item;
+      if (
+        reply.status !== "pending" ||
+        !isQuestion(item) ||
+        item.id !== ticket.id ||
+        item.sessionKey !== ticket.sessionKey ||
+        !canSend(item)
+      ) {
+        consume();
+        return this.message(
+          reply.status === "expired"
+            ? "Срок ответа истёк"
+            : "Переданный вопрос уже закрыт",
+        );
+      }
+      this.inbox.update({
+        ...this.inbox.snapshot,
+        pending: [
+          ...this.inbox.snapshot.pending.filter((row) => row.id !== item.id),
+          item,
+        ],
+      });
+      this.question = item;
+      this.resultDetail = null;
+      this.selected.clear();
+      this.answerDraft = "";
+      this.inboxTab = "pending";
+    } else {
+      const page = await this.data.request<{ items?: unknown }>(
+        "inbox.completed",
+        identity,
+      );
+      const item = Array.isArray(page.items)
+        ? page.items
+            .filter(isCompletion)
+            .find(
+              (row) =>
+                row.id === ticket.id && row.sessionKey === ticket.sessionKey,
+            )
+        : undefined;
+      if (!item) {
+        consume();
+        return this.message("Переданный результат больше недоступен");
+      }
+      this.inbox.update({ ...this.inbox.snapshot, completed: [item] });
+      this.resultDetail = ticket;
+      this.question = null;
+      this.inboxTab = "completed";
+    }
+    this.inboxSession = null;
+    this.preview = null;
+    this.renameSession = null;
+    this.tab = "inbox";
+    consume();
+  }
+  private renderVerificationBadge() {
+    const count = this.data.unconfirmed().length;
+    this.verificationButton.hidden =
+      !count || (this.tab === "inbox" && this.inboxTab === "verification");
+    this.verificationButton.textContent = `Нужна проверка · ${count}`;
+  }
+  private async verifySend(key: string, operationId?: string) {
+    const pending = this.data.pendingSend(key);
+    if (!pending || (operationId && pending.id !== operationId)) {
+      this.message("Эта отправка уже проверена");
+      return;
+    }
+    const edited = pending.text !== this.data.draft(key);
+    const receipt = await this.data.checkSend(key, pending);
+    if (receipt?.status === "accepted" && pending.hadFiles && !edited)
+      this.attachmentDrafts.delete(this.data.scope + key);
+    this.message(
+      receipt?.status === "not_found"
+        ? "Hermes не получил операцию. Можно повторить исходное сообщение."
+        : receipt?.error
+          ? errorText(receipt.error)
+          : statusText(receipt?.status || "Нет данных"),
+    );
+  }
+  private async verifyOperation(entry: UnconfirmedOperation) {
+    if (entry.kind === "message")
+      return this.verifySend(entry.sessionKey, entry.operationId);
+    if (entry.kind === "answer") {
+      const result = await this.data.checkAnswer(entry, entry);
+      this.message(
+        result.status === "pending"
+          ? "Вопрос ещё открыт. Проверьте ответ перед повтором."
+          : result.error
+            ? errorText(result.error)
+            : statusText(result.status),
+      );
+      if (result.status === "accepted")
+        await this.refreshInbox().catch(() => {});
+      return;
+    }
+    await this.openOperation(entry);
+    if (this.data.pendingSchedule()?.operationId === entry.operationId)
+      await this.checkScheduleOperation();
+    else this.message("Эта операция уже проверена");
+  }
+  private async openOperation(entry: UnconfirmedOperation) {
+    if (entry.kind === "answer")
+      return this.openInboxTarget({
+        kind: "question",
+        id: entry.id,
+        sessionKey: entry.sessionKey,
+      });
+    if (entry.kind === "message") {
+      await this.data.openChat(entry.sessionKey);
+      this.tab = "chats";
+      return;
+    }
+    await this.data.loadJobs(entry.profile);
+    this.closeScheduleEditor();
+    this.historyJob = "";
+    this.tab = "schedule";
+  }
+  private renderVerification() {
+    this.panel.innerHTML =
+      '<button id="verification-back">‹ Входящие</button><h1>Нужна проверка</h1><div id="verification-list" class="cards"></div>';
+    this.bind("#verification-back", () => {
+      this.inboxTab = "pending";
+    });
+    const list = this.panel.querySelector("#verification-list")!;
+    for (const entry of this.data.unconfirmed()) {
+      const card = document.createElement("article");
+      card.className = "card";
+      const title = document.createElement("h2");
+      title.textContent =
+        entry.kind === "message"
+          ? "Сообщение"
+          : entry.kind === "answer"
+            ? "Ответ агенту"
+            : "Расписание";
+      const target = document.createElement("p");
+      target.textContent =
+        entry.kind === "schedule"
+          ? this.data.agents.find((agent) => agent.id === entry.profile)
+              ?.name || entry.profile
+          : this.inbox.snapshot.pending.find(
+              (item) => item.sessionKey === entry.sessionKey,
+            )?.sessionTitle ||
+            this.data.sessions.find(
+              (session) => session.key === entry.sessionKey,
+            )?.label ||
+            entry.sessionKey;
+      card.append(
+        title,
+        target,
+        this.button("Проверить", () => this.verifyOperation(entry)),
+        this.button(
+          entry.kind === "message"
+            ? "Открыть чат"
+            : entry.kind === "answer"
+              ? "Открыть вопрос"
+              : "Открыть расписание",
+          () => this.openOperation(entry),
+        ),
+      );
+      list.append(card);
+    }
+    if (!list.childElementCount) list.textContent = "Все операции проверены.";
+  }
   private refreshInboxClock() {
     this.renderTabs();
+    this.renderVerificationBadge();
     const pendingTab = this.panel.querySelector("#pending");
     if (pendingTab)
       pendingTab.textContent = `Нужен ответ · ${this.pendingQuestions().length}`;
@@ -391,6 +620,8 @@ export class PhoneApp {
     this.status.textContent = `${this.relay.online ? "● Hermes" : "○ Нет связи"} · ${this.glasses.displayReady ? "G2 подключены" : "Без очков"}`;
     this.toast.textContent = this.notice;
     this.renderTabs();
+    this.renderHandoff();
+    this.renderVerificationBadge();
     const chatKey =
       this.tab === "chats" &&
       !this.confirmation &&
@@ -691,25 +922,13 @@ export class PhoneApp {
       );
     if (this.data.pendingSend())
       actions.append(
-        this.button("Проверить отправку", async () => {
-          const pending = this.data.pendingSend();
-          const edited = pending?.text !== this.data.draft();
-          const receipt = await this.data.checkSend();
-          if (receipt?.status === "accepted" && pending?.hadFiles && !edited)
-            this.files = [];
-          this.message(
-            receipt?.status === "not_found"
-              ? "Hermes не получил операцию. Можно повторить исходное сообщение."
-              : receipt?.error
-                ? errorText(receipt.error)
-                : `Отправка: ${receipt ? statusText(receipt.status) : "нет данных"}`,
-          );
-        }),
+        this.button("Проверить отправку", () => this.verifySend(key)),
       );
     actions.append(
       this.button("Вопросы сессии", () => {
         this.tab = "inbox";
         this.inboxTab = "pending";
+        this.resultDetail = null;
         this.inboxSession = { key, title };
         this.render();
       }),
@@ -933,9 +1152,30 @@ export class PhoneApp {
     );
   }
   private renderInbox() {
+    if (this.inboxTab === "verification") {
+      this.renderVerification();
+      return;
+    }
     if (this.question) {
       this.renderQuestion();
       return;
+    }
+    if (this.resultDetail) {
+      const item = this.inbox.snapshot.completed.find(
+        (row) =>
+          row.id === this.resultDetail?.id &&
+          row.sessionKey === this.resultDetail.sessionKey,
+      );
+      if (item) {
+        this.panel.innerHTML =
+          '<button id="result-back">‹ Результаты</button><h1>Результат</h1>';
+        this.bind("#result-back", () => {
+          this.resultDetail = null;
+        });
+        this.panel.append(this.completionCard(item, !this.relay.online));
+        return;
+      }
+      this.resultDetail = null;
     }
     const pending = this.pendingQuestions();
     const stale = !this.relay.online || !this.inbox.snapshot.available;
@@ -987,46 +1227,8 @@ export class PhoneApp {
         list.append(card);
       }
     else
-      for (const item of this.inbox.snapshot.completed) {
-        const card = document.createElement("article");
-        card.className = "card";
-        card.innerHTML = `<h2>${item.read ? "" : "● "}${esc(item.sessionTitle)}</h2><p class="muted">${esc(item.agentName)} · ${esc(new Date(item.createdAtMs).toLocaleString("ru-RU"))}${stale ? " · Ждёт сверки" : ""}</p><div class="markdown">${markdown(item.summary)}</div>`;
-        card.append(
-          this.button(
-            item.sessionKey.includes(":cron-run:")
-              ? "Открыть историю задачи"
-              : "Открыть чат",
-            async () => {
-              if (item.sessionKey.includes(":cron-run:") && item.jobId) {
-                await this.data.loadJobs(item.profileId || "default");
-                const result = await this.data.schedule("jobs.history", {
-                  jobId: item.jobId,
-                });
-                this.data.history = result.history || [];
-                this.data.historyCursor = result.nextBefore || null;
-                this.closeScheduleEditor();
-                this.historyJob = item.jobId;
-                this.tab = "schedule";
-                return;
-              }
-              await this.data.openChat(item.sessionKey);
-              this.tab = "chats";
-            },
-          ),
-          this.button("На очки", () =>
-            this.hud.show({
-              kind: "result",
-              key: item.sessionKey,
-              id: item.id,
-            }),
-          ),
-          this.button("Отметить прочитанным", async () => {
-            await this.data.request("inbox.read", { id: item.id });
-            await this.refreshInbox();
-          }),
-        );
-        list.append(card);
-      }
+      for (const item of this.inbox.snapshot.completed)
+        list.append(this.completionCard(item, stale));
     if (!list.childElementCount)
       list.innerHTML = `<p class="empty">${stale ? "Данные появятся после подключения и сверки." : "Здесь пока ничего нет."}</p>`;
     if (
@@ -1046,6 +1248,48 @@ export class PhoneApp {
         }),
       );
   }
+  private completionCard(item: Completion, stale: boolean) {
+    const card = document.createElement("article");
+    card.className = "card";
+    card.innerHTML = `<h2>${item.read ? "" : "● "}${esc(item.sessionTitle)}</h2><p class="muted">${esc(item.agentName)} · ${esc(new Date(item.createdAtMs).toLocaleString("ru-RU"))}${stale ? " · Ждёт сверки" : ""}</p><div class="markdown">${markdown(item.summary)}</div>`;
+    card.append(
+      this.button(
+        item.sessionKey.includes(":cron-run:")
+          ? "Открыть историю задачи"
+          : "Открыть чат",
+        async () => {
+          if (item.sessionKey.includes(":cron-run:") && item.jobId) {
+            await this.data.loadJobs(item.profileId || "default");
+            const result = await this.data.schedule("jobs.history", {
+              jobId: item.jobId,
+            });
+            this.data.history = result.history || [];
+            this.data.historyCursor = result.nextBefore || null;
+            this.closeScheduleEditor();
+            this.historyJob = item.jobId;
+            this.resultDetail = null;
+            this.tab = "schedule";
+            return;
+          }
+          await this.data.openChat(item.sessionKey);
+          this.resultDetail = null;
+          this.tab = "chats";
+        },
+      ),
+      this.button("На очки", () =>
+        this.hud.show({
+          kind: "result",
+          key: item.sessionKey,
+          id: item.id,
+        }),
+      ),
+      this.button("Отметить прочитанным", async () => {
+        await this.data.request("inbox.read", { id: item.id });
+        await this.refreshInbox();
+      }),
+    );
+    return card;
+  }
   private renderQuestion() {
     const item = this.inbox.snapshot.pending.find(
       (x) => x.id === this.question?.id,
@@ -1057,7 +1301,7 @@ export class PhoneApp {
       return;
     }
     this.question = item;
-    this.panel.innerHTML = `<button id="question-back">‹ Входящие</button><h1>${esc(item.sessionTitle)}</h1><p class="muted">${esc(item.agentName)} · ${item.kind === "permission" ? "Разрешение" : "Вопрос"}</p><div class="markdown">${markdown(item.question)}</div><div id="answer-options" class="cards"></div><form id="answer-form"><textarea id="answer-text" aria-label="Ответ агенту" rows="4">${esc(this.answerDraft)}</textarea><div class="row"><button type="button" id="answer-voice">${this.recording ? "Завершить диктовку" : "Надиктовать"}</button><button>Проверить ответ</button></div></form><div class="row" id="question-links"></div>`;
+    this.panel.innerHTML = `<button id="question-back">‹ Входящие</button><h1>${esc(item.sessionTitle)}</h1><p class="muted">${esc(item.agentName)} · ${item.kind === "permission" ? "Разрешение" : "Вопрос"}</p><div class="markdown">${item.permissionCommand ? `<p>Запрошенное действие</p><pre><code>${esc(item.permissionCommand)}</code></pre>${item.permissionDescription && item.permissionDescription !== item.permissionCommand ? `<p>${esc(item.permissionDescription)}</p>` : ""}` : markdown(item.question)}</div><div id="answer-options" class="cards"></div><form id="answer-form"><textarea id="answer-text" aria-label="Ответ агенту" rows="4">${esc(this.answerDraft)}</textarea><div class="row"><button type="button" id="answer-voice">${this.recording ? "Завершить диктовку" : "Надиктовать"}</button><button>Проверить ответ</button></div></form><div class="row" id="question-links"></div>`;
     this.bind("#question-back", () => {
       this.question = null;
     });
@@ -1073,8 +1317,9 @@ export class PhoneApp {
     }
     const prepare = (answer: Answer, label: string) => {
       if (!canSend(item)) return this.message("Срок ответа истёк");
+      const action = "decision" in answer ? item.permissionCommand : null;
       this.confirm(
-        `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}`,
+        `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}${action ? `\n\n${action}` : ""}`,
         async () => {
           const result = await this.data.answer(item, answer);
           if (result.status !== "accepted")
@@ -1404,7 +1649,7 @@ export class PhoneApp {
         ),
       );
     const list = this.panel.querySelector("#job-list")!;
-    for (const job of this.data.jobs.filter(
+    const filtered = this.data.jobs.filter(
       (j) =>
         this.jobFilter === "all" ||
         (this.jobFilter === "paused" && j.paused) ||
@@ -1415,85 +1660,105 @@ export class PhoneApp {
         (this.jobFilter === "active" &&
           !j.paused &&
           !["completed", "error"].includes(j.state)),
-    )) {
-      const card = document.createElement("article");
-      card.className = "card";
-      card.innerHTML = `<h2>${esc(job.name)}</h2><p>${esc(job.schedule)}</p><p>Следующий запуск: ${esc(date(job.nextRunAt))}</p><p class="muted">${esc(job.paused ? "На паузе" : statusText(job.state))} · последний: ${esc(job.lastExecution ? (job.lastExecution.stopRequested ? "Остановка запрошена" : job.lastExecution.needsAnswer ? "Нужен ответ" : statusText(job.lastExecution.status)) : "ещё не запускалась")}</p><div class="row"></div>`;
-      const actions = card.querySelector(".row")!;
-      actions.append(
-        this.button("Изменить", async () => {
-          const result = await this.data.schedule("automations.read", {
-            jobId: job.id,
-          });
-          this.openScheduleEditor(result.job, { ...result.job.fields });
-        }),
-        this.button(job.paused ? "Возобновить" : "Пауза", () =>
-          this.confirm(
-            `${job.paused ? "Возобновить" : "Приостановить"} расписание «${job.name}»? Текущее выполнение не останавливается.`,
-            async () => {
-              await this.data.mutateSchedule(
-                job.paused ? "jobs.resume" : "jobs.pause",
-                { jobId: job.id },
-              );
-              await this.data.loadJobs();
-            },
-          ),
-        ),
-        this.button("Запустить сейчас", () =>
-          this.confirm(
-            `Запустить «${job.name}» сейчас?\n${this.data.options?.runNowPolicy || "Штатное поведение Hermes"}`,
-            async () => {
-              await this.data.mutateSchedule("jobs.run", { jobId: job.id });
-              await this.data.loadJobs();
-            },
-          ),
-        ),
-        this.button("История", async () => {
-          const result = await this.data.schedule("jobs.history", {
-            jobId: job.id,
-          });
-          this.data.history = result.history || [];
-          this.data.historyCursor = result.nextBefore || null;
-          this.historyJob = job.id;
-        }),
-        this.button("Удалить", async () => {
-          const result = await this.data.schedule("automations.read", {
-            jobId: job.id,
-          });
-          this.confirm(
-            `Удалить расписание «${job.name}»? История выполнений останется в Hermes.`,
-            async () => {
-              await this.data.mutateSchedule("automations.delete", {
-                jobId: job.id,
-                revision: result.job.revision,
-              });
-              await this.data.loadJobs();
-            },
-          );
-        }),
-      );
-      if (
-        this.data.options?.stopSupported &&
-        ["running", "claimed"].includes(job.lastExecution?.status || "")
-      )
+    );
+    const groups = this.data.options
+      ? upcomingJobs(
+          filtered,
+          this.data.options.serverNowMs,
+          this.data.options.timezone,
+        )
+      : [{ title: "", jobs: filtered }];
+    for (const group of groups) {
+      const section = document.createElement("section");
+      section.className = "cards schedule-group";
+      if (group.title) {
+        const label = document.createElement("h2");
+        label.textContent = group.title;
+        section.append(label);
+      }
+      for (const job of group.jobs) {
+        const card = document.createElement("article");
+        card.className = "card";
+        card.innerHTML = `<h2>${esc(job.name)}</h2><p>${esc(job.schedule)}</p><p>Следующий запуск: ${esc(scheduledTime(job.paused ? undefined : job.nextRunAt, this.data.options?.timezone))}</p><p class="muted">${esc(job.paused ? "На паузе" : statusText(job.state))} · последний: ${esc(job.lastExecution ? (job.lastExecution.stopRequested ? "Остановка запрошена" : job.lastExecution.needsAnswer ? "Нужен ответ" : statusText(job.lastExecution.status)) : "ещё не запускалась")}</p><div class="row"></div>`;
+        const actions = card.querySelector(".row")!;
         actions.append(
-          this.button("Остановить выполнение", () =>
+          this.button("Изменить", async () => {
+            const result = await this.data.schedule("automations.read", {
+              jobId: job.id,
+            });
+            this.openScheduleEditor(result.job, { ...result.job.fields });
+          }),
+          this.button(job.paused ? "Возобновить" : "Пауза", () =>
             this.confirm(
-              "Остановить этот запуск? Расписание продолжит действовать.",
+              `${job.paused ? "Возобновить" : "Приостановить"} расписание «${job.name}»? Текущее выполнение не останавливается.`,
               async () => {
-                await this.data.mutateSchedule("jobs.stop", {
-                  jobId: job.id,
-                  executionId: job.lastExecution?.id,
-                });
-                this.message("Остановка запрошена");
+                await this.data.mutateSchedule(
+                  job.paused ? "jobs.resume" : "jobs.pause",
+                  { jobId: job.id },
+                );
+                await this.data.loadJobs();
               },
             ),
           ),
+          this.button("Запустить сейчас", () =>
+            this.confirm(
+              `Запустить «${job.name}» сейчас?\n${this.data.options?.runNowPolicy || "Штатное поведение Hermes"}`,
+              async () => {
+                await this.data.mutateSchedule("jobs.run", { jobId: job.id });
+                await this.data.loadJobs();
+              },
+            ),
+          ),
+          this.button("История", async () => {
+            const result = await this.data.schedule("jobs.history", {
+              jobId: job.id,
+            });
+            this.data.history = result.history || [];
+            this.data.historyCursor = result.nextBefore || null;
+            this.historyJob = job.id;
+          }),
+          this.button("Удалить", async () => {
+            const result = await this.data.schedule("automations.read", {
+              jobId: job.id,
+            });
+            this.confirm(
+              `Удалить расписание «${job.name}»? История выполнений останется в Hermes.`,
+              async () => {
+                await this.data.mutateSchedule("automations.delete", {
+                  jobId: job.id,
+                  revision: result.job.revision,
+                });
+                await this.data.loadJobs();
+              },
+            );
+          }),
         );
-      list.append(card);
+        if (
+          this.data.options?.stopSupported &&
+          ["running", "claimed"].includes(job.lastExecution?.status || "")
+        )
+          actions.append(
+            this.button("Остановить выполнение", () =>
+              this.confirm(
+                "Остановить этот запуск? Расписание продолжит действовать.",
+                async () => {
+                  await this.data.mutateSchedule("jobs.stop", {
+                    jobId: job.id,
+                    executionId: job.lastExecution?.id,
+                  });
+                  this.message("Остановка запрошена");
+                },
+              ),
+            ),
+          );
+        section.append(card);
+      }
+      list.append(section);
     }
     if (!this.data.jobs.length)
       list.innerHTML = `<p class="empty">${esc(this.data.options?.supported === false ? this.data.options.reason : "Создайте первую задачу. Выполнение продолжится на VPS после закрытия приложения.")}</p>`;
+    else if (!filtered.length)
+      list.innerHTML = '<p class="empty">Задач с этим состоянием нет.</p>';
   }
   private renderScheduleEditor() {
     const fields = this.fields!;

@@ -200,6 +200,28 @@ details p {
 .inbox-unavailable {
   color: #f5d6a1;
 }
+#phone-handoff {
+  padding: 6px 0;
+  color: #b6eacb;
+  font-size: 13px;
+}
+#phone-handoff button {
+  padding: 6px 9px;
+}
+#verification-open {
+  margin-bottom: 6px;
+  padding: 6px 9px;
+  font-size: 13px;
+  color: #f5d6a1;
+}
+.schedule-group {
+  margin: 0;
+}
+.schedule-group > h2 {
+  margin: 8px 0 0;
+  color: #b6eacb;
+  font-size: 16px;
+}
 .inbox-card-meta {
   display: block;
   margin-top: 8px;

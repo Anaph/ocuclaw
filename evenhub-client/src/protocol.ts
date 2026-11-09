@@ -1,4 +1,4 @@
-import type { Snapshot } from "./model";
+import type { Completion, Question, Snapshot } from "./model";
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -28,35 +28,39 @@ export function isSnapshot(value: unknown): value is Snapshot {
     return false;
   if (!Array.isArray(value.pending) || !Array.isArray(value.completed))
     return false;
+  return value.pending.every(isQuestion) && value.completed.every(isCompletion);
+}
+export function isQuestion(item: unknown): item is Question {
   return (
-    value.pending.every(
-      (item) =>
-        identified(item) &&
-        (item.kind === "question" || item.kind === "permission") &&
-        typeof item.question === "string" &&
-        typeof item.agentName === "string" &&
-        typeof item.sessionTitle === "string" &&
-        typeof item.createdAtMs === "number" &&
-        Number.isFinite(item.createdAtMs) &&
-        (item.expiresAtMs === null ||
-          (typeof item.expiresAtMs === "number" &&
-            Number.isFinite(item.expiresAtMs))) &&
-        (item.choices === undefined || strings(item.choices)) &&
-        (item.kind !== "permission" || strings(item.allowedDecisions)) &&
-        (item.multiSelect === undefined ||
-          typeof item.multiSelect === "boolean") &&
-        (item.allowOther === undefined || typeof item.allowOther === "boolean"),
-    ) &&
-    value.completed.every(
-      (item) =>
-        identified(item) &&
-        typeof item.summary === "string" &&
-        typeof item.read === "boolean" &&
-        typeof item.agentName === "string" &&
-        typeof item.sessionTitle === "string" &&
-        typeof item.createdAtMs === "number" &&
-        Number.isFinite(item.createdAtMs),
-    )
+    identified(item) &&
+    (item.kind === "question" || item.kind === "permission") &&
+    typeof item.question === "string" &&
+    typeof item.agentName === "string" &&
+    typeof item.sessionTitle === "string" &&
+    typeof item.createdAtMs === "number" &&
+    Number.isFinite(item.createdAtMs) &&
+    (item.expiresAtMs === null ||
+      (typeof item.expiresAtMs === "number" &&
+        Number.isFinite(item.expiresAtMs))) &&
+    (item.choices === undefined || strings(item.choices)) &&
+    (item.kind !== "permission" || strings(item.allowedDecisions)) &&
+    (item.permissionCommand == null ||
+      typeof item.permissionCommand === "string") &&
+    (item.permissionDescription == null ||
+      typeof item.permissionDescription === "string") &&
+    (item.multiSelect === undefined || typeof item.multiSelect === "boolean") &&
+    (item.allowOther === undefined || typeof item.allowOther === "boolean")
+  );
+}
+export function isCompletion(item: unknown): item is Completion {
+  return (
+    identified(item) &&
+    typeof item.summary === "string" &&
+    typeof item.read === "boolean" &&
+    typeof item.agentName === "string" &&
+    typeof item.sessionTitle === "string" &&
+    typeof item.createdAtMs === "number" &&
+    Number.isFinite(item.createdAtMs)
   );
 }
 
