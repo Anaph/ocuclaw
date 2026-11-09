@@ -733,12 +733,28 @@ export class Workspace {
       profileId: profile,
     });
     if (epoch !== this.jobsEpoch) return;
-    const data = options.supported
-      ? await this.request("jobs.list", { profileId: profile })
-      : { jobs: [] };
-    if (epoch !== this.jobsEpoch) return;
+    const jobs: Job[] = [];
+    if (options.supported) {
+      let cursor = "";
+      do {
+        const page = await this.request<{
+          jobs: Job[];
+          nextAfterJobId?: string | null;
+        }>("jobs.list", {
+          profileId: profile,
+          paged: true,
+          ...(cursor ? { afterJobId: cursor } : {}),
+        });
+        if (epoch !== this.jobsEpoch) return;
+        jobs.push(...(page.jobs || []));
+        const next = page.nextAfterJobId;
+        if (next && (typeof next !== "string" || next <= cursor))
+          throw Error("Курсор списка задач не продвинулся");
+        cursor = next || "";
+      } while (cursor);
+    }
     this.options = options;
-    this.jobs = data.jobs || [];
+    this.jobs = jobs;
     this.onChange();
     if (this.catalogProfile !== profile) await this.catalog(profile);
   }
@@ -921,8 +937,15 @@ export function scheduleExpression(
   days: string[],
   interval: string,
   cron: string,
+  utcOffset = "",
 ) {
-  if (kind === "once") return `${date}T${time}:00`;
+  if (kind === "once") {
+    const offset = utcOffset.trim();
+    if (!date || !time) throw Error("Укажите дату и время");
+    if (offset && !/^(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(offset))
+      throw Error("Введите сдвиг UTC в формате +02:00 или -05:00");
+    return `${date}T${time}:00${offset}`;
+  }
   if (kind === "interval") return `every ${interval}`;
   if (kind === "cron") return cron.trim();
   const [hours, minutes] = time.split(":").map(Number);
@@ -949,6 +972,10 @@ export function errorText(code: string): string {
         execution_not_running: "Этот запуск уже завершился",
         invalid_fields: "Проверьте название, инструкцию и расписание",
         schedule_has_no_future_run: "Расписание не содержит будущих запусков",
+        ambiguous_local_time:
+          "Этот час повторяется при переводе часов. Укажите сдвиг UTC для нужного запуска.",
+        nonexistent_local_time:
+          "Этого местного времени нет из-за перевода часов. Выберите другое время.",
         hermes_workspace_api_unavailable:
           "На сервере недоступен публичный Workspace API Hermes",
         native_job_lock_unavailable:
@@ -964,6 +991,7 @@ export interface ScheduleForm {
   days: string[];
   interval: string;
   cron: string;
+  utcOffset?: string;
 }
 export function scheduleForm(expression: string): ScheduleForm {
   const form = {
@@ -973,9 +1001,11 @@ export function scheduleForm(expression: string): ScheduleForm {
     days: [] as string[],
     interval: "2h",
     cron: expression,
+    utcOffset: "",
   };
   const interval = /^every (\d+[mhd])$/.exec(expression);
-  const once = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d)(?::00)?$/.exec(expression);
+  const once =
+    /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d)(?::00)?(Z|[+-]\d\d:\d\d)?$/.exec(expression);
   const simple = /^(\d{1,2}) (\d{1,2}) \* \* ([0-6](?:,[0-6])*|\*)$/.exec(
     expression,
   );
@@ -986,6 +1016,7 @@ export function scheduleForm(expression: string): ScheduleForm {
     form.kind = "once";
     form.date = once[1];
     form.time = once[2];
+    form.utcOffset = once[3] || "";
   } else if (simple) {
     form.kind = simple[3] === "*" ? "daily" : "weekly";
     form.time = simple[2].padStart(2, "0") + ":" + simple[1].padStart(2, "0");
@@ -994,8 +1025,24 @@ export function scheduleForm(expression: string): ScheduleForm {
   return form;
 }
 export function serializeSchedule(form: ScheduleForm, original?: string) {
-  const encode = ({ kind, date, time, days, interval, cron }: ScheduleForm) =>
-    scheduleExpression(kind, date, time, [...days].sort(), interval, cron);
+  const encode = ({
+    kind,
+    date,
+    time,
+    days,
+    interval,
+    cron,
+    utcOffset,
+  }: ScheduleForm) =>
+    scheduleExpression(
+      kind,
+      date,
+      time,
+      [...days].sort(),
+      interval,
+      cron,
+      utcOffset,
+    );
   const expression = encode(form);
   return original && expression === encode(scheduleForm(original))
     ? original

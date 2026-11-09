@@ -259,13 +259,7 @@ export class Relay {
           }
         }
         if (!this.active(generation, socket)) return;
-        const snapshot = await this.send("inbox.subscribe", {});
-        if (!this.active(generation, socket)) return;
-        if (!isSnapshot(snapshot)) {
-          this.terminal = true;
-          throw Error("Некорректный снимок Входящих");
-        }
-        await this.applySnapshot(snapshot, generation, socket);
+        await this.fetchSnapshot("inbox.subscribe", generation, socket);
       } catch (error) {
         if (!this.active(generation, socket)) return;
         this.state(false);
@@ -284,10 +278,48 @@ export class Relay {
   }
   async refreshInbox() {
     const socket = this.socket;
-    const generation = this.generation;
-    if (!socket) throw Error("Workspace не подключён");
-    const snapshot = await this.request("inbox.snapshot");
+    if (!this.online || !socket) throw Error("Workspace не подключён");
+    await this.fetchSnapshot("inbox.snapshot", this.generation, socket);
+  }
+  private async fetchSnapshot(
+    method: "inbox.snapshot" | "inbox.subscribe",
+    generation: number,
+    socket: WebSocket,
+  ) {
+    const epoch = this.snapshotEpoch;
+    const prior = this.snapshot;
+    const snapshot = await this.send(method, {});
+    if (
+      !this.active(generation, socket) ||
+      epoch !== this.snapshotEpoch ||
+      prior !== this.snapshot
+    )
+      return;
+    if (method === "inbox.subscribe" && !isSnapshot(snapshot)) {
+      this.terminal = true;
+      throw Error("Некорректный снимок Входящих");
+    }
     await this.applySnapshot(snapshot, generation, socket);
+  }
+  private updateSnapshotScope(namespaces: Snapshot["authorizedNamespaces"]) {
+    const previous = this.snapshot;
+    if (
+      !previous ||
+      !Array.isArray(namespaces) ||
+      JSON.stringify(previous.authorizedNamespaces) === JSON.stringify(namespaces)
+    )
+      return;
+    const admitted = (key: string) => namespaces.includes(key.split(":")[1]);
+    this.snapshot = {
+      ...previous,
+      authorizedNamespaces: namespaces,
+      available: false,
+      pending: previous.pending.filter((item) => admitted(item.sessionKey)),
+      completed: previous.completed.filter((item) => admitted(item.sessionKey)),
+      completedTotal: undefined,
+      unreadCompleted: undefined,
+    };
+    this.emitSnapshot(this.snapshot);
   }
   private async applySnapshot(
     raw: unknown,
@@ -299,26 +331,7 @@ export class Relay {
     const epoch = ++this.snapshotEpoch;
     const current = () =>
       epoch === this.snapshotEpoch && this.active(generation, socket);
-    const previous = this.snapshot;
-    if (
-      previous &&
-      Array.isArray(raw.authorizedNamespaces) &&
-      JSON.stringify(previous.authorizedNamespaces) !==
-        JSON.stringify(raw.authorizedNamespaces)
-    ) {
-      const admitted = (key: string) =>
-        raw.authorizedNamespaces!.includes(key.split(":")[1]);
-      this.snapshot = {
-        ...previous,
-        authorizedNamespaces: raw.authorizedNamespaces,
-        available: false,
-        pending: previous.pending.filter((item) => admitted(item.sessionKey)),
-        completed: previous.completed.filter((item) =>
-          admitted(item.sessionKey),
-        ),
-      };
-      this.emitSnapshot(this.snapshot);
-    }
+    this.updateSnapshotScope(raw.authorizedNamespaces);
     const pending = new Map(raw.pending.map((item) => [item.id, item]));
     let cursor = raw.pendingNextBefore;
     let namespaces = raw.authorizedNamespaces;
@@ -332,6 +345,7 @@ export class Relay {
         const allowed: string[] = page.authorizedNamespaces;
         namespaces =
           namespaces?.filter((ns) => allowed.includes(ns)) ?? allowed;
+        this.updateSnapshotScope(namespaces);
       }
       available = page.available === true;
       for (const item of page.pending) pending.set(item.id, item);
@@ -343,6 +357,8 @@ export class Relay {
     if (!current()) return;
     const admitted = (key: string) =>
       namespaces?.includes(key.split(":")[1]) ?? true;
+    const scopeChanged =
+      JSON.stringify(namespaces) !== JSON.stringify(raw.authorizedNamespaces);
     this.snapshot = {
       ...raw,
       available,
@@ -352,6 +368,8 @@ export class Relay {
         admitted(item.sessionKey),
       ),
       completed: raw.completed.filter((item) => admitted(item.sessionKey)),
+      completedTotal: scopeChanged ? undefined : raw.completedTotal,
+      unreadCompleted: scopeChanged ? undefined : raw.unreadCompleted,
     };
     this.state(true);
     this.emitSnapshot(this.snapshot);

@@ -242,16 +242,16 @@ def _registration_failed(job_id):
         )
 
 
-def _job(row):
+def _job(row, *, brief=False):
     if row is None:
         raise ValueError("job_not_found")
     fields = _editable(row)
-    return {
+    name = row.get("name", row["id"])
+    schedule = (row.get("schedule") or {}).get("display") or fields["schedule"]
+    result = {
         "id": row["id"],
-        "name": row.get("name", row["id"]),
-        "fields": fields,
-        "revision": digest({k: v for k, v in row.items() if k != "latest_execution"}),
-        "schedule": (row.get("schedule") or {}).get("display") or fields["schedule"],
+        "name": name[:160] if brief else name,
+        "schedule": schedule[:500] if brief else schedule,
         "state": row.get("state", "scheduled"),
         "paused": row.get("state") == "paused"
         or (
@@ -260,11 +260,17 @@ def _job(row):
         ),
         "lastStatus": row.get("last_status"),
         "nextRunAt": row.get("next_run_at"),
-        "lastExecution": _execution(row.get("latest_execution")),
+        "lastExecution": _execution(row.get("latest_execution"), brief=brief),
     }
+    if not brief:
+        result.update(
+            fields=fields,
+            revision=digest({k: v for k, v in row.items() if k != "latest_execution"}),
+        )
+    return result
 
 
-def _execution(row, *, capture_output=False):
+def _execution(row, *, capture_output=False, brief=False):
     if not row:
         return None
     from cron.delivery_queue import get_status
@@ -280,8 +286,9 @@ def _execution(row, *, capture_output=False):
         "claimedAt": row.get("claimed_at"),
         "startedAt": row.get("started_at") or row.get("claimed_at"),
         "finishedAt": row.get("finished_at"),
-        "reason": row.get("error") or "",
     }
+    if not brief:
+        result["reason"] = row.get("error") or ""
     with journal() as db:
         questions = db.execute(
             "SELECT * FROM questions WHERE execution=? AND response IS NULL",
@@ -299,7 +306,7 @@ def _execution(row, *, capture_output=False):
             if owner and owner["execution"] == row["id"]:
                 result["sessionId"] = session_id
         result["stopRequested"] = bool(binding["stop"])
-        if binding["output"]:
+        if binding["output"] and not brief:
             from hermes_constants import get_hermes_home
 
             path = Path(binding["output"])
@@ -584,18 +591,33 @@ def handle(operation, params):
     if operation == "automations.read":
         return {"job": _job(jobs.get_job(params.get("jobId")))}
     if operation == "jobs.list":
+        paged = params.get("paged") is True
+        after = params.get("afterJobId", "")
+        if paged and (not isinstance(after, str) or len(after) > 128):
+            raise ValueError("invalid_job_cursor")
+        page_size = 40
+        rows = (
+            jobs.workspace_snapshot(after=after, limit=page_size + 1)
+            if paged
+            else jobs.workspace_snapshot()
+        )
         with journal() as db:
             failed = {
                 row[0] for row in db.execute("SELECT job FROM registration_failures")
             }
-        return {
+        result = {
             "jobs": [
-                dict(_job(row), registration="failed")
+                dict(_job(row, brief=paged), registration="failed")
                 if row["id"] in failed
-                else _job(row)
-                for row in jobs.workspace_snapshot()
+                else _job(row, brief=paged)
+                for row in (rows[:page_size] if paged else rows)
             ]
         }
+        if paged:
+            result["nextAfterJobId"] = (
+                rows[page_size - 1]["id"] if len(rows) > page_size else None
+            )
+        return result
     if operation == "jobs.results":
         return finished_results(params)
     if operation == "jobs.history":

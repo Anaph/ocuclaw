@@ -3023,8 +3023,10 @@ client needs a new preview. Update/delete also require the current job `revision
 requires `operationId`, stores a receipt before native admission, rejects reuse with
 a different fingerprint and never retries an uncertain receipt. Job stop additionally
 requires the exact `executionId`. Job history uses a chronological cursor with
-`claimedAt` and `id`, plus a UTF-8 budget. Registration failures are exposed both
-in the save receipt and in the job list.
+`claimedAt` and `id`, plus a UTF-8 budget. `jobs.list {paged:true}` returns
+up to 40 lightweight cards in ID order. Pass `nextAfterJobId` as `afterJobId`
+until it is null. Job instructions and revisions are available via `automations.read`.
+Registration failures are exposed both in the save receipt and in the job list.
 
 Cron questions are live cross-process rendezvous in Hermes, validated against the
 producer's PID birth and original deadline. Answers remain request-addressed through

@@ -194,6 +194,28 @@ test("editing metadata preserves exact schedules including explicit offsets and 
   const form = scheduleForm("0 9 * * *");
   form.time = "10:30";
   assert.equal(serializeSchedule(form, "0 9 * * *"), "30 10 * * *");
+  const once = scheduleForm("2027-10-31T02:30:00+01:00");
+  assert.equal(once.kind, "once");
+  once.time = "02:40";
+  assert.equal(serializeSchedule(once), "2027-10-31T02:40:00+01:00");
+});
+
+test("the schedule list follows each page cursor within the chosen profile", async () => {
+  const pages: any[] = [];
+  const { workspace: w } = harness(async (method, p) => {
+    if (method === "automations.options") return { supported: true };
+    if (method !== "jobs.list") return {};
+    pages.push(p);
+    return p.afterJobId
+      ? { jobs: [{ id: "b" }], nextAfterJobId: null }
+      : { jobs: [{ id: "a" }], nextAfterJobId: "a" };
+  });
+  await w.loadJobs("research");
+  assert.deepEqual(pages, [
+    { profileId: "research", paged: true },
+    { profileId: "research", paged: true, afterJobId: "a" },
+  ]);
+  assert.deepEqual(w.jobs.map((job) => job.id), ["a", "b"]);
 });
 test("a schedule retry cannot move to another profile during receipt lookup", async () => {
   const receipt = deferred();

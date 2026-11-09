@@ -57,6 +57,70 @@ class HermesWorkspaceTest(unittest.TestCase):
         self.assertEqual(result["status"], "saved", result)
         return result["job"], params
 
+    def test_due_scan_distinguishes_the_two_occurrences_of_a_repeated_hour(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        Path(self.directory.name, "config.yaml").write_text("timezone: Europe/Berlin\n")
+        zone = ZoneInfo("Europe/Berlin")
+        with patch.object(
+            self.jobs,
+            "_hermes_now",
+            return_value=datetime(2026, 10, 25, 1, 55, tzinfo=zone),
+        ):
+            once = self.jobs.create_job(
+                prompt="Once", schedule="2026-10-25T02:10:00+01:00"
+            )
+            daily = self.jobs.create_job(prompt="Daily", schedule="45 2 * * *")
+        with patch.object(
+            self.jobs,
+            "_hermes_now",
+            return_value=datetime(2026, 10, 25, 2, 20, tzinfo=zone),
+        ):
+            self.assertEqual(self.jobs.get_due_jobs(), [])
+        with patch.object(
+            self.jobs,
+            "_hermes_now",
+            return_value=datetime(2026, 10, 25, 2, 10, tzinfo=zone, fold=1),
+        ):
+            due = {row["id"]: row for row in self.jobs.get_due_jobs()}
+        self.assertEqual(set(due), {once["id"], daily["id"]})
+        self.assertEqual(due[daily["id"]]["last_dispatch"]["lateness_seconds"], 25 * 60)
+
+    def test_interval_and_relative_once_use_elapsed_minutes_across_clock_changes(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import hermes_time
+
+        Path(self.directory.name, "config.yaml").write_text("timezone: Europe/Berlin\n")
+        zone = ZoneInfo("Europe/Berlin")
+        for clock, expected in (
+            (datetime(2026, 3, 29, 1, 45, tzinfo=zone), "2026-03-29T03:15:00+02:00"),
+            (datetime(2026, 10, 25, 2, 45, tzinfo=zone), "2026-10-25T02:15:00+01:00"),
+        ):
+            with (
+                patch.object(hermes_time, "now", return_value=clock),
+                patch.object(self.jobs, "_hermes_now", return_value=clock),
+            ):
+                for expression in ("every 30m", "in 30m"):
+                    with self.subTest(clock=clock, expression=expression):
+                        fields = {
+                            "name": "Timer", "prompt": "Test", "schedule": expression
+                        }
+                        preview = self.api.handle(
+                            "automations.preview", {"fields": fields}
+                        )["preview"]
+                        self.assertEqual(preview["nextRuns"][0], expected)
+                        result = self.api.handle(
+                            "automations.create",
+                            {
+                                "fields": fields,
+                                "reviewHash": preview["reviewHash"],
+                                "operationId": f"timer-{clock.month}-{expression[:2]}",
+                            },
+                        )
+                        self.assertEqual(result["job"]["nextRunAt"], expected)
+
     def test_native_clock_changes_and_reviewed_first_launch(self):
         from datetime import datetime
         from zoneinfo import ZoneInfo
@@ -203,6 +267,31 @@ class HermesWorkspaceTest(unittest.TestCase):
         self.assertEqual(len(seen), 8)
         row, = self.jobs.workspace_snapshot()
         self.assertEqual(row["latest_execution"]["id"], seen[0])
+
+    def test_large_job_list_paginates_without_exceeding_the_control_link_frame(self):
+        from ocuclaw.control_link import encode_link_frame
+
+        prompt = "🧪" * 16000
+        ids = {
+            self.jobs.create_job(
+                name=f"Test {index}", prompt=prompt, schedule="every 2h"
+            )["id"]
+            for index in range(41)
+        }
+        legacy = self.api.handle("jobs.list", {})
+        self.assertTrue(encode_link_frame({"type": "result", "data": legacy})[1])
+        first = self.api.handle("jobs.list", {"paged": True})
+        self.assertFalse(encode_link_frame({"type": "result", "data": first})[1])
+        self.assertTrue(first["nextAfterJobId"])
+        second = self.api.handle(
+            "jobs.list", {"paged": True, "afterJobId": first["nextAfterJobId"]}
+        )
+        self.assertFalse(encode_link_frame({"type": "result", "data": second})[1])
+        self.assertIsNone(second["nextAfterJobId"])
+        listed = [row["id"] for row in first["jobs"] + second["jobs"]]
+        self.assertEqual(listed, sorted(ids))
+        detail = self.api.handle("automations.read", {"jobId": listed[0]})
+        self.assertEqual(detail["job"]["fields"]["prompt"], prompt)
 
     def test_repeated_local_hour_has_independent_native_output_and_session_ids(self):
         from cron import executions, scheduler

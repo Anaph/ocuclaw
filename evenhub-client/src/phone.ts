@@ -61,6 +61,7 @@ const readSchedule = (data: FormData): ScheduleForm => ({
   days: data.getAll("days").map(String),
   interval: String(data.get("interval")),
   cron: String(data.get("cron")),
+  utcOffset: String(data.get("utcOffset") ?? ""),
 });
 type ScheduleDraft = {
   fields: ScheduleFields;
@@ -279,7 +280,7 @@ export class PhoneApp {
     try {
       await action();
     } catch (error) {
-      this.message((error as Error).message);
+      this.message(errorText((error as Error).message));
     } finally {
       this.busy = false;
       this.panel.removeAttribute("aria-busy");
@@ -1922,7 +1923,7 @@ export class PhoneApp {
         : { model: undefined, provider: undefined };
     };
     this.editorState = state;
-    this.panel.innerHTML = `<div class="row"><button id="schedule-back">‹ Расписание</button><button id="discard-schedule">Удалить черновик</button></div><h1>${this.job ? "Изменить задачу" : "Новая задача"}</h1><p class="muted">Пояс Hermes: ${esc(this.data.options?.timezone || "загружается")}</p><form id="schedule-form"><label>Название<input id="job-name" name="name" required maxlength="160" value="${esc(fields.name)}"></label><label>Инструкция и выбранный контекст<textarea id="job-prompt" name="prompt" required rows="7" maxlength="16000">${esc(fields.prompt)}</textarea></label><label>Повтор<select id="schedule-kind" name="kind"><option value="cron">Расширенное / существующее</option><option value="once">Один раз</option><option value="daily">Ежедневно</option><option value="weekly">По дням недели</option><option value="interval">Через интервал</option></select></label><div id="schedule-inputs"><label data-schedule-for="once">Дата<input name="date" type="date" value="${esc(state.date)}"></label><label data-schedule-for="once daily weekly">Время Hermes<input name="time" type="time" value="${esc(state.time)}"></label><fieldset data-schedule-for="weekly"><legend>Дни недели</legend>${[
+    this.panel.innerHTML = `<div class="row"><button id="schedule-back">‹ Расписание</button><button id="discard-schedule">Удалить черновик</button></div><h1>${this.job ? "Изменить задачу" : "Новая задача"}</h1><p class="muted">Пояс Hermes: ${esc(this.data.options?.timezone || "загружается")}</p><form id="schedule-form"><label>Название<input id="job-name" name="name" required maxlength="160" value="${esc(fields.name)}"></label><label>Инструкция и выбранный контекст<textarea id="job-prompt" name="prompt" required rows="7" maxlength="16000">${esc(fields.prompt)}</textarea></label><label>Повтор<select id="schedule-kind" name="kind"><option value="cron">Расширенное / существующее</option><option value="once">Один раз</option><option value="daily">Ежедневно</option><option value="weekly">По дням недели</option><option value="interval">Через интервал</option></select></label><div id="schedule-inputs"><label data-schedule-for="once">Дата<input name="date" type="date" value="${esc(state.date)}"></label><label data-schedule-for="once daily weekly">Время Hermes<input name="time" type="time" value="${esc(state.time)}"></label><label data-schedule-for="once">Сдвиг UTC для повторяющегося часа<input name="utcOffset" value="${esc(state.utcOffset)}" maxlength="6" placeholder="Например, +01:00"></label><fieldset data-schedule-for="weekly"><legend>Дни недели</legend>${[
       [1, "Пн"],
       [2, "Вт"],
       [3, "Ср"],

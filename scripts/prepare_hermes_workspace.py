@@ -40,14 +40,33 @@ def prepare_jobs(source):
     end = source.index("def _ensure_aware(", start)
     parser = source[start:end].replace("_hermes_now()", "_workspace_schedule_now()")
     parser = parser.replace(
-        "dt = dt.replace(tzinfo=_workspace_schedule_now().tzinfo)",
-        """candidates = _workspace_wall_times(dt, _workspace_schedule_now().tzinfo)
-                if not candidates:
-                    raise ValueError("nonexistent_local_time")
-                if len(candidates) != 1:
-                    raise ValueError("ambiguous_local_time")
-                dt = candidates[0]""",
+        "_workspace_schedule_now() + timedelta(minutes=minutes)",
+        "_workspace_after_minutes(_workspace_schedule_now(), minutes)",
+        1,
     )
+    iso_start = parser.index("    # ISO timestamp")
+    iso_end = parser.index('    # "in 30m"', iso_start)
+    iso_parser = r"""    # Resolve a naive one-shot in the configured timezone; preserve explicit offsets.
+    if 'T' in schedule or re.match(r'^\\d{4}-\\d{2}-\\d{2}', schedule):
+        try:
+            dt = datetime.fromisoformat(schedule.replace('Z', '+00:00'))
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp '{schedule}': {e}") from e
+        if dt.tzinfo is None:
+            candidates = _workspace_wall_times(dt, _workspace_schedule_now().tzinfo)
+            if not candidates:
+                raise ValueError("nonexistent_local_time")
+            if len(candidates) != 1:
+                raise ValueError("ambiguous_local_time")
+            dt = candidates[0]
+        return {
+            "kind": "once",
+            "run_at": dt.isoformat(),
+            "display": f"once at {dt.strftime('%Y-%m-%d %H:%M')}",
+        }
+
+"""
+    parser = parser[:iso_start] + iso_parser + parser[iso_end:]
     source = source[:start] + parser + source[end:]
     source = source.replace(
         "prev = croniter(str(expr), next_run_dt + timedelta(seconds=1)).get_prev(datetime)\n        return abs((prev - next_run_dt).total_seconds()) < 1.0",
@@ -60,6 +79,11 @@ def prepare_jobs(source):
         "now = _hermes_now()", "now = _workspace_schedule_now()"
     )
     computation = computation.replace(
+        "(base_time + timedelta(minutes=minutes)).isoformat()",
+        "_workspace_after_minutes(base_time, minutes).isoformat()",
+        1,
+    )
+    computation = computation.replace(
         "return croniter(expr, base_time).get_next(datetime).isoformat()",
         """iterator = croniter(expr, base_time.replace(tzinfo=None))
         while True:
@@ -69,6 +93,35 @@ def prepare_jobs(source):
                 return candidates[0].isoformat()""",
     )
     source = source[:start] + computation + source[end:]
+    # Two datetimes in the same ZoneInfo compare by wall time, ignoring fold.
+    # The due scan and claim windows need real elapsed time instead.
+    clock_checks = [
+        (
+            "run_at_dt >= now - timedelta(seconds=ONESHOT_GRACE_SECONDS)",
+            "run_at_dt.timestamp() >= now.timestamp() - ONESHOT_GRACE_SECONDS",
+        ),
+        ("(now - last_run_dt).total_seconds()", "now.timestamp() - last_run_dt.timestamp()"),
+        ("(now - claimed_at).total_seconds()", "now.timestamp() - claimed_at.timestamp()"),
+        (
+            "d.next_run_dt <= now\n        and _timezone_offset_mismatch(d.raw_next_run_dt, now)",
+            "d.next_run_dt.timestamp() <= now.timestamp()\n"
+            "        and _timezone_offset_mismatch(d.raw_next_run_dt, d.next_run_dt)",
+        ),
+        ("d.next_run_dt > now", "d.next_run_dt.timestamp() > now.timestamp()"),
+        (
+            "recovered_next_dt < d.next_run_dt",
+            "recovered_next_dt.timestamp() < d.next_run_dt.timestamp()",
+        ),
+        (
+            "(d.scan.now - d.next_run_dt).total_seconds()",
+            "d.scan.now.timestamp() - d.next_run_dt.timestamp()",
+        ),
+        ("(now - d.next_run_dt).total_seconds()", "now.timestamp() - d.next_run_dt.timestamp()"),
+    ]
+    for before, after in clock_checks:
+        if before not in source:
+            raise ValueError("unsupported_due_job_clock_source")
+        source = source.replace(before, after)
     source = source.replace(
         "def save_job_output(job_id: str, output: str):",
         "def save_job_output(job_id: str, output: str, *, execution_id=None):",
@@ -118,6 +171,10 @@ def _workspace_schedule_now():
     return _workspace_schedule_anchor.get() or _hermes_now()
 
 
+def _workspace_after_minutes(base, minutes):
+    return datetime.fromtimestamp(base.timestamp() + minutes * 60, base.tzinfo)
+
+
 def _workspace_wall_times(wall, zone):
     """Return real instants for a local wall time, earliest first."""
     from datetime import timezone
@@ -151,7 +208,7 @@ def _workspace_repair_old_dst(d):
     return False
 
 
-def workspace_snapshot():
+def workspace_snapshot(*, after="", limit=None):
     """Read-only phone projection; unlike load_jobs it never repairs a store."""
     path = _current_cron_store().jobs_file
     if not path.exists():
@@ -163,9 +220,14 @@ def workspace_snapshot():
     rows = json.loads(data.decode("utf-8-sig"))["jobs"]
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError("job_store_requires_repair")
+    rows = [_normalize_job_record(row) for row in rows]
+    if limit is not None:
+        rows = sorted(
+            (row for row in rows if row["id"] > after), key=lambda row: row["id"]
+        )[:limit]
     from cron.executions import latest_workspace_executions
     latest = latest_workspace_executions([row["id"] for row in rows])
-    return [dict(_normalize_job_record(row), latest_execution=latest.get(row["id"])) for row in rows]
+    return [dict(row, latest_execution=latest.get(row["id"])) for row in rows]
 '''
     ast.parse(source)
     return source

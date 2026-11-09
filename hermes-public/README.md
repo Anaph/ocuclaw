@@ -24,8 +24,9 @@ cross-process lock as CLI/Desktop, with locking failure refusing the phone edit.
 
 The pinned native scheduler resolves cron expressions in the profile's wall-clock
 timezone. Nonexistent recurring times are skipped, and an ambiguous recurring
-time runs once at its first occurrence. A one-shot at an ambiguous time needs
-an explicit offset. A nonexistent one-shot local time is rejected. New execution
+time runs once at its first occurrence. Intervals and relative delays count
+elapsed minutes. A one-shot at an ambiguous time needs an explicit offset.
+A nonexistent one-shot local time is rejected. New execution
 files and session IDs include the execution identifier so repeated local times
 preserve separate results.
 

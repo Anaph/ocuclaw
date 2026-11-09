@@ -195,7 +195,7 @@ export function mountHud(
         busy = true;
         render();
         void p
-          .catch((e) => message(String(e.message)))
+          .catch((e) => message(errorText(String(e.message))))
           .finally(() => {
             busy = false;
             render();
@@ -203,7 +203,7 @@ export function mountHud(
           });
       }
     } catch (e) {
-      message(String((e as Error).message));
+      message(errorText(String((e as Error).message)));
     }
   }
   function go(next: Screen) {

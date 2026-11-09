@@ -1208,6 +1208,43 @@ test("new chat keeps profile/model affinity and file-picker cancellation is harm
   );
 });
 
+test("a repeated-hour one-shot accepts an explicit UTC offset in the phone form", async ({
+  page,
+}) => {
+  const { calls, replyNext } = await server(page);
+  await connect(page);
+  await page.getByRole("button", { name: "Расписание", exact: true }).click();
+  await page.getByRole("button", { name: "＋ Задача", exact: true }).click();
+  await page.getByLabel("Название", { exact: true }).fill("Разовая задача");
+  await page.getByLabel("Инструкция и выбранный контекст").fill("Собери отчёт");
+  await page.locator("#schedule-kind").selectOption("once");
+  await page.locator('[name="date"]').fill("2027-10-31");
+  await page.locator('[name="time"]').fill("02:30");
+  const check = page.getByRole("button", { name: "Проверить расписание" });
+  replyNext("automations.preview", { error: "ambiguous_local_time" });
+  await check.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Этот час повторяется при переводе часов",
+  );
+  const offset = page.getByLabel("Сдвиг UTC для повторяющегося часа");
+  await offset.fill("+01:00");
+  replyNext("automations.preview", {
+    preview: {
+      reviewHash: "a".repeat(64),
+      timezone: "Europe/Berlin",
+      nextRuns: ["2027-10-31T02:30:00+01:00"],
+    },
+  });
+  await check.click();
+  await expect(page.locator("#schedule-preview")).toContainText(
+    "2027-10-31 02:30:00+01:00",
+  );
+  await page.getByRole("button", { name: "Подтвердить и сохранить" }).click();
+  expect(
+    calls.find((call) => call.method === "automations.create")?.params.fields.schedule,
+  ).toBe("2027-10-31T02:30:00+01:00");
+});
+
 test("live inbox updates preserve schedule input and externally answered questions cannot be sent", async ({
   page,
 }) => {

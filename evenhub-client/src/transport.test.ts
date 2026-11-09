@@ -240,3 +240,87 @@ test("large Inbox pages are joined and revoked namespaces are filtered before ex
     relay.disconnect();
   }
 });
+
+test("a mid-pagination scope change removes revoked cached data immediately", async () => {
+  const { relay, sockets } = harness();
+  const observed: any[] = [];
+  relay.onSnapshot = (value) => observed.push(value);
+  relay.connect("ws://localhost/a", "key");
+  const socket = sockets[0];
+  const initial = snapshot("previously-visible");
+  initial.completed[0].sessionKey = "hermes:research:a";
+  try {
+    await ready(relay, socket);
+    socket.frame({
+      type: "ocuclaw.workspace.changed",
+      version: 1,
+      data: {
+        ...initial,
+        authorizedNamespaces: ["main", "research"],
+        completedTotal: 1,
+        unreadCompleted: 1,
+      },
+    });
+    assert.equal(observed.at(-1).completed.length, 1);
+    socket.frame({
+      type: "ocuclaw.workspace.changed",
+      version: 1,
+      data: {
+        ...initial,
+        authorizedNamespaces: ["main", "research"],
+        completedTotal: 1,
+        unreadCompleted: 1,
+        pendingNextBefore: [1, 1, "first"],
+      },
+    });
+    socket.reply("inbox.pending", {
+      available: true,
+      authorizedNamespaces: ["main"],
+      pending: [],
+      pendingNextBefore: [2, 1, "second"],
+    });
+    await tick();
+    assert.deepEqual(observed.at(-1).authorizedNamespaces, ["main"]);
+    assert.deepEqual(observed.at(-1).completed, []);
+    assert.equal(observed.at(-1).unreadCompleted, undefined);
+    socket.reply("inbox.pending", {
+      available: true,
+      authorizedNamespaces: ["main"],
+      pending: [],
+      pendingNextBefore: null,
+    });
+    await tick();
+    assert.equal(observed.at(-1).completedTotal, undefined);
+    assert.equal(observed.at(-1).unreadCompleted, undefined);
+  } finally {
+    relay.disconnect();
+  }
+});
+
+test("an older Inbox refresh cannot restore data after a pushed revocation", async () => {
+  const { relay, sockets } = harness();
+  const observed: any[] = [];
+  relay.onSnapshot = (value) => observed.push(value);
+  relay.connect("ws://localhost/a", "key");
+  const socket = sockets[0];
+  try {
+    await ready(relay, socket);
+    const refresh = relay.refreshInbox();
+    socket.frame({
+      type: "ocuclaw.workspace.changed",
+      version: 1,
+      data: { ...snapshot(), authorizedNamespaces: ["main"] },
+    });
+    const old = snapshot("revoked");
+    old.completed[0].sessionKey = "hermes:research:a";
+    socket.reply("inbox.snapshot", {
+      ...old,
+      authorizedNamespaces: ["main", "research"],
+    });
+    await refresh;
+    assert.deepEqual(observed.at(-1).authorizedNamespaces, ["main"]);
+    assert.deepEqual(observed.at(-1).completed, []);
+  } finally {
+    relay.disconnect();
+  }
+});
