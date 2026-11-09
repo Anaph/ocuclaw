@@ -755,7 +755,7 @@ function createHermesGatewayBridge(opts) {
   }
 
   const workspaceMethods = Object.fromEntries(
-    ["snapshot", "completed", "get", "answer", "operation", "read"].map(name => [
+    ["snapshot", "pending", "completed", "get", "answer", "operation", "read"].map(name => [
       `inbox.${name}`, params => link.request(`inbox.${name}`, params || {}, DB_READ_TIMEOUT)
     ])
   );
@@ -1633,6 +1633,7 @@ function createHermesGatewayBridge(opts) {
         ? null : toFiniteNumber(beforeValue);
       const linkParams = {
         identity: keyToIdentity(params && params.sessionKey),
+        ...(params?.workspaceBounded === true ? { workspaceBounded: true } : {}),
 
         ...(limit !== null && limit > 0 ? { limit: Math.floor(limit) } : {}),
         ...(afterId !== null && afterId >= 0 ? { afterId: Math.floor(afterId) } : {}),

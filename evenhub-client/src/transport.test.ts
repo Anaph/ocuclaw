@@ -191,3 +191,52 @@ test("malformed snapshots never enter the UI", async () => {
   assert(!relay.online);
   relay.disconnect();
 });
+
+test("large Inbox pages are joined and revoked namespaces are filtered before exposing data", async () => {
+  const { relay, sockets } = harness();
+  const observed: any[] = [];
+  relay.onSnapshot = (value) => observed.push(value);
+  relay.connect("ws://localhost/a", "key");
+  const socket = sockets[0];
+  try {
+    socket.open();
+    socket.frame({ type: "protocolHelloAck", protocolVersion: "v2" });
+    socket.reply("capabilities", { version: 1 });
+    await tick();
+    const item = (id: string, namespace: string) => ({
+      id,
+      sessionKey: `hermes:${namespace}:a`,
+      sessionTitle: "Session",
+      agentName: "Hermes",
+      kind: "question",
+      question: "Prompt",
+      createdAtMs: 1,
+      expiresAtMs: null,
+    });
+    const cursor = [Number.MAX_SAFE_INTEGER, 1, "first"];
+    socket.reply("inbox.subscribe", {
+      ...snapshot(),
+      authorizedNamespaces: ["main", "research"],
+      pending: [item("first", "research")],
+      pendingNextBefore: cursor,
+    });
+    await tick();
+    assert.equal(relay.online, false);
+    assert.deepEqual(socket.sent.at(-1).params.before, cursor);
+    socket.reply("inbox.pending", {
+      available: true,
+      authorizedNamespaces: ["main"],
+      pending: [item("second", "main"), item("third", "main")],
+      pendingNextBefore: null,
+    });
+    await tick();
+    assert(relay.online);
+    assert.deepEqual(
+      observed.at(-1).pending.map((row: { id: string }) => row.id),
+      ["second", "third"],
+    );
+    assert.deepEqual(observed.at(-1).authorizedNamespaces, ["main"]);
+  } finally {
+    relay.disconnect();
+  }
+});

@@ -132,3 +132,18 @@ test("stale activity observations must not claim a session is still working", ()
     "Нет связи",
   );
 });
+
+test("question expiration is evaluated against the Hermes clock sample", () => {
+  const model = new InboxModel();
+  const remote = Date.now() - 600_000;
+  const item = question("server-live", remote + 300_000);
+  model.update({
+    ...model.snapshot,
+    available: true,
+    observedAtMs: remote,
+    pending: [item],
+  });
+  assert.deepEqual(model.order, ["server-live"]);
+  assert(canSend(item, model.now()));
+  assert(!canSend(item));
+});

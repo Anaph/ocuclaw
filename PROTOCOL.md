@@ -2952,6 +2952,10 @@ the native resolver twice; after a lost acknowledgment query the original receip
 `inbox.py` persists results/receipts in `state/ocuclaw-inbox.sqlite` (0600), retained
 seven days. Questions are rechecked against the public native source. Known
 original deadlines classify expirations without re-registering a request.
+A large pending queue uses bounded pages. The snapshot carries `pendingNextBefore`
+and `inbox.pending {before}` returns the continuation, with live profile admission
+checked for every page. The client uses `observedAtMs` from the snapshot for deadlines.
+
 Results are newest-first in pages of 100. `inbox.completed {before?}` returns
 items, total/unread counts and a `nextBefore` cursor. Read state is independent
 of session unread. `inbox.completed {id,sessionKey}` returns zero or one item
@@ -2998,7 +3002,8 @@ addressed 45-second event subscription. Renew every 15 seconds; `chat.unsubscrib
 removes it. Events are `{type:"ocuclaw.workspace.chat",version:1,event,data}` for
 native `streaming`, `message`, `activity`; only subscribers of the exact session key
 receive them. The relay's globally selected session is untouched. Reconnection reads
-history again. Read-only cron history uses a separate profile-verified native binding.
+byte-bounded history again together with the most recent active stream fragment.
+Read-only cron history uses a separate profile-verified native binding.
 
 `uploads.begin {size,fileName,mimeType}`, `uploads.chunk {id,offset,content}`,
 `uploads.cancel {id}` implement socket-owned, sequential, bounded base64 chunks.
@@ -3013,10 +3018,13 @@ and `jobs.list/history/pause/resume/run/stop/receipt`, always with `profileId`.
 The server checks live profile admission and calls the public `cron.phone_workspace`
 API. Options return native server time/timezone and actual scheduler policy.
 Preview returns native `nextRuns` and a two-minute `reviewHash`. Create/update require
-that proof; update/delete also require the current job `revision`. Every mutation
+that proof and the reviewed first launch. If the first launch has elapsed, the
+client needs a new preview. Update/delete also require the current job `revision`. Every mutation
 requires `operationId`, stores a receipt before native admission, rejects reuse with
 a different fingerprint and never retries an uncertain receipt. Job stop additionally
-requires the exact `executionId`. Job history has a native cursor and UTF-8 budget.
+requires the exact `executionId`. Job history uses a chronological cursor with
+`claimedAt` and `id`, plus a UTF-8 budget. Registration failures are exposed both
+in the save receipt and in the job list.
 
 Cron questions are live cross-process rendezvous in Hermes, validated against the
 producer's PID birth and original deadline. Answers remain request-addressed through

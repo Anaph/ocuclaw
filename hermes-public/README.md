@@ -22,6 +22,13 @@ private Hermes queues from the plugin. Cancellation feeds the existing native
 cancellation path and does not pause the schedule. Job edits take the same native
 cross-process lock as CLI/Desktop, with locking failure refusing the phone edit.
 
+The pinned native scheduler resolves cron expressions in the profile's wall-clock
+timezone. Nonexistent recurring times are skipped, and an ambiguous recurring
+time runs once at its first occurrence. A one-shot at an ambiguous time needs
+an explicit offset. A nonexistent one-shot local time is rejected. New execution
+files and session IDs include the execution identifier so repeated local times
+preserve separate results.
+
 ## Prepare, review, test
 
 Use a **clean local checkout** of the pinned commit and an output directory outside

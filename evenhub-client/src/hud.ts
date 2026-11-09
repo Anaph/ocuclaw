@@ -57,6 +57,7 @@ interface Confirmation {
   id: number;
   text: string;
   bodyLines?: string[];
+  sourceKey?: string;
   label: string;
   checkLabel?: string;
   retryLabel?: string;
@@ -80,7 +81,8 @@ export function mountHud(
     chatKey = "",
     chatTitle = "",
     messages: any[] = [],
-    total = 0;
+    total = 0,
+    chatBefore: string | number | null = null;
   let confirmation: Confirmation | null = null;
   let confirmationId = 0,
     shownAction = "",
@@ -95,6 +97,7 @@ export function mountHud(
     draft = "",
     voiceRetry: Uint8Array | null = null,
     readText = "",
+    readKey = "",
     readPage = 0,
     readReturn: Screen = "question",
     notice = "",
@@ -112,6 +115,8 @@ export function mountHud(
   let choices = new Set<number>();
   const workspace = new Workspace(relay, model);
   let currentJob: Job | null = null;
+  let currentJobKey = "";
+  let assertJobProfile = () => {};
   let connectionGeneration = 0,
     connectionScope = "",
     sessionSearch = "";
@@ -123,12 +128,14 @@ export function mountHud(
     connectionGeneration++;
     workspace.reset(scope);
     currentJob = null;
+    currentJobKey = "";
     connectionScope = scope;
     notice = "";
     model.reset();
     sessions = [];
     messages = [];
     total = 0;
+    chatBefore = null;
     chatKey = "";
     chatTitle = "";
     questionId = "";
@@ -141,6 +148,7 @@ export function mountHud(
     voiceRetry = null;
     textField.value = "";
     readText = "";
+    readKey = "";
     readPage = 0;
     clearNotification();
     notificationQueue.length = 0;
@@ -214,7 +222,12 @@ export function mountHud(
     options: Partial<
       Pick<
         Confirmation,
-        "label" | "phase" | "bodyLines" | "checkLabel" | "retryLabel"
+        | "label"
+        | "phase"
+        | "bodyLines"
+        | "checkLabel"
+        | "retryLabel"
+        | "sourceKey"
       >
     > = {},
   ) {
@@ -223,6 +236,7 @@ export function mountHud(
       text,
       label: options.label ?? "Отправить",
       bodyLines: options.bodyLines,
+      sourceKey: options.sourceKey,
       checkLabel: options.checkLabel,
       retryLabel: options.retryLabel,
       back,
@@ -234,6 +248,18 @@ export function mountHud(
     return confirmation;
   }
   function full(text: string) {
+    readKey =
+      (screen === "question"
+        ? q()?.sessionKey
+        : screen === "result"
+          ? result()?.sessionKey
+          : screen === "chat"
+            ? chatKey
+            : screen === "confirm"
+              ? confirmation?.sourceKey
+              : screen === "job"
+                ? `hermes:${workspace.profile === "default" ? "main" : workspace.profile}:job`
+                : undefined) ?? "";
     readText = text;
     readPage = 0;
     readReturn = screen;
@@ -285,11 +311,16 @@ export function mountHud(
     chatTitle = title;
     messages = data.messages || [];
     total = data.total ?? messages.length;
+    chatBefore =
+      (data.hasMore ?? total > messages.length)
+        ? (data.nextBeforeId ?? messages[0]?.id ?? null)
+        : null;
     go("chat");
   }
   function questionAnswer(answer: Answer, back: Screen = "question") {
     const item = q();
-    if (!item || !canSend(item)) return message("Вопрос уже не актуален");
+    if (!item || !canSend(item, model.now()))
+      return message("Вопрос уже не актуален");
     const shown =
       "text" in answer
         ? answer.text
@@ -297,12 +328,13 @@ export function mountHud(
           ? decisionLabel(answer.decision)
           : answer.indices.map((i) => item.choices![i]).join(", ");
     const attempt = workspace.answerAttempt(item);
+    const recoveringOther = () => workspace.isPreviousAnswer(attempt, answer);
     const context = `${item.agentName} / ${item.sessionTitle}`;
     const action = "decision" in answer ? item.permissionCommand : null;
     const summary = [`«${shown}»`, action, context].filter(Boolean).join("\n");
     const submit = async () => {
       try {
-        if (!attempt.operationId && !canSend(item))
+        if (!attempt.operationId && !canSend(item, model.now()))
           return showOutcome({ status: "expired" });
         showOutcome(await workspace.answer(item, answer, attempt));
       } catch (error) {
@@ -310,16 +342,22 @@ export function mountHud(
         throw error;
       }
     };
-    const flow = confirm(summary, submit, back, {
-      phase: attempt.operationId ? "check" : "review",
-    });
+    const flow = confirm(
+      recoveringOther() ? `Проверьте предыдущий ответ.\n${context}` : summary,
+      submit,
+      back,
+      {
+        sourceKey: item.sessionKey,
+        phase: attempt.operationId ? "check" : "review",
+      },
+    );
     function showOutcome(reply: { status: string; error?: string }) {
       if (
         ["accepted", "already_answered", "expired", "not_found"].includes(
           reply.status,
         )
       ) {
-        if (reply.status === "accepted") {
+        if (reply.status === "accepted" && !recoveringOther()) {
           positions.delete("answered");
           go("answered");
         } else go("pending");
@@ -328,11 +366,18 @@ export function mountHud(
         flow.phase = reply.status === "rejected" ? "review" : "check";
         if (reply.status === "rejected") attempt.operationId = undefined;
       }
-      message(reply.error || statusLabel(reply.status));
+      message(
+        reply.error ||
+          (reply.status === "accepted" && recoveringOther()
+            ? "Принят предыдущий ответ"
+            : statusLabel(reply.status)),
+      );
     }
     flow.check = async () => {
       const reply = await workspace.checkAnswer(item, attempt);
       if (reply.status !== "pending") return showOutcome(reply);
+      workspace.prepareAnswerRetry(attempt, answer);
+      flow.text = summary;
       flow.phase = "retry";
       message("Hermes ждёт ответ. Можно отправить.");
     };
@@ -377,7 +422,7 @@ export function mountHud(
     if (item.expiresAtMs === null) return "Без таймера";
     const seconds = Math.max(
       0,
-      Math.ceil((item.expiresAtMs - Date.now()) / 1000),
+      Math.ceil((item.expiresAtMs - model.now()) / 1000),
     );
     return seconds
       ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`
@@ -466,6 +511,8 @@ export function mountHud(
             label: `${job.name}\n${job.paused ? "На паузе" : job.nextRunAt || job.state}`,
             run: () => {
               currentJob = job;
+              currentJobKey = `hermes:${workspace.profile === "default" ? "main" : workspace.profile}:job`;
+              assertJobProfile = workspace.scheduleGuard();
               go("job");
             },
           })),
@@ -491,6 +538,7 @@ export function mountHud(
                   id: "receipt",
                   label: "Проверить операцию",
                   run: async () => {
+                    const assertProfile = workspace.scheduleGuard();
                     const operation = workspace.pendingSchedule();
                     if (!operation) return;
                     const report = async (result: {
@@ -508,10 +556,12 @@ export function mountHud(
                     const receipt = await workspace.reconcileSchedule(
                       operation.operationId,
                     );
+                    assertProfile();
                     if (receipt?.status === "not_found")
                       confirm(
                         "Hermes не получил операцию. Повторить?",
                         async () => {
+                          assertProfile();
                           const result = await workspace.retrySchedule(
                             operation.operationId,
                           );
@@ -529,10 +579,11 @@ export function mountHud(
         ],
       };
     if (screen === "job" && currentJob) {
+      const assertProfile = assertJobProfile;
       const job = currentJob;
       return {
         title: job.name,
-        body: `${job.schedule}\n${job.nextRunAt || job.state}`,
+        body: `${job.schedule}\n${job.registration === "failed" ? "Ошибка регистрации" : job.nextRunAt || job.state}`,
         actions: [
           {
             id: "details",
@@ -549,6 +600,7 @@ export function mountHud(
               confirm(
                 `${job.paused ? "Возобновить" : "Приостановить"} «${job.name}»?`,
                 async () => {
+                  assertProfile();
                   await workspace.mutateSchedule(
                     job.paused ? "jobs.resume" : "jobs.pause",
                     { jobId: job.id },
@@ -565,6 +617,7 @@ export function mountHud(
               confirm(
                 `Запустить «${job.name}»?\n${workspace.options?.runNowPolicy || ""}`,
                 async () => {
+                  assertProfile();
                   await workspace.mutateSchedule("jobs.run", {
                     jobId: job.id,
                   });
@@ -609,6 +662,7 @@ export function mountHud(
         available && relay.online
           ? orderedQuestions(
               model.snapshot.pending.filter((item) => item.id !== questionId),
+              model.now(),
             )[0]
           : undefined;
       return {
@@ -630,7 +684,7 @@ export function mountHud(
                     );
                     if (
                       current &&
-                      canSend(current) &&
+                      canSend(current, model.now()) &&
                       relay.online &&
                       available
                     )
@@ -888,7 +942,7 @@ export function mountHud(
             label: `${m.role === "user" ? "Вы" : "Агент"}: ${content(m.content)}`,
             run: () => full(content(m.content)),
           })),
-          ...(messages.length < total && messages[0]?.id
+          ...(chatBefore !== null
             ? [
                 {
                   id: "earlier",
@@ -896,12 +950,20 @@ export function mountHud(
                   run: async () => {
                     const page = await relay.request("chat.history", {
                       sessionKey: chatKey,
-                      beforeId: messages[0].id,
+                      beforeId: chatBefore,
                       limit: 20,
                     });
                     if (page.rowIdsUnavailable)
                       throw Error("Hermes не предоставляет курсоры истории");
                     const seen = new Set(messages.map((x) => x.id));
+                    const earlier =
+                      page.nextBeforeId ?? page.messages[0]?.id ?? null;
+                    chatBefore =
+                      (page.hasMore ??
+                        total > messages.length + page.messages.length) &&
+                      earlier !== chatBefore
+                        ? earlier
+                        : null;
                     messages = [
                       ...page.messages.filter((m: any) => !seen.has(m.id)),
                       ...messages,
@@ -1101,6 +1163,7 @@ export function mountHud(
       go("jobs");
       return message("Проверьте предыдущую операцию расписания.");
     }
+    const assertProfile = workspace.scheduleGuard();
     const draftResult = await workspace.schedule("automations.draft", { text });
     const fields = draftResult.fields as ScheduleFields;
     const { preview } = await workspace.schedule("automations.preview", {
@@ -1109,11 +1172,19 @@ export function mountHud(
     const nextRun = preview.nextRuns[0]?.replace("T", " ") || "—";
     const nearest = `Ближайший запуск: ${nextRun}`;
     let operationId: string | undefined;
-    async function report(receipt: { status: string; error?: string }) {
+    async function report(receipt: {
+      status: string;
+      error?: string;
+      registration?: string;
+    }) {
       if (receipt.status === "saved") {
         bound.recovery = undefined;
         go("jobs");
-        message("Задача сохранена");
+        message(
+          receipt.registration === "failed"
+            ? "Планировщик не зарегистрировал задачу"
+            : "Задача сохранена",
+        );
         await workspace
           .loadJobs()
           .catch(() => message("Задача сохранена. Список пока недоступен."));
@@ -1140,6 +1211,7 @@ export function mountHud(
       `${fields.name}\n${nearest}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
       async () => {
         try {
+          assertProfile();
           const result = operationId
             ? await workspace.retrySchedule(operationId)
             : await workspace.mutateSchedule(
@@ -1172,6 +1244,7 @@ export function mountHud(
       },
     );
     flow.check = async () => {
+      assertProfile();
       const receipt = await workspace.reconcileSchedule(operationId);
       if (receipt) await report(receipt);
     };
@@ -1278,6 +1351,8 @@ export function mountHud(
       return;
     }
     if (screen === "read") {
+      readText = "";
+      readKey = "";
       go(readReturn);
       return;
     }
@@ -1337,7 +1412,7 @@ export function mountHud(
       if (
         "question" in item
           ? model.snapshot.pending.some((x) => x.id === item.id) &&
-            canSend(item)
+            canSend(item, model.now())
           : model.snapshot.completed.some((x) => x.id === item.id)
       )
         notification = item;
@@ -1351,11 +1426,8 @@ export function mountHud(
       render();
     }
   }
-  async function refreshInbox() {
-    const generation = connectionGeneration;
-    const snapshot = await relay.request("inbox.snapshot");
-    if (generation !== connectionGeneration) return;
-    applySnapshot(snapshot);
+  function refreshInbox() {
+    return relay.refreshInbox();
   }
   async function reconcileOperations() {
     const generation = connectionGeneration,
@@ -1410,6 +1482,41 @@ export function mountHud(
     if (!loadedOlder) nextCompleted = snapshot.completedNextBefore ?? null;
     model.update(snapshot);
     available = snapshot.available;
+    sessions = sessions.filter((session) => model.allows(session.key));
+    const revokedChat = Boolean(chatKey && !model.allows(chatKey));
+    const revokedJob = Boolean(currentJobKey && !model.allows(currentJobKey));
+    if (revokedChat) {
+      chatKey = "";
+      chatTitle = "";
+      messages = [];
+      total = 0;
+      chatBefore = null;
+    }
+    if (revokedJob) {
+      currentJob = null;
+      currentJobKey = "";
+    }
+    if (
+      notification &&
+      (!model.allows(notification.sessionKey) ||
+        ("question" in notification &&
+          snapshot.available &&
+          !model.snapshot.pending.some((item) => item.id === notification!.id)))
+    )
+      clearNotification();
+    if (
+      (revokedChat && ["chat", "menu"].includes(screen)) ||
+      (revokedJob && screen === "job") ||
+      (screen === "read" && readKey && !model.allows(readKey)) ||
+      (screen === "confirm" &&
+        confirmation?.sourceKey &&
+        !model.allows(confirmation.sourceKey))
+    ) {
+      readText = "";
+      readKey = "";
+      confirmation = null;
+      go("home");
+    }
     if (sawSnapshot)
       for (const item of snapshot.pending)
         if (!before.has(item.id)) notificationQueue.push(item);

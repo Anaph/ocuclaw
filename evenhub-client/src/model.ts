@@ -31,6 +31,8 @@ export interface Completion {
   createdAtMs: number;
 }
 export interface Snapshot {
+  observedAtMs?: number;
+  pendingNextBefore?: [number, number, string] | null;
   authorizedNamespaces?: string[] | null;
   completedNextBefore?: { id: string; createdAtMs: number } | null;
   completedTotal?: number;
@@ -110,7 +112,20 @@ export class InboxModel {
   };
   order: string[] = [];
   selectedId: string | null = null;
+  private clock?: { remote: number; monotonic: number };
+  now() {
+    return this.clock
+      ? this.clock.remote +
+          Math.max(0, performance.now() - this.clock.monotonic)
+      : Date.now();
+  }
+  allows(key: string) {
+    return (
+      this.snapshot.authorizedNamespaces?.includes(key.split(":")[1]) ?? true
+    );
+  }
   reset() {
+    this.clock = undefined;
     this.snapshot = {
       version: 1,
       available: false,
@@ -126,10 +141,19 @@ export class InboxModel {
     this.selectedId = null;
   }
   enter() {
-    this.order = orderedQuestions(this.snapshot.pending).map((x) => x.id);
+    this.order = orderedQuestions(this.snapshot.pending, this.now()).map(
+      (x) => x.id,
+    );
     this.retain();
   }
   update(snapshot: Snapshot) {
+    const remote = snapshot.observedAtMs;
+    if (
+      typeof remote === "number" &&
+      Number.isFinite(remote) &&
+      remote !== this.clock?.remote
+    )
+      this.clock = { remote, monotonic: performance.now() };
     const visible = (key: string) =>
       !snapshot.authorizedNamespaces ||
       snapshot.authorizedNamespaces.includes(key.split(":")[1]);
@@ -145,7 +169,7 @@ export class InboxModel {
       if (
         !latest.has(old.id) &&
         visible(old.sessionKey) &&
-        old.createdAtMs > Date.now() - 7 * 86400000
+        old.createdAtMs > this.now() - 7 * 86400000
       )
         latest.set(old.id, old);
     this.snapshot = {
@@ -157,7 +181,7 @@ export class InboxModel {
     };
     this.order = stableOrder(
       this.order,
-      orderedQuestions(pending).map((x) => x.id),
+      orderedQuestions(pending, this.now()).map((x) => x.id),
     );
     this.retain();
   }

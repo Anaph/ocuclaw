@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 import time
+from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -60,6 +61,8 @@ def journal():
       CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY,created REAL NOT NULL,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS previews (hash TEXT PRIMARY KEY,expires REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS reviewed_runs (hash TEXT PRIMARY KEY, clock TEXT NOT NULL, first_run TEXT);
+      CREATE TABLE IF NOT EXISTS registration_failures (job TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS bindings (execution TEXT PRIMARY KEY,job TEXT NOT NULL,session TEXT,output TEXT,stop INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS questions (id TEXT PRIMARY KEY,owner_pid INTEGER NOT NULL,owner_started INTEGER,created INTEGER NOT NULL,expires INTEGER,payload TEXT NOT NULL,execution TEXT NOT NULL,response TEXT);
       CREATE TABLE IF NOT EXISTS aliases (session TEXT PRIMARY KEY,execution TEXT NOT NULL);
@@ -109,10 +112,8 @@ def record_output(job_id, execution_id, path):
 def record_finished(record):
     if not record or record.get("status") not in {"completed", "failed", "unknown"}:
         return
-    item = _execution(record)
+    item = _execution(record, capture_output=True)
     item["summary"] = item.get("summary", "")[:4000]
-    from datetime import datetime
-
     created = datetime.fromisoformat(
         item["finishedAt"] or item["claimedAt"]
     ).timestamp()
@@ -127,20 +128,24 @@ def record_finished(record):
 def finished_results(params):
     before = params.get("before")
     args = [time.time() - 7 * 86400]
-    where = "created>=?"
+    where = "r.created>=?"
     if before:
-        where += " AND (created<? OR (created=? AND id<?))"
+        where += " AND (r.created<? OR (r.created=? AND r.id<?))"
         args.extend([before["created"], before["created"], before["id"]])
     with journal() as db:
         rows = db.execute(
-            "SELECT id,created,payload FROM results WHERE "
+            "SELECT r.id,r.created,r.payload,a.execution AS owner "
+            "FROM results r LEFT JOIN bindings b ON b.execution=r.id "
+            "LEFT JOIN aliases a ON a.session=b.session WHERE "
             + where
-            + " ORDER BY created DESC,id DESC LIMIT 501",
+            + " ORDER BY r.created DESC,r.id DESC LIMIT 501",
             args,
         ).fetchall()
     items, used = [], 0
     for row in rows[:500]:
         item = json.loads(row["payload"])
+        if row["owner"] and row["owner"] != row["id"]:
+            item.pop("sessionId", None)
         size = len(json.dumps(item, ensure_ascii=False).encode())
         if items and used + size > 192 * 1024:
             break
@@ -228,6 +233,15 @@ def _editable(row):
     }
 
 
+def _registration_failed(job_id):
+    with journal() as db:
+        return bool(
+            db.execute(
+                "SELECT 1 FROM registration_failures WHERE job=?", (job_id,)
+            ).fetchone()
+        )
+
+
 def _job(row):
     if row is None:
         raise ValueError("job_not_found")
@@ -250,7 +264,7 @@ def _job(row):
     }
 
 
-def _execution(row):
+def _execution(row, *, capture_output=False):
     if not row:
         return None
     from cron.delivery_queue import get_status
@@ -279,14 +293,36 @@ def _execution(row):
         delivery.get("status", "unknown") if delivery else "not_configured"
     )
     if binding:
-        result["sessionId"] = binding["session"]
+        session_id = binding["session"]
+        if session_id:
+            owner = binding_for_session(session_id)
+            if owner and owner["execution"] == row["id"]:
+                result["sessionId"] = session_id
         result["stopRequested"] = bool(binding["stop"])
         if binding["output"]:
             from hermes_constants import get_hermes_home
 
             path = Path(binding["output"])
             base = (get_hermes_home() / "cron" / "output").resolve()
-            if path.resolve().is_relative_to(base) and path.is_file():
+            with journal() as db:
+                shared = db.execute(
+                    "SELECT 1 FROM bindings WHERE output=? AND execution<>? LIMIT 1",
+                    (binding["output"], row["id"]),
+                ).fetchone()
+                archived = (
+                    db.execute(
+                        "SELECT payload FROM results WHERE id=?", (row["id"],)
+                    ).fetchone()
+                    if shared
+                    else None
+                )
+            if archived:
+                result["summary"] = json.loads(archived[0]).get("summary", "")
+            elif (
+                (capture_output or not shared)
+                and path.resolve().is_relative_to(base)
+                and path.is_file()
+            ):
                 with path.open(encoding="utf-8") as stream:
                     result["summary"] = stream.read(16000)
     return result
@@ -321,8 +357,13 @@ def options():
     }
 
 
+def _review_identity(fields, job_id, revision, timezone, first_run):
+    return digest([fields, job_id, revision, timezone, first_run])
+
+
 def preview(params):
     from cron import jobs
+    from hermes_time import now
 
     fields = _fields(params.get("fields"))
     job_id = params.get("jobId")
@@ -331,33 +372,41 @@ def preview(params):
     if job_id and revision != params.get("revision"):
         raise ValueError("stale_edit")
     unchanged = current and fields["schedule"] == _editable(current)["schedule"]
-    parsed = (
-        current["schedule"] if unchanged else jobs.parse_schedule(fields["schedule"])
-    )
-    next_run = (
-        current.get("next_run_at") if unchanged else jobs.compute_next_run(parsed)
-    )
-    runs = []
-    while next_run and next_run not in runs:
-        runs.append(next_run)
-        if len(runs) == 5 or parsed.get("kind") == "once":
-            break
-        next_run = jobs.compute_next_run(parsed, next_run)
-    if not runs and not unchanged:
+    clock = now()
+    with jobs.workspace_schedule_time(clock):
+        parsed = (
+            current["schedule"]
+            if unchanged
+            else jobs.parse_schedule(fields["schedule"])
+        )
+        next_run = (
+            current.get("next_run_at") if unchanged else jobs.compute_next_run(parsed)
+        )
+        runs = []
+        while next_run and next_run not in runs:
+            runs.append(next_run)
+            if len(runs) == 5 or parsed.get("kind") == "once":
+                break
+            next_run = jobs.compute_next_run(parsed, next_run)
+    first_run = runs[0] if runs else None
+    if not unchanged and (
+        first_run is None
+        or datetime.fromisoformat(first_run).timestamp() <= clock.timestamp()
+    ):
         raise ValueError("schedule_has_no_future_run")
     meta = options()
-    review = digest(
-        {
-            "fields": fields,
-            "jobId": job_id,
-            "revision": revision,
-            "timezone": meta["timezone"],
-        }
-    )
+    review = _review_identity(fields, job_id, revision, meta["timezone"], first_run)
     with journal() as db:
         db.execute("DELETE FROM previews WHERE expires<?", (time.time(),))
         db.execute(
+            "DELETE FROM reviewed_runs WHERE hash NOT IN (SELECT hash FROM previews)"
+        )
+        db.execute(
             "INSERT OR REPLACE INTO previews VALUES (?,?)", (review, time.time() + 120)
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO reviewed_runs VALUES (?,?,?)",
+            (review, clock.isoformat(), first_run),
         )
     return {
         "preview": {
@@ -418,32 +467,70 @@ def _mutate(operation, p):
         raise ValueError("stale_edit")
     if operation in {"automations.create", "automations.update"}:
         fields = _fields(p.get("fields"))
-        expected = digest(
-            {
-                "fields": fields,
-                "jobId": job_id,
-                "revision": p.get("revision") if job_id else None,
-                "timezone": options()["timezone"],
-            }
-        )
+        from hermes_time import now
+
+        clock = now()
+        zone = options()["timezone"]
+        review = p.get("reviewHash")
         with journal() as db:
             proof = db.execute(
-                "SELECT expires FROM previews WHERE hash=?", (expected,)
+                "SELECT p.expires, r.clock, r.first_run FROM previews p "
+                "JOIN reviewed_runs r USING(hash) WHERE p.hash=?",
+                (review,),
             ).fetchone()
-        if expected != p.get("reviewHash") or not proof or proof[0] < time.time():
+        if (
+            not proof
+            or proof["expires"] < time.time()
+            or review
+            != _review_identity(
+                fields,
+                job_id,
+                p.get("revision") if job_id else None,
+                zone,
+                proof["first_run"],
+            )
+        ):
             raise ValueError("preview_expired")
-        if operation == "automations.create":
-            # Native create persists the task once; registration failure is a partial result.
-            job = jobs.create_job(**fields)
-            try:
-                resolve_cron_scheduler().register_job(job)
-            except Exception:
-                return {"status": "saved", "registration": "failed", "job": _job(job)}
-        else:
-            if fields["schedule"] == _editable(current)["schedule"]:
+        unchanged = current and fields["schedule"] == _editable(current)["schedule"]
+        with jobs.workspace_schedule_time(
+            datetime.fromisoformat(proof["clock"]).astimezone(clock.tzinfo)
+        ):
+            if unchanged:
+                if current.get("next_run_at") != proof["first_run"]:
+                    raise ValueError("preview_expired")
                 fields.pop("schedule")
-            job = jobs.update_job(job_id, fields)
-        resolve_cron_scheduler().on_jobs_changed()
+            else:
+                first_run = proof["first_run"]
+                if (
+                    not first_run
+                    or datetime.fromisoformat(first_run).timestamp()
+                    <= clock.timestamp()
+                ):
+                    raise ValueError("preview_expired")
+                if (
+                    jobs.compute_next_run(jobs.parse_schedule(fields["schedule"]))
+                    != first_run
+                ):
+                    raise ValueError("preview_expired")
+            job = (
+                jobs.create_job(**fields)
+                if operation == "automations.create"
+                else jobs.update_job(job_id, fields)
+            )
+        provider = resolve_cron_scheduler()
+        try:
+            if operation == "automations.create" or _registration_failed(job["id"]):
+                provider.register_job(job)
+            provider.on_jobs_changed()
+        except Exception:
+            with journal() as db:
+                db.execute(
+                    "INSERT OR IGNORE INTO registration_failures VALUES (?)",
+                    (job["id"],),
+                )
+            return {"status": "saved", "registration": "failed", "job": _job(job)}
+        with journal() as db:
+            db.execute("DELETE FROM registration_failures WHERE job=?", (job["id"],))
         return {"status": "saved", "registration": "registered", "job": _job(job)}
     if current is None:
         raise ValueError("job_not_found")
@@ -497,16 +584,27 @@ def handle(operation, params):
     if operation == "automations.read":
         return {"job": _job(jobs.get_job(params.get("jobId")))}
     if operation == "jobs.list":
-        return {"jobs": [_job(row) for row in jobs.workspace_snapshot()]}
+        with journal() as db:
+            failed = {
+                row[0] for row in db.execute("SELECT job FROM registration_failures")
+            }
+        return {
+            "jobs": [
+                dict(_job(row), registration="failed")
+                if row["id"] in failed
+                else _job(row)
+                for row in jobs.workspace_snapshot()
+            ]
+        }
     if operation == "jobs.results":
         return finished_results(params)
     if operation == "jobs.history":
-        from cron.executions import list_executions
+        from cron.executions import list_workspace_executions
 
-        rows = list_executions(
+        rows = list_workspace_executions(
             job_id=params.get("jobId"),
             limit=500,
-            before_claimed_at=params.get("before"),
+            before=params.get("before"),
         )
         items, used = [], 0
         for row in rows:
@@ -517,7 +615,7 @@ def handle(operation, params):
             items.append(item)
             used += size
         cursor = (
-            items[-1]["claimedAt"]
+            {"claimedAt": items[-1]["claimedAt"], "id": items[-1]["id"]}
             if items and (len(items) < len(rows) or len(rows) == 500)
             else None
         )

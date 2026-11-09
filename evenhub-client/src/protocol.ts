@@ -1,4 +1,4 @@
-import type { Completion, Question, Snapshot } from "./model";
+import type { Answer, Completion, Question, Snapshot } from "./model";
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -74,6 +74,7 @@ export function endpointScope(address: string): string {
 }
 
 interface AnswerReceipt {
+  answer?: Answer;
   operationId: string;
   id: string;
   sessionKey: string;

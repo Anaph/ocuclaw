@@ -80,9 +80,9 @@ type SchedulePreview = {
   timezone: string;
   nextRuns: string[];
 };
-const deadline = (expiresAt: number | null) => {
+const deadline = (expiresAt: number | null, now: number) => {
   if (expiresAt === null) return "Без срока";
-  const seconds = Math.ceil((expiresAt - Date.now()) / 1000);
+  const seconds = Math.ceil((expiresAt - now) / 1000);
   if (seconds <= 0) return "Срок истёк";
   if (seconds < 60) return `Осталось ${seconds} с`;
   return `Осталось ${Math.ceil(seconds / 60)} мин`;
@@ -91,6 +91,11 @@ export class PhoneApp {
   readonly data: Workspace;
   private tab: Tab = "chats";
   private search = "";
+  private searchInput = "";
+  private discardableSends = new Map<string, string>();
+  private completionCursor?: InboxModel["snapshot"]["completedNextBefore"];
+  private completionScope = "";
+  private historyProfile = "";
   private hidden = false;
   private inboxTab = "pending";
   private inboxSession: { key: string; title: string } | null = null;
@@ -158,6 +163,14 @@ export class PhoneApp {
     private hud: Hud,
     private hudRoot: HTMLElement,
   ) {
+    const savedAddress = localStorage.getItem("ocuclaw.server");
+    if (savedAddress) {
+      try {
+        localStorage.setItem("ocuclaw.server", endpointScope(savedAddress));
+      } catch {
+        localStorage.removeItem("ocuclaw.server");
+      }
+    }
     this.data = new Workspace(relay, inbox);
     root.innerHTML = `<main class="phone"><header><div><span class="brand">OCUCLAW</span><small>Hermes · Even Hub</small></div><div id="phone-status" role="status"></div></header><div class="phone-feedback"><p id="phone-notice" role="status"></p><section id="phone-handoff" class="row" aria-label="Передача с очков" hidden></section><button id="verification-open" hidden>Нужна проверка</button></div><section id="phone-content"></section><nav class="bottom-nav" aria-label="Разделы"></nav></main>`;
     this.panel = root.querySelector("#phone-content")!;
@@ -183,7 +196,12 @@ export class PhoneApp {
       if (!this.updateChatStream()) this.render();
     };
     relay.observe({
-      snapshot: () => {
+      snapshot: (snapshot) => {
+        const scope = JSON.stringify(snapshot.authorizedNamespaces ?? null);
+        if (scope !== this.completionScope) {
+          this.completionScope = scope;
+          this.completionCursor = undefined;
+        }
         this.renderHandoff();
         if (this.tab === "inbox" && !this.recording && !this.confirmation)
           this.render();
@@ -233,6 +251,12 @@ export class PhoneApp {
     const generation = this.data.generation;
     this.syncing = true;
     const requests = [this.data.refreshChat(undefined, true)];
+    if (
+      this.tab === "schedule" &&
+      this.historyJob &&
+      this.historyProfile === this.data.profile
+    )
+      requests.push(this.refreshHistory(this.historyJob));
     if (reconnected || (this.tab === "chats" && !this.data.chatKey))
       requests.push(this.data.list(this.search, this.hidden));
     if (
@@ -287,9 +311,26 @@ export class PhoneApp {
     this.confirmation = { text, action, label };
     this.render();
   }
-  private async refreshInbox() {
-    const snapshot = await this.data.request("inbox.snapshot");
-    this.relay.onSnapshot(snapshot);
+  private refreshInbox() {
+    return this.relay.refreshInbox();
+  }
+  private confirmSchedule(text: string, action: () => Promise<void>) {
+    const assertProfile = this.data.scheduleGuard();
+    this.confirm(text, async () => {
+      assertProfile();
+      await action();
+    });
+  }
+  private async refreshHistory(jobId: string) {
+    const data = await this.data.schedule("jobs.history", { jobId });
+    if (this.historyJob !== jobId || this.historyProfile !== this.data.profile)
+      return;
+    const head = data.history as typeof this.data.history;
+    const ids = new Set(head.map((run) => run.id));
+    this.data.history = [
+      ...head,
+      ...this.data.history.filter((run) => !ids.has(run.id)),
+    ];
     this.render();
   }
   private async restoreConnection() {
@@ -327,6 +368,8 @@ export class PhoneApp {
     this.scheduleDraftProfile = "";
     this.scheduleDraftOperation = undefined;
     this.attachmentDrafts.clear();
+    this.discardableSends.clear();
+    this.completionCursor = undefined;
     this.preview = null;
     this.confirmation = null;
     this.historyJob = "";
@@ -336,11 +379,12 @@ export class PhoneApp {
     this.chatMenuOpen = false;
     this.inboxSession = null;
     this.search = "";
+    this.searchInput = "";
     this.hidden = false;
     this.showNew = false;
     this.tab = "chats";
-    localStorage.setItem("ocuclaw.server", address);
-    this.relay.connect(address, token);
+    localStorage.setItem("ocuclaw.server", scope);
+    this.relay.connect(scope, token);
   }
   private navigate(tab: Tab) {
     if (tab === this.tab || this.busy) return;
@@ -389,7 +433,7 @@ export class PhoneApp {
     }
     const badge = this.bottom.querySelector<HTMLElement>(".inbox-badge")!;
     const count = this.inbox.snapshot.pending.filter((item) =>
-      canSend(item),
+      canSend(item, this.inbox.now()),
     ).length;
     badge.hidden = count === 0;
     badge.textContent = count > 99 ? "99+" : String(count);
@@ -448,7 +492,7 @@ export class PhoneApp {
         !isQuestion(item) ||
         item.id !== ticket.id ||
         item.sessionKey !== ticket.sessionKey ||
-        !canSend(item)
+        !canSend(item, this.inbox.now())
       ) {
         consume();
         return this.message(
@@ -511,10 +555,19 @@ export class PhoneApp {
       this.message("Эта отправка уже проверена");
       return;
     }
-    const edited = pending.text !== this.data.draft(key);
-    const receipt = await this.data.checkSend(key, pending);
-    if (receipt?.status === "accepted" && pending.hadFiles && !edited)
-      this.attachmentDrafts.delete(this.data.scope + key);
+    const attachmentKey = this.data.scope + key;
+    const draft = this.data.draft(key);
+    const currentFiles = () => this.attachmentDrafts.get(attachmentKey) ?? [];
+    const receipt = await this.data.checkSend(key, pending, currentFiles);
+    if (receipt?.status === "not_found")
+      this.discardableSends.set(key, pending.id);
+    else this.discardableSends.delete(key);
+    if (
+      receipt?.status === "accepted" &&
+      pending.hadFiles &&
+      this.data.matchesSend(pending, draft, currentFiles())
+    )
+      this.attachmentDrafts.delete(attachmentKey);
     this.message(
       receipt?.status === "not_found"
         ? "Hermes не получил операцию. Можно повторить исходное сообщение."
@@ -619,7 +672,7 @@ export class PhoneApp {
       const expiresAt = element.dataset.deadline
         ? Number(element.dataset.deadline)
         : null;
-      element.textContent = deadline(expiresAt);
+      element.textContent = deadline(expiresAt, this.inbox.now());
     }
   }
   private render() {
@@ -796,7 +849,12 @@ export class PhoneApp {
       this.renderChat();
       return;
     }
-    this.panel.innerHTML = `<div class="heading"><h1>Чаты</h1><button id="new">＋ Новый чат</button></div><form id="search-form" class="inline"><input id="session-search" aria-label="Поиск чатов" value="${esc(this.search)}" placeholder="Поиск чатов"><button>Найти</button></form><label class="check"><input type="checkbox" id="hidden" ${this.hidden ? "checked" : ""}> Показывать скрытые</label><div id="session-list" class="cards"></div>`;
+    this.panel.innerHTML = `<div class="heading"><h1>Чаты</h1><button id="new">＋ Новый чат</button></div><form id="search-form" class="inline"><input id="session-search" aria-label="Поиск чатов" value="${esc(this.searchInput)}" placeholder="Поиск чатов"><button>Найти</button></form><label class="check"><input type="checkbox" id="hidden" ${this.hidden ? "checked" : ""}> Показывать скрытые</label><div id="session-list" class="cards"></div>`;
+    this.panel.querySelector<HTMLInputElement>("#session-search")!.oninput = (
+      event,
+    ) => {
+      this.searchInput = (event.currentTarget as HTMLInputElement).value;
+    };
     this.bind("#new", async () => {
       this.showNew = true;
       await this.data.catalog(this.creationProfile);
@@ -929,10 +987,25 @@ export class PhoneApp {
           );
         }),
       );
-    if (this.data.pendingSend())
+    const pendingSend = this.data.pendingSend();
+    if (pendingSend) {
       actions.append(
         this.button("Проверить отправку", () => this.verifySend(key)),
       );
+      if (this.discardableSends.get(key) === pendingSend.id)
+        actions.append(
+          this.button("Отменить старую отправку", () =>
+            this.confirm(
+              "Отменить операцию, которую Hermes не получил? Черновик сохранится.",
+              async () => {
+                await this.data.discardUnsent(key, pendingSend.id);
+                this.discardableSends.delete(key);
+                this.message("Старая отправка отменена");
+              },
+            ),
+          ),
+        );
+    }
     actions.append(
       this.button("Вопросы сессии", () => {
         this.tab = "inbox";
@@ -1066,7 +1139,7 @@ export class PhoneApp {
           files = [...attachments];
         void this.run(async () => {
           if (this.recording) throw Error("Завершите диктовку");
-          await this.data.send(text, files);
+          await this.data.send(text, files, key, undefined, () => attachments);
           for (const file of files) {
             const index = attachments.indexOf(file);
             if (index !== -1) attachments.splice(index, 1);
@@ -1158,6 +1231,7 @@ export class PhoneApp {
         (item) =>
           !this.inboxSession || item.sessionKey === this.inboxSession.key,
       ),
+      this.inbox.now(),
     );
   }
   private renderInbox() {
@@ -1226,7 +1300,7 @@ export class PhoneApp {
         meta.className = "inbox-card-meta";
         const expires = document.createElement("span");
         expires.dataset.deadline = String(item.expiresAtMs ?? "");
-        expires.textContent = deadline(item.expiresAtMs);
+        expires.textContent = deadline(item.expiresAtMs, this.inbox.now());
         meta.append(
           item.kind === "permission" ? "Разрешение · " : "Вопрос · ",
           expires,
@@ -1240,20 +1314,18 @@ export class PhoneApp {
         list.append(this.completionCard(item, stale));
     if (!list.childElementCount)
       list.innerHTML = `<p class="empty">${stale ? "Данные появятся после подключения и сверки." : "Здесь пока ничего нет."}</p>`;
-    if (
-      this.inboxTab === "completed" &&
-      this.inbox.snapshot.completedNextBefore
-    )
+    const cursor =
+      this.completionCursor === undefined
+        ? this.inbox.snapshot.completedNextBefore
+        : this.completionCursor;
+    if (this.inboxTab === "completed" && cursor)
       list.append(
         this.button("Предыдущие результаты", async () => {
           const page = await this.data.request("inbox.completed", {
-            before: this.inbox.snapshot.completedNextBefore,
+            before: cursor,
           });
-          this.inbox.update({
-            ...this.inbox.snapshot,
-            completed: page.items,
-            completedNextBefore: page.nextBefore,
-          });
+          this.completionCursor = page.nextBefore ?? null;
+          this.inbox.update({ ...this.inbox.snapshot, completed: page.items });
         }),
       );
   }
@@ -1276,6 +1348,7 @@ export class PhoneApp {
             this.data.historyCursor = result.nextBefore || null;
             this.closeScheduleEditor();
             this.historyJob = item.jobId;
+            this.historyProfile = this.data.profile;
             this.resultDetail = null;
             this.tab = "schedule";
             return;
@@ -1316,19 +1389,27 @@ export class PhoneApp {
     });
     const options = this.panel.querySelector("#answer-options")!;
     const blocked =
-      !this.relay.online || !this.inbox.snapshot.available || !canSend(item);
+      !this.relay.online ||
+      !this.inbox.snapshot.available ||
+      !canSend(item, this.inbox.now());
     if (blocked) {
-      options.textContent = !canSend(item)
+      options.textContent = !canSend(item, this.inbox.now())
         ? "Срок ответа истёк."
         : "Ответ будет доступен после сверки с Hermes.";
       this.panel.querySelector<HTMLFormElement>("#answer-form")!.hidden = true;
       return;
     }
     const prepare = (answer: Answer, label: string) => {
-      if (!canSend(item)) return this.message("Срок ответа истёк");
+      if (!canSend(item, this.inbox.now()))
+        return this.message("Срок ответа истёк");
       const action = "decision" in answer ? item.permissionCommand : null;
       const text = `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}${action ? `\n\n${action}` : ""}`;
       const attempt = this.data.answerAttempt(item);
+      const recoveringOther = () => this.data.isPreviousAnswer(attempt, answer);
+      const recoveryText = () =>
+        recoveringOther()
+          ? `${item.agentName} / ${item.sessionTitle}\n\nПроверьте отправку предыдущего ответа. Выбранный сейчас ответ ещё не отправлен.`
+          : text;
       const report = async (result: { status: string; error?: string }) => {
         if (
           ["accepted", "already_answered", "expired", "not_found"].includes(
@@ -1340,7 +1421,9 @@ export class PhoneApp {
           await this.refreshInbox().catch(() => {});
           this.message(
             result.status === "accepted"
-              ? "Ответ принят"
+              ? recoveringOther()
+                ? "Принят предыдущий ответ"
+                : "Ответ принят"
               : statusText(result.status),
           );
           return;
@@ -1352,7 +1435,13 @@ export class PhoneApp {
       const check = async () => {
         const result = await this.data.checkAnswer(item, attempt);
         if (result.status === "pending") {
-          this.confirm(text, submit, "Повторить отправку");
+          const changed = recoveringOther();
+          this.data.prepareAnswerRetry(attempt, answer);
+          this.confirm(
+            text,
+            submit,
+            changed ? "Отправить новый ответ" : "Повторить отправку",
+          );
           this.message("Вопрос ещё открыт. Проверьте ответ перед повтором.");
           return;
         }
@@ -1364,17 +1453,18 @@ export class PhoneApp {
           result = await this.data.answer(item, answer, attempt);
         } catch (error) {
           if (attempt.operationId)
-            this.confirm(text, check, "Проверить отправку");
+            this.confirm(recoveryText(), check, "Проверить отправку");
           throw error;
         }
         if (
           attempt.operationId &&
           ["uncertain", "source_unavailable"].includes(result.status)
         )
-          this.confirm(text, check, "Проверить отправку");
+          this.confirm(recoveryText(), check, "Проверить отправку");
         await report(result);
       };
-      if (attempt.operationId) this.confirm(text, check, "Проверить отправку");
+      if (attempt.operationId)
+        this.confirm(recoveryText(), check, "Проверить отправку");
       else this.confirm(text, submit);
     };
     if (item.kind === "permission")
@@ -1625,6 +1715,10 @@ export class PhoneApp {
           ? errorText(result.error)
           : `Состояние операции: ${statusText(result.status)}`,
       );
+      if ((result as { registration?: string }).registration === "failed")
+        this.message(
+          "Задача сохранена. Планировщик Hermes не зарегистрировал её.",
+        );
       if (!["not_found", "uncertain"].includes(result.status))
         await this.data.loadJobs();
     };
@@ -1633,7 +1727,7 @@ export class PhoneApp {
       result?.status === "not_found" &&
       pending?.operationId === operationId
     ) {
-      this.confirm(
+      this.confirmSchedule(
         "Hermes не получил операцию. Повторить её с исходным идентификатором?",
         async () => {
           try {
@@ -1659,6 +1753,8 @@ export class PhoneApp {
       this.renderScheduleEditor();
       return;
     }
+    if (this.historyJob && this.historyProfile !== this.data.profile)
+      this.historyJob = "";
     if (this.historyJob) {
       this.renderHistory();
       return;
@@ -1698,9 +1794,11 @@ export class PhoneApp {
         (this.jobFilter === "error" &&
           (["error", "failed", "blocked_config"].includes(j.state) ||
             ["failed", "unknown"].includes(j.lastExecution?.status || "") ||
-            j.lastStatus === "blocked_config")) ||
+            j.lastStatus === "blocked_config" ||
+            j.registration === "failed")) ||
         (this.jobFilter === "active" &&
           !j.paused &&
+          j.registration !== "failed" &&
           !["completed", "error"].includes(j.state)),
     );
     const groups = this.data.options
@@ -1721,7 +1819,7 @@ export class PhoneApp {
       for (const job of group.jobs) {
         const card = document.createElement("article");
         card.className = "card";
-        card.innerHTML = `<h2>${esc(job.name)}</h2><p>${esc(job.schedule)}</p><p>Следующий запуск: ${esc(scheduledTime(job.paused ? undefined : job.nextRunAt, this.data.options?.timezone))}</p><p class="muted">${esc(job.paused ? "На паузе" : statusText(job.state))} · последний: ${esc(job.lastExecution ? (job.lastExecution.stopRequested ? "Остановка запрошена" : job.lastExecution.needsAnswer ? "Нужен ответ" : statusText(job.lastExecution.status)) : "ещё не запускалась")}</p><div class="row"></div>`;
+        card.innerHTML = `<h2>${esc(job.name)}</h2><p>${esc(job.schedule)}</p><p>Следующий запуск: ${esc(scheduledTime(job.paused ? undefined : job.nextRunAt, this.data.options?.timezone))}</p><p class="muted">${esc(job.registration === "failed" ? "Ошибка регистрации" : job.paused ? "На паузе" : statusText(job.state))} · последний: ${esc(job.lastExecution ? (job.lastExecution.stopRequested ? "Остановка запрошена" : job.lastExecution.needsAnswer ? "Нужен ответ" : statusText(job.lastExecution.status)) : "ещё не запускалась")}</p><div class="row"></div>`;
         const actions = card.querySelector(".row")!;
         actions.append(
           this.button("Изменить", async () => {
@@ -1731,7 +1829,7 @@ export class PhoneApp {
             this.openScheduleEditor(result.job, { ...result.job.fields });
           }),
           this.button(job.paused ? "Возобновить" : "Пауза", () =>
-            this.confirm(
+            this.confirmSchedule(
               `${job.paused ? "Возобновить" : "Приостановить"} расписание «${job.name}»? Текущее выполнение не останавливается.`,
               async () => {
                 await this.data.mutateSchedule(
@@ -1743,7 +1841,7 @@ export class PhoneApp {
             ),
           ),
           this.button("Запустить сейчас", () =>
-            this.confirm(
+            this.confirmSchedule(
               `Запустить «${job.name}» сейчас?\n${this.data.options?.runNowPolicy || "Штатное поведение Hermes"}`,
               async () => {
                 await this.data.mutateSchedule("jobs.run", { jobId: job.id });
@@ -1758,12 +1856,13 @@ export class PhoneApp {
             this.data.history = result.history || [];
             this.data.historyCursor = result.nextBefore || null;
             this.historyJob = job.id;
+            this.historyProfile = this.data.profile;
           }),
           this.button("Удалить", async () => {
             const result = await this.data.schedule("automations.read", {
               jobId: job.id,
             });
-            this.confirm(
+            this.confirmSchedule(
               `Удалить расписание «${job.name}»? История выполнений останется в Hermes.`,
               async () => {
                 await this.data.mutateSchedule("automations.delete", {
@@ -1781,7 +1880,7 @@ export class PhoneApp {
         )
           actions.append(
             this.button("Остановить выполнение", () =>
-              this.confirm(
+              this.confirmSchedule(
                 "Остановить этот запуск? Расписание продолжит действовать.",
                 async () => {
                   await this.data.mutateSchedule("jobs.stop", {
@@ -1946,6 +2045,10 @@ export class PhoneApp {
             );
             if (operationId)
               this.settleScheduleDraft(key, operationId, result.status);
+            if (result.registration === "failed")
+              this.message(
+                "Задача сохранена. Планировщик Hermes не зарегистрировал её.",
+              );
           } catch (error) {
             if (error instanceof ScheduleRejected && operationId) {
               this.settleScheduleDraft(key, operationId, "rejected");
@@ -2008,16 +2111,25 @@ export class PhoneApp {
               !this.glasses.bridge ||
               !(await this.glasses.bridge.setLocalStorage(
                 "ocuclaw.connection",
-                JSON.stringify({ address, token }),
+                JSON.stringify({ address: endpointScope(address), token }),
               ))
             )
               throw Error("Подключение работает, но Even Hub не сохранил ключ");
-          } else if (this.glasses.bridge)
-            await this.glasses.bridge.setLocalStorage("ocuclaw.connection", "");
+          } else if (
+            this.glasses.bridge &&
+            !(await this.glasses.bridge.setLocalStorage(
+              "ocuclaw.connection",
+              "",
+            ))
+          )
+            throw Error("Even Hub не удалил ранее сохранённый ключ");
         });
       });
     this.bind("#forget", async () => {
-      await this.glasses.bridge?.setLocalStorage("ocuclaw.connection", "");
+      if (
+        !(await this.glasses.bridge?.setLocalStorage("ocuclaw.connection", ""))
+      )
+        throw Error("Even Hub не удалил сохранённое подключение");
       this.message("Сохранённое подключение удалено");
     });
     this.panel.querySelector<HTMLSelectElement>("#microphone")!.onchange = (

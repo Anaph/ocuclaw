@@ -1,4 +1,4 @@
-import { isSnapshot, randomId } from "./protocol";
+import { isQuestion, isSnapshot, randomId } from "./protocol";
 import type { Snapshot } from "./model";
 interface Timing {
   handshake: number;
@@ -35,6 +35,7 @@ export class Relay {
   private socketReady = false;
   private subscription: Promise<void> | null = null;
   private snapshot: Snapshot | null = null;
+  private snapshotEpoch = 0;
   private timing: Timing;
   capabilities: Record<string, any> = {};
   private observers = new Set<{
@@ -173,12 +174,18 @@ export class Relay {
         this.online &&
         frame.version === 1
       ) {
-        if (isSnapshot(frame.data)) {
-          this.snapshot = frame.data;
-          this.emitSnapshot(frame.data);
-        } else stop("Некорректный снимок Входящих");
+        if (!isSnapshot(frame.data)) {
+          stop("Некорректный снимок Входящих");
+          return;
+        }
+        void this.applySnapshot(frame.data, generation, socket).catch(
+          (error) => {
+            if (this.active(generation, socket)) stop(error.message);
+          },
+        );
       }
       if (frame.type === "ocuclaw.workspace.unavailable" && this.snapshot) {
+        this.snapshotEpoch++;
         this.snapshot = { ...this.snapshot, available: false };
         this.emitSnapshot(this.snapshot);
       }
@@ -258,9 +265,7 @@ export class Relay {
           this.terminal = true;
           throw Error("Некорректный снимок Входящих");
         }
-        this.snapshot = snapshot;
-        this.state(true);
-        this.emitSnapshot(snapshot);
+        await this.applySnapshot(snapshot, generation, socket);
       } catch (error) {
         if (!this.active(generation, socket)) return;
         this.state(false);
@@ -276,6 +281,80 @@ export class Relay {
       if (this.subscription === work) this.subscription = null;
     });
     return work;
+  }
+  async refreshInbox() {
+    const socket = this.socket;
+    const generation = this.generation;
+    if (!socket) throw Error("Workspace не подключён");
+    const snapshot = await this.request("inbox.snapshot");
+    await this.applySnapshot(snapshot, generation, socket);
+  }
+  private async applySnapshot(
+    raw: unknown,
+    generation: number,
+    socket: WebSocket,
+  ) {
+    if (!this.active(generation, socket)) return;
+    if (!isSnapshot(raw)) throw Error("Некорректный снимок Входящих");
+    const epoch = ++this.snapshotEpoch;
+    const current = () =>
+      epoch === this.snapshotEpoch && this.active(generation, socket);
+    const previous = this.snapshot;
+    if (
+      previous &&
+      Array.isArray(raw.authorizedNamespaces) &&
+      JSON.stringify(previous.authorizedNamespaces) !==
+        JSON.stringify(raw.authorizedNamespaces)
+    ) {
+      const admitted = (key: string) =>
+        raw.authorizedNamespaces!.includes(key.split(":")[1]);
+      this.snapshot = {
+        ...previous,
+        authorizedNamespaces: raw.authorizedNamespaces,
+        available: false,
+        pending: previous.pending.filter((item) => admitted(item.sessionKey)),
+        completed: previous.completed.filter((item) =>
+          admitted(item.sessionKey),
+        ),
+      };
+      this.emitSnapshot(this.snapshot);
+    }
+    const pending = new Map(raw.pending.map((item) => [item.id, item]));
+    let cursor = raw.pendingNextBefore;
+    let namespaces = raw.authorizedNamespaces;
+    let available = raw.available;
+    while (cursor && available && current()) {
+      const page = await this.send("inbox.pending", { before: cursor });
+      if (!current()) return;
+      if (!Array.isArray(page.pending) || !page.pending.every(isQuestion))
+        throw Error("Некорректная страница Входящих");
+      if (Array.isArray(page.authorizedNamespaces)) {
+        const allowed: string[] = page.authorizedNamespaces;
+        namespaces =
+          namespaces?.filter((ns) => allowed.includes(ns)) ?? allowed;
+      }
+      available = page.available === true;
+      for (const item of page.pending) pending.set(item.id, item);
+      const next = page.pendingNextBefore;
+      if (next && JSON.stringify(next) === JSON.stringify(cursor))
+        throw Error("Курсор Входящих не продвинулся");
+      cursor = next;
+    }
+    if (!current()) return;
+    const admitted = (key: string) =>
+      namespaces?.includes(key.split(":")[1]) ?? true;
+    this.snapshot = {
+      ...raw,
+      available,
+      authorizedNamespaces: namespaces,
+      pendingNextBefore: null,
+      pending: [...pending.values()].filter((item) =>
+        admitted(item.sessionKey),
+      ),
+      completed: raw.completed.filter((item) => admitted(item.sessionKey)),
+    };
+    this.state(true);
+    this.emitSnapshot(this.snapshot);
   }
   request(
     method: string,

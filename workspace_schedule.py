@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 
 from .management_profiles import management_profile_home
 from .stock_management import profile_context
+from .session_rpc import bounded_workspace_history
 
 
 class WorkspaceSchedule:
@@ -220,34 +220,7 @@ class WorkspaceSchedule:
                 raise ValueError("invalid_history_cursor")
             rows = rows[:index]
         limit = max(1, min(int(params.get("limit", 30)), 100))
-        page, used = [], 0
-        budget = 192 * 1024
-        for row in reversed(rows[-limit:]):
-            size = len(json.dumps(row, ensure_ascii=False).encode())
-            if size > budget:
-                content = row.get("content")
-                if isinstance(content, list):
-                    content = next(
-                        (
-                            block["text"]
-                            for block in content
-                            if isinstance(block, dict)
-                            and isinstance(block.get("text"), str)
-                        ),
-                        "",
-                    )
-                prefix = content[:24000] if isinstance(content, str) else ""
-                note = "[Длинное сообщение сокращено. Полный текст доступен в истории Hermes.]"
-                row = {
-                    "id": row.get("id"),
-                    "role": row["role"],
-                    "content": f"{prefix}\n\n{note}" if prefix else note,
-                }
-                size = len(json.dumps(row, ensure_ascii=False).encode())
-            if used + size > budget:
-                break
-            page.insert(0, row)
-            used += size
+        page = bounded_workspace_history(rows[-limit:])
         return {
             "messages": page,
             "hasMore": len(rows) > len(page),

@@ -1233,3 +1233,425 @@ test("live inbox updates preserve schedule input and externally answered questio
   await expect(page.locator("#phone-notice")).toContainText("Ответ уже дан");
   expect(calls.filter((x) => x.method === "inbox.answer")).toHaveLength(0);
 });
+
+test("a recovered approval names the previous decision while the new choice remains unsent", async ({
+  page,
+}) => {
+  const fixture = workspaceFixture();
+  const sent: any[] = [];
+  const checked: string[] = [];
+  fixture.replacePending([
+    {
+      id: "approval",
+      sessionKey: "hermes:main:a",
+      sessionTitle: "Проверка",
+      agentName: "Hermes",
+      kind: "permission",
+      question: "Разрешить тестовую команду?",
+      allowedDecisions: ["allow-once", "deny"],
+      expiresAtMs: null,
+      createdAtMs: Date.now(),
+    },
+  ]);
+  await page.routeWebSocket("ws://127.0.0.1:47801/**", (socket) =>
+    fixture.attach({
+      send: (text) => socket.send(text),
+      close: (options) => socket.close(options),
+      onMessage: (handle) =>
+        socket.onMessage((raw) => {
+          const frame = JSON.parse(String(raw));
+          if (frame.method === "inbox.answer") {
+            sent.push(frame.params);
+            return;
+          }
+          if (frame.method === "inbox.operation") {
+            checked.push(frame.params.operationId);
+            fixture.replyNext("inbox.operation", { status: "accepted" });
+          }
+          handle(raw);
+        }),
+    }),
+  );
+  await page.clock.install();
+  await connect(page);
+  await page.getByRole("button", { name: "Входящие", exact: true }).click();
+  await page.locator("#inbox-list button").click();
+  await page
+    .getByRole("button", { name: "Разрешить один раз", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
+  await expect.poll(() => sent.length).toBe(1);
+  await page.clock.fastForward(71000);
+  await page
+    .getByRole("button", { name: "Изменить / Назад", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Запретить", exact: true }).click();
+  await expect(page.locator("#phone-content")).toContainText(
+    "Выбранный сейчас ответ ещё не отправлен",
+  );
+  fixture.resolveExternal();
+  await page
+    .getByRole("button", { name: "Проверить отправку", exact: true })
+    .click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Принят предыдущий ответ",
+  );
+  expect(sent.map((frame) => frame.answer)).toEqual([
+    { decision: "allow-once" },
+  ]);
+  expect(checked).toEqual([sent[0].operationId]);
+});
+
+test("new attachments survive a previous receipt and changed payload requires a new operation", async ({
+  page,
+}) => {
+  const fixture = workspaceFixture();
+  let dropBeforeAdmission = false;
+  const sends: any[] = [];
+  await page.routeWebSocket("ws://127.0.0.1:47801/**", (socket) =>
+    fixture.attach({
+      send: (text) => socket.send(text),
+      close: (options) => socket.close(options),
+      onMessage: (handle) =>
+        socket.onMessage((raw) => {
+          const frame = JSON.parse(String(raw));
+          if (frame.method === "agent") {
+            sends.push(frame.params);
+            if (dropBeforeAdmission) {
+              dropBeforeAdmission = false;
+              void socket.close({ code: 1012, reason: "Before admission" });
+              return;
+            }
+          }
+          handle(raw);
+        }),
+    }),
+  );
+  await connect(page);
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  const composer = page.getByLabel("Сообщение Hermes");
+  const send = page
+    .locator("#compose-chat")
+    .getByRole("button", { name: "Отправить", exact: true });
+  const pick = (name: string) =>
+    page.locator("#files").setInputFiles({
+      name,
+      mimeType: "text/plain",
+      buffer: Buffer.from(name),
+    });
+  const remove = (name: string) =>
+    page.getByRole("button", { name: `${name} ×`, exact: true }).click();
+  const check = page.getByRole("button", {
+    name: "Проверить отправку",
+    exact: true,
+  });
+  const reconnected = () =>
+    expect(page.locator("#phone-status")).toContainText("● Hermes", {
+      timeout: 10000,
+    });
+
+  await composer.fill("Черновик");
+  await pick("original.txt");
+  fixture.dropNextReply("agent");
+  await send.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Соединение потеряно",
+  );
+  await reconnected();
+  await remove("original.txt");
+  await pick("replacement.txt");
+  await check.click();
+  await expect(
+    page.getByRole("button", { name: "replacement.txt ×", exact: true }),
+  ).toBeVisible();
+  await expect(composer).toHaveValue("Черновик");
+
+  dropBeforeAdmission = true;
+  await send.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Соединение потеряно",
+  );
+  await reconnected();
+  await remove("replacement.txt");
+  await pick("new.txt");
+  await check.click();
+  await send.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Восстановите исходный текст",
+  );
+  expect(sends).toHaveLength(2);
+  await page
+    .getByRole("button", { name: "Отменить старую отправку", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
+  await expect(composer).toHaveValue("Черновик");
+  await send.click();
+  await expect.poll(() => sends.length).toBe(3);
+  expect(sends[1].idempotencyKey).not.toBe(sends[2].idempotencyKey);
+});
+
+test("revocation cancels a captured schedule confirmation without retargeting the job", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  const job = {
+    id: "shared-id",
+    name: "Исходная задача",
+    state: "scheduled",
+    schedule: "0 9 * * *",
+  };
+  await connect(page);
+  await page.getByRole("button", { name: "Расписание", exact: true }).click();
+  fixture.replyNext("jobs.list", { jobs: [job] });
+  await page.locator("#job-profile").selectOption("research");
+  await page.getByRole("heading", { name: job.name, exact: true }).waitFor();
+  await page.getByRole("button", { name: "Пауза", exact: true }).click();
+  fixture.update({ authorizedNamespaces: ["main"], pending: [] });
+  await expect(page.locator("#job-profile")).toHaveCount(0);
+  await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Профиль задачи изменился",
+  );
+  expect(
+    fixture.calls.filter((frame) => frame.method === "jobs.pause"),
+  ).toHaveLength(0);
+});
+
+test("periodic refresh preserves the search and live prefix, terminal events clear the stream", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  await page.clock.install();
+  await connect(page);
+  const search = page.getByLabel("Поиск чатов");
+  await page.getByRole("button", { name: /Первый чат/ }).waitFor();
+  await search.fill("Незавершённый поиск");
+  const reads = fixture.calls.filter(
+    (frame) => frame.method === "sessions.list",
+  ).length;
+  await page.clock.fastForward(16000);
+  await expect
+    .poll(
+      () =>
+        fixture.calls.filter((frame) => frame.method === "sessions.list")
+          .length,
+    )
+    .toBeGreaterThan(reads);
+  await expect(search).toHaveValue("Незавершённый поиск");
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  const run = { sessionKey: "hermes:main:a", runId: "prefix-run" };
+  fixture.emit("streaming", { ...run, seq: 1, text: "Отчёт" });
+  await expect(page.locator(".streaming")).toContainText("Отчёт");
+  const subscriptions = fixture.calls.filter(
+    (frame) => frame.method === "chat.subscribe",
+  ).length;
+  await page.clock.fastForward(16000);
+  await expect
+    .poll(
+      () =>
+        fixture.calls.filter((frame) => frame.method === "chat.subscribe")
+          .length,
+    )
+    .toBeGreaterThan(subscriptions);
+  await expect(page.locator(".streaming")).toContainText("Отчёт");
+  fixture.emit("activity", { ...run, phase: "error" });
+  await expect(page.locator(".streaming")).toHaveCount(0);
+});
+
+test("G2 paginates cron conversation by cursor and clears a revoked full-text screen", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  const key = "hermes:research:x:cron:qa";
+  fixture.replaceCompleted([
+    {
+      id: "qa-result",
+      sessionKey: key,
+      sessionTitle: "Cron QA",
+      agentName: "Hermes",
+      summary: "Результат",
+      read: false,
+      createdAtMs: Date.now(),
+    },
+  ]);
+  await page.goto("/?preview=1&hud=1");
+  await page.locator("#connect [name=url]").fill("ws://127.0.0.1:47801/");
+  await page.locator("#connect [name=token]").fill("key");
+  await page.locator("#connect button").click();
+  await expect(page.locator("#connection")).toHaveText("VPS подключён");
+  await page.getByRole("button", { name: "Готово · 1", exact: true }).click();
+  await page.getByRole("button", { name: /Cron QA/ }).click();
+  fixture.replyNext("chat.history", {
+    messages: [{ id: 11, role: "assistant", content: "Новая запись" }],
+    hasMore: true,
+    nextBeforeId: 11,
+  });
+  await page
+    .getByRole("button", { name: "Открыть сессию", exact: true })
+    .click();
+  fixture.replyNext("chat.history", {
+    messages: [
+      { id: 10, role: "assistant", content: "Закрытая запись Research" },
+    ],
+    hasMore: false,
+    nextBeforeId: 10,
+  });
+  await page
+    .getByRole("button", { name: "Загрузить предыдущие", exact: true })
+    .click();
+  await page.getByRole("button", { name: /Закрытая запись Research/ }).click();
+  await expect(page.locator("#body")).toContainText("Закрытая запись Research");
+  fixture.update({
+    authorizedNamespaces: ["main"],
+    pending: [],
+    completed: [],
+  });
+  await expect(page.locator("#body")).not.toContainText(
+    "Закрытая запись Research",
+  );
+  await expect(page.locator("#title")).toHaveText("OcuClaw");
+});
+
+test("the phone keeps its older-results cursor across live snapshots", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  const item = (id: string, age: number) => ({
+    id,
+    sessionKey: "hermes:main:a",
+    sessionTitle: id,
+    agentName: "Hermes",
+    summary: id,
+    read: true,
+    createdAtMs: Date.now() - age,
+  });
+  const first = item("Первая страница", 1000),
+    second = item("Вторая страница", 2000),
+    third = item("Третья страница", 3000);
+  const cursor = ({ id, createdAtMs }: Completion) => ({ id, createdAtMs });
+  fixture.replaceCompleted([first]);
+  await connect(page);
+  await page.getByRole("button", { name: "Входящие", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Результаты · 0", exact: true })
+    .click();
+  const older = page.getByRole("button", {
+    name: "Предыдущие результаты",
+    exact: true,
+  });
+  fixture.update({ completedNextBefore: cursor(first) });
+  fixture.replyNext("inbox.completed", {
+    items: [second],
+    nextBefore: cursor(second),
+  });
+  await older.click();
+  await expect(
+    page.getByRole("heading", { name: second.id, exact: true }),
+  ).toBeVisible();
+  fixture.update({ completedNextBefore: cursor(first) });
+  fixture.replyNext("inbox.completed", { items: [third], nextBefore: null });
+  await older.click();
+  await expect(
+    page.getByRole("heading", { name: third.id, exact: true }),
+  ).toBeVisible();
+  expect(
+    fixture.calls
+      .filter((frame) => frame.method === "inbox.completed")
+      .map((frame) => frame.params.before),
+  ).toEqual([cursor(first), cursor(second)]);
+});
+
+test("the phone refreshes an open execution history and displays persisted registration errors", async ({
+  page,
+}) => {
+  const fixture = workspaceFixture();
+  const job = {
+    id: "job",
+    name: "Задача с ошибкой регистрации",
+    registration: "failed",
+    state: "scheduled",
+    schedule: "0 9 * * *",
+  };
+  let status = "running";
+  await page.routeWebSocket("ws://127.0.0.1:47801/**", (socket) =>
+    fixture.attach({
+      send: (text) => socket.send(text),
+      close: (options) => socket.close(options),
+      onMessage: (handle) =>
+        socket.onMessage((raw) => {
+          const frame = JSON.parse(String(raw));
+          if (frame.method === "jobs.list")
+            fixture.replyNext(frame.method, { jobs: [job] });
+          if (frame.method === "jobs.history")
+            fixture.replyNext(frame.method, {
+              history: [{ id: "run", jobId: job.id, status }],
+            });
+          handle(raw);
+        }),
+    }),
+  );
+  await page.clock.install();
+  await connect(page);
+  await page.getByRole("button", { name: "Расписание", exact: true }).click();
+  await expect(page.locator("#job-list")).toContainText("Ошибка регистрации");
+  await page.getByRole("button", { name: "История", exact: true }).click();
+  await expect(page.locator("#execution-list")).toContainText("Работает");
+  status = "completed";
+  await page.clock.fastForward(16000);
+  await expect(page.locator("#execution-list")).toContainText("Готово");
+  expect(
+    fixture.calls.filter((frame) => frame.method === "jobs.history"),
+  ).toHaveLength(2);
+});
+
+test("a pasted token is stripped from the saved address and a refused key deletion is visible", async ({
+  page,
+}) => {
+  await server(page);
+  await page.route("**/src/main.ts", (route) =>
+    route.fulfill({
+      contentType: "application/javascript",
+      body: `
+      import { Glasses } from "/src/glasses.ts";
+      import { Relay } from "/src/transport.ts";
+      import { InboxModel } from "/src/model.ts";
+      import { mountHud } from "/src/hud.ts";
+      import { PhoneApp } from "/src/phone.ts";
+      const root = document.querySelector("#app"), relay = new Relay(), inbox = new InboxModel();
+      const glasses = new Glasses(async () => ({
+        createStartUpPageContainer: async () => 1,
+        onEvenHubEvent: () => () => {},
+        getLocalStorage: async () => "",
+        setLocalStorage: async () => false
+      }));
+      const hudRoot = document.createElement("section"), phone = document.createElement("section");
+      hudRoot.hidden = true;
+      root.append(phone, hudRoot);
+      const hud = mountHud(relay, glasses, inbox, hudRoot);
+      new PhoneApp(phone, relay, glasses, inbox, hud, hudRoot);
+    `,
+    }),
+  );
+  await page.goto("/");
+  const settings = page.getByRole("button", { name: "Настройки", exact: true });
+  await settings.click();
+  await page
+    .locator("#phone-url")
+    .fill("ws://127.0.0.1:47801/?token=fixture-secret");
+  await page.locator("#phone-token").fill("key");
+  await page.locator("#phone-connect button").click();
+  await expect(page.locator("#phone-status")).toContainText("● Hermes");
+  expect(
+    await page.evaluate(() => localStorage.getItem("ocuclaw.server")),
+  ).toBe("ws://127.0.0.1:47801/");
+  await settings.click();
+  await page
+    .getByRole("button", {
+      name: "Забыть сохранённое подключение",
+      exact: true,
+    })
+    .click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Even Hub не удалил сохранённое подключение",
+  );
+});

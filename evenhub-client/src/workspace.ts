@@ -11,6 +11,12 @@ export interface Model {
   provider: string;
   name?: string;
 }
+interface ChatStream {
+  runId: string;
+  seq?: number;
+  text?: string;
+  content?: string;
+}
 export interface Message {
   id?: string | number;
   role: string;
@@ -26,6 +32,7 @@ export interface Job {
   nextRunAt?: string;
   lastExecution?: Execution;
   lastStatus?: string;
+  registration?: string;
   fields?: Record<string, unknown>;
   revision?: string;
 }
@@ -79,6 +86,7 @@ interface PendingSend {
   id: string;
   text: string;
   hadFiles: boolean;
+  fileIds?: string[];
   clearDraft?: boolean;
 }
 export interface SendAttempt {
@@ -86,8 +94,18 @@ export interface SendAttempt {
 }
 export interface AnswerAttempt {
   operationId?: string;
+  answer?: Answer;
 }
 const activeSends = new Set<string>();
+const fileIdentities = new WeakMap<File, string>();
+function fileId(file: File) {
+  let id = fileIdentities.get(file);
+  if (!id) {
+    id = randomId();
+    fileIdentities.set(file, id);
+  }
+  return id;
+}
 const terminalAnswers = new Set([
   "accepted",
   "rejected",
@@ -107,12 +125,14 @@ export class Workspace {
   hasMore = false;
   jobs: Job[] = [];
   history: Execution[] = [];
-  historyCursor: string | null = null;
+  historyCursor: string | { claimedAt: string; id: string } | null = null;
   private selectedProfile = "default";
   options: ScheduleOptions | null = null;
   liveText = "";
   liveRun = "";
   liveSeq = -1;
+  private liveRevision = 0;
+  private finishedRuns = new Set<string>();
   onChange = () => {};
   private chatEpoch = 0;
   private openingChat = "";
@@ -174,22 +194,41 @@ export class Workspace {
         const data = frame.data;
         if (data.sessionKey !== this.chatKey) return;
         if (frame.event === "streaming") {
-          const seq = typeof data.seq === "number" ? data.seq : 0;
-          if (data.runId !== this.liveRun) {
-            this.liveRun = data.runId;
-            this.liveSeq = -1;
-          }
-          if (seq < this.liveSeq) return;
-          this.liveSeq = seq;
-          this.liveText = String(data.text ?? data.content ?? "");
-          this.onChange();
+          this.applyStream(data);
         } else if (
           frame.event === "message" ||
           ["complete", "completed", "end", "error"].includes(data.phase)
-        )
+        ) {
+          if (data.runId && frame.event !== "message")
+            this.finishRun(data.runId);
+          if (data.runId && data.runId === this.liveRun) {
+            this.liveText = "";
+            this.liveRevision++;
+            this.onChange();
+          }
           void this.refreshChat().catch(() => {});
+        }
       },
     });
+  }
+  private finishRun(run: string) {
+    this.finishedRuns.add(run);
+    if (this.finishedRuns.size > 64)
+      this.finishedRuns.delete(this.finishedRuns.values().next().value!);
+  }
+  private applyStream(data: ChatStream) {
+    if (!data.runId || this.finishedRuns.has(data.runId)) return;
+    if (data.runId !== this.liveRun) {
+      if (this.liveRun) this.finishRun(this.liveRun);
+      this.liveRun = data.runId;
+      this.liveSeq = -1;
+    }
+    const seq = data.seq ?? 0;
+    if (seq < this.liveSeq) return;
+    this.liveSeq = seq;
+    this.liveText = String(data.text ?? data.content ?? "");
+    this.liveRevision++;
+    this.onChange();
   }
   reset(address: string) {
     this.generation++;
@@ -291,6 +330,8 @@ export class Workspace {
     this.liveText = "";
     this.liveRun = "";
     this.liveSeq = -1;
+    this.liveRevision++;
+    this.finishedRuns.clear();
   }
   async closeChat() {
     this.clearChat();
@@ -316,13 +357,14 @@ export class Workspace {
   async refreshChat(key = this.chatKey, renew = false) {
     if (!key || key !== this.chatKey || this.openingChat) return;
     const epoch = this.chatEpoch,
-      refresh = ++this.refreshEpoch;
+      refresh = ++this.refreshEpoch,
+      liveRevision = this.liveRevision;
     const data = await this.request(renew ? "chat.subscribe" : "chat.history", {
       sessionKey: key,
       limit: 30,
     });
     if (epoch !== this.chatEpoch || refresh !== this.refreshEpoch) return;
-    this.applyChatPage(data, false);
+    this.applyChatPage(data, false, liveRevision === this.liveRevision);
   }
   private applyChatPage(
     data: {
@@ -330,8 +372,10 @@ export class Workspace {
       hasMore?: boolean;
       nextBeforeId?: string | number | null;
       total?: number;
+      live?: ChatStream | null;
     },
     changed: boolean,
+    applyLive = true,
   ) {
     const page = data.messages || [];
     const first = page[0]?.id;
@@ -347,18 +391,15 @@ export class Workspace {
       this.nextBeforeId = hasMore ? (data.nextBeforeId ?? first ?? null) : null;
       this.hasMore = this.nextBeforeId !== null;
     }
-    if (
-      changed ||
-      (this.liveText &&
-        this.messages.some(
-          (x) =>
-            x.role === "assistant" &&
-            messageText(x.content).includes(this.liveText),
-        ))
-    ) {
+    if (changed) {
       this.liveText = "";
+      this.liveRun = "";
       this.liveSeq = -1;
-      if (changed) this.liveRun = "";
+      this.finishedRuns.clear();
+    }
+    if (applyLive && data.live !== undefined) {
+      if (data.live) this.applyStream(data.live);
+      else this.liveText = "";
     }
     this.onChange();
   }
@@ -426,6 +467,7 @@ export class Workspace {
     files: File[],
     key = this.chatKey,
     attempt?: SendAttempt,
+    currentFiles = () => files,
   ) {
     if (!key || (!text.trim() && !files.length))
       throw Error("Добавьте сообщение или вложение");
@@ -440,14 +482,14 @@ export class Workspace {
         this.pendingSend(key) ??
         (attempt?.pending?.text === text ? attempt.pending : undefined);
       if (prior) {
-        const receipt = await this.checkSend(key, prior);
+        const receipt = await this.checkSend(key, prior, currentFiles);
         if (
           attempt &&
           (receipt?.status === "accepted" || receipt?.status === "rejected")
         )
           attempt.pending = undefined;
         if (receipt?.status === "accepted") {
-          if (prior.text !== text || prior.hadFiles !== Boolean(files.length))
+          if (!this.matchesSend(prior, text, files))
             throw Error(
               "Предыдущее сообщение принято. Отправьте новый черновик отдельно.",
             );
@@ -461,16 +503,18 @@ export class Workspace {
           throw Error(
             "Предыдущая отправка не подтверждена. Проверьте историю и квитанцию.",
           );
-        if (prior.text !== text || prior.hadFiles !== Boolean(files.length))
+        if (!this.matchesSend(prior, text, files))
           throw Error(
             "Восстановите исходный текст и вложения перед повтором неподтверждённой отправки.",
           );
       }
+      const fileIds = files.map(fileId);
       for (const file of files) uploads.push(await this.upload(file));
       const pending = prior ?? {
         id: randomId(),
         text,
         hadFiles: files.length > 0,
+        ...(files.length ? { fileIds } : {}),
         clearDraft: this.chatKey === key,
       };
       if (attempt) attempt.pending = pending;
@@ -482,7 +526,7 @@ export class Workspace {
         uploadIds: uploads,
       });
       uploads.length = 0; // The relay consumed the staged files before dispatching.
-      this.applySendReceipt(key, pending, result);
+      this.applySendReceipt(key, pending, result, currentFiles());
       if (
         attempt &&
         (result.status === "accepted" || result.status === "rejected")
@@ -515,25 +559,62 @@ export class Workspace {
       return null;
     }
   }
-  async checkSend(key = this.chatKey, pending = this.pendingSend(key)) {
+  matchesSend(pending: PendingSend, text: string, files: File[]) {
+    return (
+      pending.text === text &&
+      (pending.hadFiles
+        ? pending.fileIds?.length === files.length &&
+          pending.fileIds.every(
+            (id, index) => fileIdentities.get(files[index]) === id,
+          )
+        : files.length === 0)
+    );
+  }
+  async discardUnsent(key: string, operationId: string) {
+    const storageKey = this.sendKey(key);
+    if (activeSends.has(storageKey)) throw Error("Сообщение уже отправляется");
+    activeSends.add(storageKey);
+    try {
+      const pending = this.pendingSend(key);
+      if (pending?.id !== operationId) throw Error("Операция изменилась");
+      const receipt = await this.checkSend(key, pending);
+      if (
+        receipt?.status !== "not_found" ||
+        this.pendingSend(key)?.id !== operationId
+      )
+        throw Error("Hermes больше не подтверждает отсутствие операции");
+      this.storage.removeItem(storageKey);
+    } finally {
+      activeSends.delete(storageKey);
+    }
+  }
+  async checkSend(
+    key = this.chatKey,
+    pending = this.pendingSend(key),
+    currentFiles = () => [] as File[],
+  ) {
     if (!pending) return null;
     const receipt = await this.outcome("workspace.send.receipt", {
       sessionKey: key,
       operationId: pending.id,
     });
-    this.applySendReceipt(key, pending, receipt);
+    this.applySendReceipt(key, pending, receipt, currentFiles());
     return receipt;
   }
   private applySendReceipt(
     key: string,
     pending: PendingSend,
     receipt: { status?: string },
+    files: File[],
   ) {
     if (this.pendingSend(key)?.id !== pending.id) return;
     if (receipt.status === "accepted" || receipt.status === "rejected")
       this.storage.removeItem(this.sendKey(key));
     if (receipt.status === "accepted") {
-      if (pending.clearDraft !== false && this.draft(key) === pending.text)
+      if (
+        pending.clearDraft !== false &&
+        this.matchesSend(pending, this.draft(key), files)
+      )
         this.saveDraft("", key);
       void this.refreshChat(key).catch(() => {});
     }
@@ -569,12 +650,23 @@ export class Workspace {
       );
   }
   answerAttempt(item: Question): AnswerAttempt {
-    return {
-      operationId: this.answerReceipt(
-        new ReceiptStore(sessionStorage, this.scope),
-        item,
-      )?.operationId,
-    };
+    const pending = this.answerReceipt(
+      new ReceiptStore(sessionStorage, this.scope),
+      item,
+    );
+    return { operationId: pending?.operationId, answer: pending?.answer };
+  }
+  isPreviousAnswer(attempt: AnswerAttempt, answer: Answer) {
+    return Boolean(
+      attempt.operationId &&
+        JSON.stringify(attempt.answer) !== JSON.stringify(answer),
+    );
+  }
+  prepareAnswerRetry(attempt: AnswerAttempt, answer: Answer) {
+    if (!this.isPreviousAnswer(attempt, answer)) return;
+    new ReceiptStore(sessionStorage, this.scope).clear(attempt.operationId!);
+    attempt.operationId = undefined;
+    attempt.answer = undefined;
   }
   async answer(item: Question, answer: Answer, attempt: AnswerAttempt = {}) {
     const store = new ReceiptStore(sessionStorage, this.scope);
@@ -582,14 +674,18 @@ export class Workspace {
     const pending = () => this.answerReceipt(store, item);
     const previous = pending();
     attempt.operationId ??= previous?.operationId;
+    attempt.answer ??= previous?.answer;
     if (previous && previous.operationId !== attempt.operationId)
       return { status: "uncertain" };
     const current = await this.checkAnswer(item, attempt);
     if (current.status !== "pending") return current;
     if (pending()?.operationId !== previous?.operationId)
       return { status: "uncertain" };
+    if (this.isPreviousAnswer(attempt, answer))
+      throw Error("Проверьте предыдущий ответ перед отправкой другого");
     const operationId = (attempt.operationId ??= randomId());
-    store.save({ ...identity, operationId });
+    attempt.answer = answer;
+    store.save({ ...identity, operationId, answer });
     const result = await this.outcome("inbox.answer", {
       ...identity,
       operationId,
@@ -598,12 +694,25 @@ export class Workspace {
     if (terminalAnswers.has(result.status)) store.clear(operationId);
     return result;
   }
+  scheduleGuard() {
+    const epoch = this.profileEpoch;
+    return () => {
+      if (epoch !== this.profileEpoch || !this.canRead(this.profile))
+        throw Error("Профиль задачи изменился или больше недоступен");
+    };
+  }
   async schedule(method: string, payload: Record<string, unknown> = {}) {
     const epoch = this.profileEpoch;
-    const result = await this.request(method, {
-      ...payload,
-      profileId: this.profile,
-    });
+    let result;
+    try {
+      result = await this.request(method, {
+        ...payload,
+        profileId: this.profile,
+      });
+    } catch (error) {
+      if (error instanceof Error) throw Error(errorText(error.message));
+      throw error;
+    }
     if (epoch !== this.profileEpoch) throw Error("Профиль изменился");
     return result;
   }
@@ -689,6 +798,7 @@ export class Workspace {
     params: Record<string, unknown>,
     reserved?: (operationId: string) => void,
   ) {
+    this.scheduleGuard()();
     const key = this.receiptKey(),
       profileId = this.profile;
     if (this.storage.getItem(key))

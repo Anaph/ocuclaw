@@ -57,6 +57,265 @@ class HermesWorkspaceTest(unittest.TestCase):
         self.assertEqual(result["status"], "saved", result)
         return result["job"], params
 
+    def test_native_clock_changes_and_reviewed_first_launch(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import hermes_time
+
+        config = Path(self.directory.name, "config.yaml")
+        config.write_text("timezone: Europe/Berlin\n")
+        zone = ZoneInfo("Europe/Berlin")
+        fields = {"name": "Daily", "prompt": "Test", "schedule": "0 9 * * *"}
+        for month, previous, transition in [(3, 28, 29), (10, 24, 25)]:
+            before = datetime(2026, month, previous, 9, 1, tzinfo=zone)
+            with (
+                patch.object(hermes_time, "now", return_value=before),
+                patch.object(self.jobs, "_hermes_now", return_value=before),
+            ):
+                preview = self.api.handle("automations.preview", {"fields": fields})[
+                    "preview"
+                ]
+                first = datetime.fromisoformat(preview["nextRuns"][0])
+                self.assertEqual((first.day, first.hour), (transition, 9))
+                self.assertEqual(
+                    [datetime.fromisoformat(x).hour for x in preview["nextRuns"]],
+                    [9] * 5,
+                )
+                result = self.api.handle(
+                    "automations.create",
+                    {
+                        "fields": fields,
+                        "reviewHash": preview["reviewHash"],
+                        "operationId": f"dst-{month}",
+                    },
+                )
+                self.assertEqual(result["job"]["nextRunAt"], preview["nextRuns"][0])
+            due = datetime(2026, month, transition, 9, tzinfo=zone)
+            with patch.object(self.jobs, "_hermes_now", return_value=due):
+                self.assertIn(
+                    result["job"]["id"], {job["id"] for job in self.jobs.get_due_jobs()}
+                )
+            self.jobs.remove_job(result["job"]["id"])
+        before = datetime(2027, 2, 1, 8, 59, 55, tzinfo=zone)
+        after = datetime(2027, 2, 1, 9, 0, 5, tzinfo=zone)
+        interval = {**fields, "schedule": "every 2h"}
+        with patch.object(hermes_time, "now", return_value=before):
+            preview = self.api.handle("automations.preview", {"fields": fields})[
+                "preview"
+            ]
+            cadence = self.api.handle("automations.preview", {"fields": interval})[
+                "preview"
+            ]
+            with self.assertRaisesRegex(ValueError, "nonexistent_local_time"):
+                self.api.handle(
+                    "automations.preview",
+                    {"fields": {**fields, "schedule": "2027-03-28T02:30:00"}},
+                )
+            with self.assertRaisesRegex(ValueError, "ambiguous_local_time"):
+                self.api.handle(
+                    "automations.preview",
+                    {"fields": {**fields, "schedule": "2027-10-31T02:30:00"}},
+                )
+            explicit = "2027-10-31T02:30:00+01:00"
+            exact = self.api.handle(
+                "automations.preview", {"fields": {**fields, "schedule": explicit}}
+            )["preview"]
+            self.assertEqual(exact["nextRuns"], [explicit])
+        with patch.object(hermes_time, "now", return_value=after):
+            expired = self.api.handle(
+                "automations.create",
+                {
+                    "fields": fields,
+                    "reviewHash": preview["reviewHash"],
+                    "operationId": "past-reviewed",
+                },
+            )
+            self.assertEqual(
+                expired, {"status": "rejected", "error": "preview_expired"}
+            )
+            result = self.api.handle(
+                "automations.create",
+                {
+                    "fields": interval,
+                    "reviewHash": cadence["reviewHash"],
+                    "operationId": "interval-reviewed",
+                },
+            )
+            self.assertEqual(result["job"]["nextRunAt"], cadence["nextRuns"][0])
+
+    def test_a_legacy_dst_shift_is_repaired_before_it_can_skip_an_occurrence(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        Path(self.directory.name, "config.yaml").write_text("timezone: Europe/Berlin\n")
+        zone = ZoneInfo("Europe/Berlin")
+        before = datetime(2026, 10, 24, 9, 1, tzinfo=zone)
+        with patch.object(self.jobs, "_hermes_now", return_value=before):
+            job = self.jobs.create_job(prompt="Legacy", schedule="0 9 * * *")
+            self.jobs.update_job(
+                job["id"], {"next_run_at": "2026-10-25T10:00:00+01:00"}
+            )
+        early = datetime(2026, 10, 25, 8, 59, tzinfo=zone)
+        with patch.object(self.jobs, "_hermes_now", return_value=early):
+            self.assertEqual(self.jobs.get_due_jobs(), [])
+            self.assertEqual(
+                self.jobs.get_job(job["id"])["next_run_at"], "2026-10-25T09:00:00+01:00"
+            )
+        due = datetime(2026, 10, 25, 9, tzinfo=zone)
+        with patch.object(self.jobs, "_hermes_now", return_value=due):
+            self.assertEqual(
+                [row["id"] for row in self.jobs.get_due_jobs()], [job["id"]]
+            )
+
+    def test_history_orders_instants_and_retains_rows_with_equal_claim_time(self):
+        from cron import executions
+        from datetime import datetime
+
+        job_id = self.jobs.create_job(prompt="Test", schedule="every 2h")["id"]
+        root = Path(self.directory.name, "cron", "output", job_id)
+        root.mkdir(parents=True)
+        expected = set()
+        for index in range(7):
+            instant = datetime.fromisoformat("2026-10-25T02:10:00+01:00")
+            with patch.object(executions, "_hermes_now", return_value=instant):
+                run = executions.create_execution(job_id, source="integration")
+            expected.add(run["id"])
+            file = root / f"{index}.md"
+            file.write_text("🧪" * 16000)
+            self.api.record_output(job_id, run["id"], file)
+        with patch.object(
+            executions,
+            "_hermes_now",
+            return_value=datetime.fromisoformat("2026-10-25T02:50:00+02:00"),
+        ):
+            earlier = executions.create_execution(job_id, source="integration")
+        seen = []
+        cursor = None
+        while True:
+            page = self.api.handle("jobs.history", {"jobId": job_id, "before": cursor})
+            seen.extend(row["id"] for row in page["history"])
+            cursor = page["nextBefore"]
+            if cursor is None:
+                break
+            self.assertLess(len(seen), 9)
+        self.assertEqual(seen[-1], earlier["id"])
+        self.assertEqual(set(seen[:-1]), expected)
+        self.assertEqual(len(seen), 8)
+        row, = self.jobs.workspace_snapshot()
+        self.assertEqual(row["latest_execution"]["id"], seen[0])
+
+    def test_repeated_local_hour_has_independent_native_output_and_session_ids(self):
+        from cron import executions, scheduler
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from contextlib import ExitStack
+
+        root = Path(self.directory.name)
+        scripts = root / "scripts"
+        scripts.mkdir()
+        script = scripts / "probe.py"
+        zone = ZoneInfo("Europe/Berlin")
+        job = self.jobs.create_job(
+            prompt="", schedule="every 2h", script=script.name, no_agent=True
+        )
+        agent_job = self.jobs.create_job(prompt="Test", schedule="every 2h")
+        ids, agent_ids = [], []
+        for fold in (0, 1):
+            clock = datetime(2027, 10, 31, 2, 20, tzinfo=zone, fold=fold)
+            script.write_text(f"print('Result {fold}')\n")
+            with ExitStack() as stack:
+                for module in (self.jobs, scheduler, executions):
+                    stack.enter_context(
+                        patch.object(module, "_hermes_now", return_value=clock)
+                    )
+                row = executions.create_execution(job["id"], source="integration")
+                ids.append(row["id"])
+                with patch.dict(
+                    os.environ, {"_HERMES_CRON_EXTERNAL_WORKER": row["id"]}
+                ):
+                    self.assertTrue(
+                        scheduler.run_one_job({**job, "execution_id": row["id"]})
+                    )
+                row = executions.create_execution(agent_job["id"], source="integration")
+                agent_ids.append(row["id"])
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {"run_agent": types.SimpleNamespace(AIAgent=object)},
+                    ),
+                    patch.multiple(
+                        scheduler,
+                        _prepare_job_prompt=lambda *a: (None, "Test"),
+                        _load_cron_job_config=lambda *a: types.SimpleNamespace(
+                            cfg={}, model="test"
+                        ),
+                        _resolve_cron_agent_setup=lambda *a: types.SimpleNamespace(
+                            blocked=None, model="test"
+                        ),
+                        _open_cron_session_db=lambda *a: None,
+                        _construct_cron_agent=lambda *a, **kw: object(),
+                        _run_agent_with_watchdog=lambda *a, **kw: {},
+                        _final_response_from_result=lambda *a: "Test model result",
+                        _teardown_cron_agent=lambda *a: None,
+                    ),
+                    patch.dict(os.environ, {"_HERMES_CRON_EXTERNAL_WORKER": row["id"]}),
+                ):
+                    self.assertTrue(
+                        scheduler.run_one_job({**agent_job, "execution_id": row["id"]})
+                    )
+        history = {
+            row["id"]: row
+            for row in self.api.handle("jobs.history", {"jobId": job["id"]})["history"]
+        }
+        self.assertIn("Result 0", history[ids[0]]["summary"])
+        self.assertIn("Result 1", history[ids[1]]["summary"])
+        self.assertEqual(
+            len(list((root / "cron" / "output" / job["id"]).glob("*.md"))), 2
+        )
+        history = {
+            row["id"]: row
+            for row in self.api.handle("jobs.history", {"jobId": agent_job["id"]})[
+                "history"
+            ]
+        }
+        keys = [history[run]["sessionId"] for run in agent_ids]
+        self.assertEqual(len(set(keys)), 2)
+        for run, key in zip(agent_ids, keys):
+            self.assertEqual(self.api.binding_for_session(key)["execution"], run)
+
+    def test_failed_registration_is_visible_in_persisted_schedule(self):
+        from cron import scheduler_provider
+
+        def fail(_):
+            raise RuntimeError("test provider refused registration")
+
+        provider = types.SimpleNamespace(
+            name="test", register_job=fail, on_jobs_changed=lambda: None
+        )
+        with patch.object(
+            scheduler_provider, "resolve_cron_scheduler", return_value=provider
+        ):
+            fields = {"name": "Task", "prompt": "Test", "schedule": "every 2h"}
+            preview = self.api.handle("automations.preview", {"fields": fields})[
+                "preview"
+            ]
+            result = self.api.handle(
+                "automations.create",
+                {
+                    "fields": fields,
+                    "reviewHash": preview["reviewHash"],
+                    "operationId": "registration",
+                },
+            )
+        self.assertEqual(result["registration"], "failed")
+        self.assertEqual(
+            self.api.handle("jobs.list", {})["jobs"][0]["registration"], "failed"
+        )
+        self.assertEqual(
+            self.api.handle("automations.receipt", {"operationId": "registration"}),
+            result,
+        )
+
     def test_native_crud_replay_revision_and_server_clock(self):
         job, params = self.create()
         self.assertEqual(

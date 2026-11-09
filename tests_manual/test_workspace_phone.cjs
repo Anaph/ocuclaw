@@ -51,3 +51,39 @@ const {createHermesGatewayBridge}=require('../dist-cjs/runtime/hermes-gateway-br
  assert.deepEqual(events, ['hermes:main:b']);
  service.close();
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+(async () => {
+ const listeners = new Map();
+ const frames = [];
+ let finishHistory;
+ const service = createWorkspaceService({
+   bridge: {
+     on(name, listener) {
+       listeners.set(name, listener);
+       return () => listeners.delete(name);
+     },
+     request: () => new Promise((resolve) => { finishHistory = resolve; }),
+   },
+   send: (_, event) => frames.push(event),
+ });
+ try {
+   const sessionKey = 'hermes:main:a';
+   const request = () => service.request('phone', {
+     version: 1, id: 'subscribe', method: 'chat.subscribe', params: { sessionKey },
+   });
+   const first = request();
+   const live = { sessionKey, runId: 'run', seq: 7, text: 'Partial reply' };
+   listeners.get('streaming')(live);
+   finishHistory({ messages: [] });
+   assert.deepEqual(JSON.parse((await first).unicast).data.live, live);
+   listeners.get('activity')({ sessionKey, runId: 'run', phase: 'error' });
+   listeners.get('streaming')({ ...live, seq: 8 });
+   const second = request();
+   finishHistory({ messages: [] });
+   assert.equal(JSON.parse((await second).unicast).data.live, null);
+   assert.equal(frames[0].event, 'activity');
+   console.log('test_workspace_live_resume OK');
+ } finally {
+   service.close();
+ }
+})().catch(error=>{console.error(error);process.exitCode=1;});

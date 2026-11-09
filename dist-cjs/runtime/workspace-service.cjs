@@ -6,10 +6,35 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
   const chatSubscribers = new Map();
   const pendingChatSubscriptions = new Map();
   const uploads = createWorkspaceUploads(now);
+  const liveChats = new Map();
+  const finishedRuns = new Map();
+  const liveLease = 120000;
+  function remember(map, key, value, max) {
+    map.delete(key);
+    map.set(key, value);
+    if (map.size > max) map.delete(map.keys().next().value);
+  }
+  function trackChat(name, data) {
+    const key = data.sessionKey, run = data.runId, at = now();
+    const prior = liveChats.get(key);
+    const terminal = name === "activity" &&
+      ["complete", "completed", "end", "error"].includes(data.phase);
+    if (terminal && run) remember(finishedRuns, run, at + liveLease, 256);
+    if ((name === "message" || terminal) && prior?.data.runId === run)
+      liveChats.delete(key);
+    if (name !== "streaming" || !run || (finishedRuns.get(run) ?? 0) > at)
+      return;
+    if (prior?.data.runId === run && (prior.data.seq ?? 0) > (data.seq ?? 0))
+      return;
+    if (prior && prior.data.runId !== run)
+      remember(finishedRuns, prior.data.runId, at + liveLease, 256);
+    remember(liveChats, key, { data, until: at + liveLease }, 64);
+  }
   const off = ["streaming", "message", "activity"]
     .map((name) =>
       bridge.on?.(name, (data) => {
         if (!data || typeof data.sessionKey !== "string") return;
+        trackChat(name, data);
         for (const [id, sub] of chatSubscribers)
           if (sub.until >= now() && sub.key === data.sessionKey)
             send(id, {
@@ -26,6 +51,7 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
   const allowed = new Set([
     "inbox.snapshot",
     "inbox.completed",
+    "inbox.pending",
     "inbox.get",
     "inbox.answer",
     "inbox.operation",
@@ -131,8 +157,12 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         if (sub.until < now() || revoked(sub)) chatSubscribers.delete(id);
       for (const [id, sub] of pendingChatSubscriptions)
         if (revoked(sub)) pendingChatSubscriptions.delete(id);
+      for (const [key, entry] of liveChats)
+        if (entry.until < now() || revoked({ key })) liveChats.delete(key);
       const fingerprint = JSON.stringify([
         data.pending,
+        data.pendingNextBefore,
+        data.pendingRevision,
         data.completed,
         data.available,
         data.unreadCompleted,
@@ -244,7 +274,7 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
             /:x:cron:/.test(p.sessionKey)
               ? "workspace.cron.history"
               : "chat.history",
-            { sessionKey: p.sessionKey, limit: 30 },
+            { sessionKey: p.sessionKey, limit: 30, workspaceBounded: true },
           );
           if (
             pendingChatSubscriptions.get(clientId) === subscription &&
@@ -252,6 +282,8 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
           ) {
             subscription.until = now() + 45000;
             chatSubscribers.set(clientId, subscription);
+            const latest = liveChats.get(subscription.key);
+            return reply({ ...history, live: latest?.until >= now() ? latest.data : null });
           }
           return reply(history);
         } finally {
@@ -361,6 +393,8 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
         }
         return reply({ key });
       }
+      if (frame.method === "chat.history")
+        return reply(await bridge.request(frame.method, { ...p, workspaceBounded: true }));
       if (!allowed.has(frame.method)) throw Error("unsupported_operation");
       return reply(await bridge.request(frame.method, p));
     } catch (error) {
@@ -380,6 +414,8 @@ function createWorkspaceService({ bridge, sessions, send, now = Date.now }) {
       for (const unsubscribe of off) unsubscribe();
       chatSubscribers.clear();
       pendingChatSubscriptions.clear();
+      liveChats.clear();
+      finishedRuns.clear();
       uploads.close();
       titleQueue.clear();
       titles.clear();

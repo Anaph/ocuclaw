@@ -148,6 +148,31 @@ def _paginate_conversation(messages, after_id, before_id, limit):
     }
 
 
+def bounded_workspace_history(rows):
+    """Fit one Workspace page in the control link, retaining its oldest cursor."""
+    budget = 192 * 1024
+    result = []
+    used = 0
+    for row in reversed(rows):
+        size = len(json.dumps(row, ensure_ascii=False).encode())
+        if size > budget:
+            content = row.get("content")
+            if isinstance(content, list):
+                content = next(
+                    (part["text"] for part in content if isinstance(part, dict)
+                     and isinstance(part.get("text"), str)), ""
+                )
+            prefix = content[:24000] if isinstance(content, str) else ""
+            note = "[Длинное сообщение сокращено. Полный текст доступен в истории Hermes.]"
+            row = {**row, "content": f"{prefix}\n\n{note}" if prefix else note}
+            size = len(json.dumps(row, ensure_ascii=False).encode())
+        if used + size > budget:
+            break
+        result.append(row)
+        used += size
+    return list(reversed(result))
+
+
 def _is_stale_schema_error(exc: BaseException) -> bool:
     """True for the two errors a store behind ``SCHEMA_SQL`` raises at prepare
     time: a missing table and a missing column."""
@@ -1268,7 +1293,13 @@ class SessionRpc:
             "sessionId": tip,
             "total": total,
         }
-        if before_id is not None:
+        if p.get("workspaceBounded") is True:
+            bounded = bounded_workspace_history(result["messages"])
+            result["messages"] = bounded
+            result["hasMore"] = page["hasMore"] or len(bounded) < len(page["messages"])
+            if bounded and bounded[0].get("id") is not None:
+                result["nextBeforeId"] = bounded[0]["id"]
+        elif before_id is not None:
             result["hasMore"] = page["hasMore"]
             if page["nextBeforeId"] is not None:
                 result["nextBeforeId"] = page["nextBeforeId"]

@@ -18,6 +18,7 @@ from pathlib import Path
 
 RETENTION_MS = 7 * 86400 * 1000
 RESULT_PAGE_BYTES = 192 * 1024
+PENDING_PAGE_BYTES = 192 * 1024
 
 
 async def resolved(value):
@@ -74,8 +75,14 @@ class Inbox:
         ):
             return
         with self._lock, self.db:
+            sql = "INSERT OR IGNORE INTO completions (id,created,payload,read,namespace) VALUES (?,?,?,0,?)"
+            if item["id"].startswith("cron-result:"):
+                sql += (
+                    " ON CONFLICT(id) DO UPDATE SET payload=excluded.payload "
+                    "WHERE namespace=excluded.namespace AND payload<>excluded.payload"
+                )
             self.db.execute(
-                "INSERT OR IGNORE INTO completions (id,created,payload,read,namespace) VALUES (?,?,?,0,?)",
+                sql,
                 (
                     item["id"],
                     min(self.now(), int(item.get("createdAtMs") or self.now())),
@@ -105,30 +112,105 @@ class Inbox:
             self.db.execute("DELETE FROM completions WHERE created < ?", (cutoff,))
             self.db.execute("DELETE FROM operations WHERE created < ?", (cutoff,))
 
+    @staticmethod
+    def _question_key(item):
+        expires = item.get("expiresAtMs")
+        return (
+            expires if expires is not None else 2**53 - 1,
+            item.get("createdAtMs", 0),
+            item["id"],
+        )
+
+    @staticmethod
+    def _wire_question(item):
+        if len(json.dumps(item, ensure_ascii=False).encode("utf-8")) <= 420 * 1024:
+            return item
+        projected = dict(item)
+        for field in ("question", "permissionCommand", "permissionDescription"):
+            value = projected.get(field)
+            if isinstance(value, str) and len(value) > 24000:
+                projected[field] = value[:24000] + "…"
+        choices = projected.get("choices")
+        if choices:
+            limit = max(20, 12000 // len(choices))
+            projected["choices"] = [
+                value if len(value) <= limit else value[:limit] + "…"
+                for value in choices
+            ]
+        if projected.get("kind") == "permission":
+            projected["question"] = (
+                "Запрос слишком длинный. Проверьте полное действие в Hermes."
+            )
+            projected["allowedDecisions"] = [
+                decision
+                for decision in projected.get("allowedDecisions", [])
+                if decision == "deny"
+            ]
+        return projected
+
+    async def _source_pending(self):
+        try:
+            return await resolved(await asyncio.to_thread(self.source.snapshot)), True
+        except Exception:
+            return [], False
+
+    def _pending_page(self, items, available, now, allowed, before=None):
+        if before is not None and (
+            not isinstance(before, list)
+            or len(before) != 3
+            or any(type(value) is not int for value in before[:2])
+            or not isinstance(before[2], str)
+        ):
+            raise ValueError("invalid_question_cursor")
+        live = sorted(
+            (
+                item
+                for item in items
+                if (allowed is None or self._namespace(item["sessionKey"]) in allowed)
+                and (item.get("expiresAtMs") is None or item["expiresAtMs"] > now)
+            ),
+            key=self._question_key,
+        )
+        revision = (
+            hashlib.sha256(
+                json.dumps(
+                    live, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+            if before is None
+            else None
+        )
+        rows = []
+        used = 0
+        next_before = None
+        for item in live:
+            if before is not None and self._question_key(item) <= tuple(before):
+                continue
+            projected = self._wire_question(item)
+            size = len(json.dumps(projected, ensure_ascii=False).encode("utf-8"))
+            if rows and (len(rows) == 250 or used + size > PENDING_PAGE_BYTES):
+                next_before = list(self._question_key(rows[-1]))
+                break
+            rows.append(projected)
+            used += size
+        return {
+            "pending": rows,
+            "pendingNextBefore": next_before,
+            "pendingRevision": revision,
+            "authorizedNamespaces": allowed,
+            "available": available,
+        }
+
+    async def pending(self, params):
+        items, available = await self._source_pending()
+        allowed = self._scope()[1] if hasattr(self.source, "namespaces") else None
+        return self._pending_page(
+            items, available, self.now(), allowed, params.get("before")
+        )
+
     async def snapshot(self, _params=None):
         self._prune()
-        try:
-            items = await resolved(await asyncio.to_thread(self.source.snapshot))
-            available = True
-        except Exception:
-            items, available = [], False
-        now = self.now()
-        pending = [
-            dict(x)
-            for x in items
-            if x.get("expiresAtMs") is None or x["expiresAtMs"] > now
-        ]
-        for item in pending:
-            self._known[item["id"]] = item
-        while len(self._known) > 4096:
-            self._known.pop(next(iter(self._known)))
-        pending.sort(
-            key=lambda x: (
-                x.get("expiresAtMs") or float("inf"),
-                x.get("createdAtMs", 0),
-                x["id"],
-            )
-        )
+        items, available = await self._source_pending()
         collect = getattr(self.source, "completions", None)
         if collect:
             try:
@@ -136,16 +218,24 @@ class Inbox:
                     self.completion(result)
             except Exception:
                 pass  # Pending questions remain usable if result storage is temporarily unavailable.
-        done = await self.completed({})
+        scope = self._scope()
+        allowed = scope[1] if hasattr(self.source, "namespaces") else None
+        now = self.now()
+        pending = self._pending_page(items, available, now, allowed)
+        for item in items:
+            if allowed is None or self._namespace(item["sessionKey"]) in allowed:
+                self._known[item["id"]] = {
+                    "sessionKey": item["sessionKey"],
+                    "expiresAtMs": item.get("expiresAtMs"),
+                }
+        while len(self._known) > 4096:
+            self._known.pop(next(iter(self._known)))
+        done = self._completed({}, scope)
         return {
+            **pending,
             "version": 1,
             "observedAtMs": now,
-            "available": available,
             "capabilities": self.source.capabilities(),
-            "authorizedNamespaces": self._scope()[1]
-            if hasattr(self.source, "namespaces")
-            else None,
-            "pending": pending,
             "completed": done["items"],
             "completedNextBefore": done["nextBefore"],
             "completedTotal": done["total"],
@@ -154,10 +244,13 @@ class Inbox:
 
     async def completed(self, params):
         self._prune()
+        return self._completed(params, self._scope())
+
+    def _completed(self, params, scope_info):
         before = params.get("before")
         identity = params.get("id")
         session_key = params.get("sessionKey")
-        scope, scope_args = self._scope()
+        scope, scope_args = scope_info
         if identity is not None or session_key is not None:
             if before is not None or not all(
                 isinstance(value, str) and 0 < len(value) <= 512
@@ -218,11 +311,26 @@ class Inbox:
         return {"items": items, "total": total, "unread": unread, "nextBefore": cursor}
 
     async def get(self, params):
+        reply = await self._get(params)
+        if reply["status"] == "pending":
+            reply["item"] = self._wire_question(reply["item"])
+        return reply
+
+    async def _get(self, params):
+        key = params.get("sessionKey")
+        if not isinstance(key, str) or (
+            hasattr(self.source, "namespaces")
+            and self._namespace(key) not in self._scope()[1]
+        ):
+            return {"status": "not_found"}
         try:
             item = await resolved(self.source.get(str(params.get("id") or "")))
         except Exception:
             return {"status": "source_unavailable"}
-        if item and item.get("sessionKey") != params.get("sessionKey"):
+        if (item and item.get("sessionKey") != key) or (
+            hasattr(self.source, "namespaces")
+            and self._namespace(key) not in self._scope()[1]
+        ):
             return {"status": "not_found"}
         if not item:
             known = self._known.get(str(params.get("id") or ""))
@@ -235,7 +343,10 @@ class Inbox:
             ):
                 return {"status": "expired"}
             return {"status": "already_answered" if known else "not_found"}
-        self._known[item["id"]] = dict(item)
+        self._known[item["id"]] = {
+            "sessionKey": key,
+            "expiresAtMs": item.get("expiresAtMs"),
+        }
         if item.get("expiresAtMs") is not None and item["expiresAtMs"] <= self.now():
             return {"status": "expired"}
         return {"status": "pending", "item": item}
@@ -269,7 +380,7 @@ class Inbox:
                     raise ValueError("operation_identity_conflict")
                 return json.loads(row[1])
             try:
-                current = await self.get({"id": item_id, "sessionKey": key})
+                current = await self._get({"id": item_id, "sessionKey": key})
             except Exception:
                 return {"status": "source_unavailable"}
             if current["status"] != "pending":
@@ -337,6 +448,7 @@ class Inbox:
     def handlers(self):
         return {
             "inbox.snapshot": self.snapshot,
+            "inbox.pending": self.pending,
             "inbox.completed": self.completed,
             "inbox.get": self.get,
             "inbox.answer": self.answer,
