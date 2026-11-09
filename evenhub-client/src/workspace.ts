@@ -65,7 +65,19 @@ interface PendingSend {
   id: string;
   text: string;
   hadFiles: boolean;
+  clearDraft?: boolean;
 }
+export interface SendAttempt {
+  pending?: PendingSend;
+}
+const activeSends = new Set<string>();
+const terminalAnswers = new Set([
+  "accepted",
+  "rejected",
+  "already_answered",
+  "expired",
+  "not_found",
+]);
 export class Workspace {
   scope = "";
   generation = 0;
@@ -88,7 +100,6 @@ export class Workspace {
   private chatEpoch = 0;
   private openingChat = "";
   private refreshEpoch = 0;
-  private sends = new Set<string>();
   private catalogProfile = "";
   private catalogEpoch = 0;
   private listEpoch = 0;
@@ -377,19 +388,31 @@ export class Workspace {
       throw error;
     }
   }
-  async send(text: string, files: File[]) {
-    const key = this.chatKey;
+  async send(
+    text: string,
+    files: File[],
+    key = this.chatKey,
+    attempt?: SendAttempt,
+  ) {
     if (!key || (!text.trim() && !files.length))
       throw Error("Добавьте сообщение или вложение");
     const operationKey = this.sendKey(key);
-    if (this.sends.has(operationKey)) throw Error("Сообщение уже отправляется");
-    this.sends.add(operationKey);
+    if (activeSends.has(operationKey))
+      throw Error("Сообщение уже отправляется");
+    activeSends.add(operationKey);
     const generation = this.generation;
     const uploads: string[] = [];
     try {
-      const prior = this.pendingSend(key);
+      const prior =
+        this.pendingSend(key) ??
+        (attempt?.pending?.text === text ? attempt.pending : undefined);
       if (prior) {
-        const receipt = await this.checkSend(key);
+        const receipt = await this.checkSend(key, prior);
+        if (
+          attempt &&
+          (receipt?.status === "accepted" || receipt?.status === "rejected")
+        )
+          attempt.pending = undefined;
         if (receipt?.status === "accepted") {
           if (prior.text !== text || prior.hadFiles !== Boolean(files.length))
             throw Error(
@@ -411,11 +434,13 @@ export class Workspace {
           );
       }
       for (const file of files) uploads.push(await this.upload(file));
-      const pending = {
-        id: prior?.id || randomId(),
+      const pending = prior ?? {
+        id: randomId(),
         text,
         hadFiles: files.length > 0,
+        clearDraft: this.chatKey === key,
       };
+      if (attempt) attempt.pending = pending;
       this.storage.setItem(operationKey, JSON.stringify(pending));
       const result = await this.outcome("agent", {
         sessionKey: key,
@@ -425,6 +450,11 @@ export class Workspace {
       });
       uploads.length = 0; // The relay consumed the staged files before dispatching.
       this.applySendReceipt(key, pending, result);
+      if (
+        attempt &&
+        (result.status === "accepted" || result.status === "rejected")
+      )
+        attempt.pending = undefined;
       if (result.status !== "accepted")
         throw Error(
           errorText(
@@ -433,7 +463,7 @@ export class Workspace {
         );
       return result;
     } finally {
-      this.sends.delete(operationKey);
+      activeSends.delete(operationKey);
       if (generation === this.generation)
         for (const id of uploads)
           void this.request("uploads.cancel", { id }).catch(() => {});
@@ -449,8 +479,7 @@ export class Workspace {
       return null;
     }
   }
-  async checkSend(key = this.chatKey) {
-    const pending = this.pendingSend(key);
+  async checkSend(key = this.chatKey, pending = this.pendingSend(key)) {
     if (!pending) return null;
     const receipt = await this.outcome("workspace.send.receipt", {
       sessionKey: key,
@@ -468,30 +497,50 @@ export class Workspace {
     if (receipt.status === "accepted" || receipt.status === "rejected")
       this.storage.removeItem(this.sendKey(key));
     if (receipt.status === "accepted") {
-      if (this.draft(key) === pending.text) this.saveDraft("", key);
+      if (pending.clearDraft !== false && this.draft(key) === pending.text)
+        this.saveDraft("", key);
       void this.refreshChat(key).catch(() => {});
     }
   }
   async answer(item: Question, answer: Answer) {
-    const current = await this.request("inbox.get", {
-      id: item.id,
-      sessionKey: item.sessionKey,
-    });
-    if (current.status !== "pending") throw Error(statusText(current.status));
-    const store = new ReceiptStore(sessionStorage, this.scope),
-      operationId = randomId();
-    store.save({ id: item.id, sessionKey: item.sessionKey, operationId });
+    const store = new ReceiptStore(sessionStorage, this.scope);
+    const identity = { id: item.id, sessionKey: item.sessionKey };
+    const pending = () =>
+      store
+        .list()
+        .find(
+          (entry) =>
+            entry.id === identity.id &&
+            entry.sessionKey === identity.sessionKey,
+        );
+    const previous = pending();
+    if (previous) {
+      const receipt = await this.outcome("inbox.operation", {
+        operationId: previous.operationId,
+      });
+      if (receipt.status !== "not_found") {
+        if (terminalAnswers.has(receipt.status))
+          store.clear(previous.operationId);
+        return receipt;
+      }
+    }
+    const current = await this.request("inbox.get", identity);
+    if (current.status !== "pending") {
+      if (previous && terminalAnswers.has(current.status))
+        store.clear(previous.operationId);
+      return current;
+    }
+    if (pending()?.operationId !== previous?.operationId)
+      return { status: "uncertain" };
+    const operationId = previous?.operationId ?? randomId();
+    store.save({ ...identity, operationId });
     const result = await this.outcome("inbox.answer", {
-      id: item.id,
-      sessionKey: item.sessionKey,
+      ...identity,
       operationId,
       answer,
     });
-    if (result.status !== "uncertain") store.clear();
-    if (result.status !== "accepted")
-      throw Error(
-        result.error ? errorText(result.error) : statusText(result.status),
-      );
+    if (terminalAnswers.has(result.status)) store.clear(operationId);
+    return result;
   }
   async schedule(method: string, payload: Record<string, unknown> = {}) {
     const epoch = this.profileEpoch;

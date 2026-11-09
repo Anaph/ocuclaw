@@ -12,8 +12,13 @@ import {
   type Snapshot,
 } from "./model";
 import { Relay } from "./transport";
-import { ReceiptStore, endpointScope, randomId, isSnapshot } from "./protocol";
-import { Workspace, type Job, type ScheduleFields } from "./workspace";
+import { ReceiptStore, endpointScope, isSnapshot } from "./protocol";
+import {
+  Workspace,
+  type Job,
+  type ScheduleFields,
+  type SendAttempt,
+} from "./workspace";
 import { Glasses, wavBase64 } from "./glasses";
 type Screen =
   | "jobs"
@@ -62,7 +67,7 @@ export function mountHud(
     confirmReturn: Screen = "question";
   type Target =
     | { kind: "question"; id: string; key: string }
-    | { kind: "message"; key: string; context?: string }
+    | { kind: "message"; key: string; context?: string; attempt?: SendAttempt }
     | { kind: "rename"; key: string }
     | { kind: "search" }
     | { kind: "schedule" };
@@ -84,7 +89,7 @@ export function mountHud(
     positions = new Map<string, string>(),
     stopping = new Set<string>();
   let choices = new Set<number>();
-  const scheduleData = new Workspace(relay, model);
+  const workspace = new Workspace(relay, model);
   let currentJob: Job | null = null;
   let connectionGeneration = 0,
     connectionScope = "",
@@ -95,7 +100,7 @@ export function mountHud(
   }
   function resetConnection(scope: string) {
     connectionGeneration++;
-    scheduleData.reset(scope);
+    workspace.reset(scope);
     currentJob = null;
     connectionScope = scope;
     notice = "";
@@ -232,12 +237,6 @@ export function mountHud(
   function questionAnswer(answer: Answer) {
     const item = q();
     if (!item || !canSend(item)) return message("Вопрос уже не актуален");
-    const bound = {
-      id: item.id,
-      sessionKey: item.sessionKey,
-      operationId: randomId(),
-      answer,
-    };
     const shown =
       "text" in answer
         ? answer.text
@@ -247,26 +246,16 @@ export function mountHud(
     confirm(
       `${item.agentName} / ${item.sessionTitle}\n\nОтправить: «${shown}»?`,
       async () => {
-        const fresh = await relay.request("inbox.get", {
-          id: bound.id,
-          sessionKey: bound.sessionKey,
-        });
-        if (fresh.status !== "pending") {
+        const reply = await workspace.answer(item, answer);
+        if (
+          ["accepted", "already_answered", "expired", "not_found"].includes(
+            reply.status,
+          )
+        ) {
           go("pending");
-          return message(statusLabel(fresh.status));
+          await refreshInbox().catch(() => {});
         }
-        receipts!.save({
-          operationId: bound.operationId,
-          id: bound.id,
-          sessionKey: bound.sessionKey,
-        });
-        const reply = await relay.request("inbox.answer", bound);
-        if (reply.status !== "uncertain") receipts?.clear();
-        if (reply.status === "accepted") {
-          go("pending");
-          message("Ответ принят");
-          await refreshInbox();
-        } else message(statusLabel(reply.status));
+        message(reply.error || statusLabel(reply.status));
       },
       "question",
     );
@@ -367,8 +356,8 @@ export function mountHud(
             id: "jobs",
             label: "Расписание",
             run: async () => {
-              await scheduleData.catalog();
-              await scheduleData.loadJobs();
+              await workspace.catalog();
+              await workspace.loadJobs();
               go("jobs");
             },
           },
@@ -385,8 +374,8 @@ export function mountHud(
     if (screen === "jobs")
       return {
         title: "Расписание · Hermes",
-        body: scheduleData.options
-          ? `Пояс: ${scheduleData.options.timezone}`
+        body: workspace.options
+          ? `Пояс: ${workspace.options.timezone}`
           : "Время определяет сервер",
         actions: [
           {
@@ -394,7 +383,7 @@ export function mountHud(
             label: "+ Новая задача голосом",
             run: () => compose({ kind: "schedule" }),
           },
-          ...scheduleData.jobs.map((job) => ({
+          ...workspace.jobs.map((job) => ({
             id: job.id,
             label: `${job.name}\n${job.paused ? "На паузе" : job.nextRunAt || job.state}`,
             run: () => {
@@ -406,15 +395,15 @@ export function mountHud(
             id: "refresh-jobs",
             label: "Обновить",
             run: async () => {
-              await scheduleData.loadJobs();
+              await workspace.loadJobs();
               render();
             },
           },
-          ...scheduleData.agents.map((agent) => ({
+          ...workspace.agents.map((agent) => ({
             id: `profile-${agent.id}`,
             label: `Агент: ${agent.name}`,
             run: async () => {
-              await scheduleData.loadJobs(agent.id);
+              await workspace.loadJobs(agent.id);
               render();
             },
           })),
@@ -422,7 +411,7 @@ export function mountHud(
             id: "receipt",
             label: "Проверить прошлое действие",
             run: async () => {
-              const result = await scheduleData.reconcileSchedule();
+              const result = await workspace.reconcileSchedule();
               message(result?.status || "Нет неподтверждённых действий");
             },
           },
@@ -439,7 +428,7 @@ export function mountHud(
             label: "Прочитать полностью",
             run: () =>
               full(
-                `${job.name}\n${job.schedule}\n${job.nextRunAt || job.state}\n${scheduleData.options?.runNowPolicy || ""}`,
+                `${job.name}\n${job.schedule}\n${job.nextRunAt || job.state}\n${workspace.options?.runNowPolicy || ""}`,
               ),
           },
           {
@@ -449,11 +438,11 @@ export function mountHud(
               confirm(
                 `${job.paused ? "Возобновить" : "Приостановить"} «${job.name}»?`,
                 async () => {
-                  await scheduleData.mutateSchedule(
+                  await workspace.mutateSchedule(
                     job.paused ? "jobs.resume" : "jobs.pause",
                     { jobId: job.id },
                   );
-                  await scheduleData.loadJobs();
+                  await workspace.loadJobs();
                   go("jobs");
                 },
               ),
@@ -463,12 +452,12 @@ export function mountHud(
             label: "Запустить сейчас",
             run: () =>
               confirm(
-                `Запустить «${job.name}»?\n${scheduleData.options?.runNowPolicy || ""}`,
+                `Запустить «${job.name}»?\n${workspace.options?.runNowPolicy || ""}`,
                 async () => {
-                  await scheduleData.mutateSchedule("jobs.run", {
+                  await workspace.mutateSchedule("jobs.run", {
                     jobId: job.id,
                   });
-                  await scheduleData.loadJobs();
+                  await workspace.loadJobs();
                   go("jobs");
                 },
               ),
@@ -477,7 +466,7 @@ export function mountHud(
             id: "job-history",
             label: "Последний результат",
             run: async () => {
-              const result = await scheduleData.schedule("jobs.history", {
+              const result = await workspace.schedule("jobs.history", {
                 jobId: job.id,
               });
               const row = result.history?.[0];
@@ -702,16 +691,23 @@ export function mountHud(
         ],
       };
     }
-    if (screen === "chat")
+    if (screen === "chat") {
+      const foreign = chatKey.split(":")[2] === "x";
       return {
         title: chatTitle,
-        body: `Загружено ${messages.length} из ${total}`,
+        body: foreign
+          ? "Продолжение доступно в интерфейсе, где запущена сессия."
+          : `Загружено ${messages.length} из ${total}`,
         actions: [
-          {
-            id: "send",
-            label: "Написать / надиктовать",
-            run: () => compose({ kind: "message", key: chatKey }),
-          },
+          ...(!foreign
+            ? [
+                {
+                  id: "send",
+                  label: "Написать / надиктовать",
+                  run: () => compose({ kind: "message", key: chatKey }),
+                },
+              ]
+            : []),
           { id: "menu", label: "Действия с сессией", run: () => go("menu") },
           ...messages.map((m, i) => ({
             id: String(m.id ?? i),
@@ -743,6 +739,7 @@ export function mountHud(
             : []),
         ],
       };
+    }
     if (screen === "menu") {
       const s = sessions.find((x) => x.key === chatKey);
       const acts: Action[] = [];
@@ -899,26 +896,25 @@ export function mountHud(
       boundDraft =
         target?.kind === "message" && target.context
           ? `${target.context}\n${draft}`
-          : draft,
-      sendId = randomId();
+          : draft;
     if (boundTarget.kind === "schedule") {
       return (async () => {
-        const result = await scheduleData.schedule("automations.draft", {
+        const result = await workspace.schedule("automations.draft", {
           text: boundDraft,
         });
         const fields = result.fields as ScheduleFields;
-        const { preview } = await scheduleData.schedule("automations.preview", {
+        const { preview } = await workspace.schedule("automations.preview", {
           fields,
         });
         const nextRun = preview.nextRuns[0]?.replace("T", " ") || "—";
         confirm(
           `${fields.name}\nБлижайший запуск: ${nextRun}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
           async () => {
-            await scheduleData.mutateSchedule("automations.create", {
+            await workspace.mutateSchedule("automations.create", {
               fields,
               reviewHash: preview.reviewHash,
             });
-            await scheduleData.loadJobs();
+            await workspace.loadJobs();
             go("jobs");
           },
           "compose",
@@ -939,19 +935,25 @@ export function mountHud(
       confirm(
         `Отправить: «${boundDraft}»?`,
         async () => {
-          if (boundTarget.kind === "rename")
+          if (boundTarget.kind === "rename") {
             await relay.request("sessions.patch", {
               key: boundTarget.key,
               label: boundDraft,
             });
-          else
-            await relay.request("agent", {
-              sessionKey: boundTarget.key,
-              message: boundDraft,
-              idempotencyKey: sendId,
-            });
-          await refreshSessions();
-          await openChat(boundTarget.key);
+            await refreshSessions();
+            await openChat(boundTarget.key);
+          } else {
+            await workspace.send(
+              boundDraft,
+              [],
+              boundTarget.key,
+              (boundTarget.attempt ??= {}),
+            );
+            go("sessions");
+            await openChat(boundTarget.key).catch(() =>
+              message("Сообщение принято. История пока недоступна."),
+            );
+          }
         },
         "compose",
       );
@@ -1083,34 +1085,51 @@ export function mountHud(
     if (generation !== connectionGeneration) return;
     applySnapshot(snapshot);
   }
-  async function reconcileOperation() {
+  async function reconcileOperations() {
     const generation = connectionGeneration,
       store = receipts;
-    const pending = store?.load();
-    if (!pending) return;
-    const receipt = await relay.request("inbox.operation", {
-      operationId: pending.operationId,
-    });
-    if (generation !== connectionGeneration) return;
-    if (receipt.status === "accepted") {
-      receipts?.clear();
-      message("Предыдущий ответ принят Hermes");
-    } else {
-      const current = await relay.request("inbox.get", pending);
-      if (generation !== connectionGeneration) return;
-      if (current.status === "source_unavailable") {
-        message(
-          "Источник вопросов недоступен. Предыдущая отправка ещё не подтверждена.",
+    if (!store) return;
+    const checks = await Promise.allSettled(
+      store.list().map(async (pending) => {
+        const receipt = await relay.request(
+          "inbox.operation",
+          {
+            operationId: pending.operationId,
+          },
+          { acceptStatus: true },
         );
-        return;
-      }
-      message(
-        current.status === "pending"
+        if (generation !== connectionGeneration) return "";
+        if (
+          ["accepted", "rejected", "already_answered", "expired"].includes(
+            receipt.status,
+          )
+        ) {
+          store.clear(pending.operationId);
+          return receipt.status === "accepted"
+            ? "Предыдущий ответ принят Hermes"
+            : receipt.error || statusLabel(receipt.status);
+        }
+        const current = await relay.request("inbox.get", {
+          id: pending.id,
+          sessionKey: pending.sessionKey,
+        });
+        if (generation !== connectionGeneration) return "";
+        if (
+          ["not_found", "expired", "already_answered"].includes(current.status)
+        ) {
+          store.clear(pending.operationId);
+          return "Предыдущий запрос больше не активен. Повторной отправки не было.";
+        }
+        return current.status === "pending"
           ? "Предыдущая отправка не подтверждена. Вопрос ещё ожидает ответа."
-          : "Предыдущий запрос больше не активен. Повторной отправки не было.",
-      );
-      if (current.status !== "pending") store?.clear();
-    }
+          : "Источник вопросов недоступен. Предыдущая отправка ещё не подтверждена.";
+      }),
+    );
+    if (generation !== connectionGeneration) return;
+    const notices = checks.flatMap((check) =>
+      check.status === "fulfilled" && check.value ? [check.value] : [],
+    );
+    if (notices.length) message([...new Set(notices)].join("\n"));
   }
   function applySnapshot(snapshot: Snapshot) {
     if (!isSnapshot(snapshot)) throw Error("Некорректный снимок Входящих");
@@ -1136,7 +1155,7 @@ export function mountHud(
     app.querySelector("#connection")!.textContent = online
       ? "VPS подключён"
       : "Нет связи";
-    if (online) void reconcileOperation().catch(() => {});
+    if (online) void reconcileOperations().catch(() => {});
     else available = false;
     render();
   };
@@ -1169,8 +1188,8 @@ export function mountHud(
       });
     else if (id === 104)
       run(async () => {
-        await scheduleData.catalog();
-        await scheduleData.loadJobs();
+        await workspace.catalog();
+        await workspace.loadJobs();
         go("jobs");
       });
     else if (id === 103 && screen === "chat") go("menu");

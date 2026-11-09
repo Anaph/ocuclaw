@@ -800,10 +800,16 @@ export class PhoneApp {
       this.confirm(
         `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}`,
         async () => {
-          await this.data.answer(item, answer);
+          const result = await this.data.answer(item, answer);
+          if (result.status !== "accepted")
+            throw Error(
+              result.error
+                ? errorText(result.error)
+                : statusText(result.status),
+            );
           this.question = null;
           this.answerDraft = "";
-          await this.refreshInbox();
+          await this.refreshInbox().catch(() => {});
           this.message("Ответ принят");
         },
       );

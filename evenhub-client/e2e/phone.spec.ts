@@ -3,6 +3,7 @@ async function server(page: Page) {
   const calls: any[] = [];
   const sendReceipts = new Map<string, any>();
   const scheduleReceipts = new Map<string, any>();
+  const answerReceipts = new Map<string, any>();
   const nextReply = new Map<string, any>();
   const dropReplies = new Set<string>();
   let peer: any;
@@ -130,9 +131,13 @@ async function server(page: Page) {
           ? { status: "pending", item: pending[0] }
           : { status: "already_answered" };
       if (frame.method === "inbox.answer") {
-        pending = [];
-        data = { status: "accepted" };
+        data = nextReply.get(frame.method) ?? { status: "accepted" };
+        if (data.status === "accepted")
+          pending = pending.filter((item) => item.id !== p.id);
+        answerReceipts.set(p.operationId, data);
       }
+      if (frame.method === "inbox.operation")
+        data = answerReceipts.get(p.operationId) ?? { status: "not_found" };
       if (frame.method === "automations.options") data = options;
       if (frame.method === "jobs.list") data = { jobs };
       if (frame.method === "workspace.stt.providers")
@@ -266,6 +271,75 @@ async function connect(page: Page) {
     .click();
   await expect(page.locator("#phone-status")).toContainText("● Hermes");
 }
+
+test("reconfirming a G2 message after a lost acknowledgment checks the original receipt", async ({
+  page,
+}) => {
+  const { calls, dropNextReply } = await server(page);
+  await page.goto("/?preview=1&hud=1");
+  await page.locator("#connect [name=url]").fill("ws://127.0.0.1:47801/");
+  await page.locator("#connect [name=token]").fill("key");
+  await page.locator("#connect button").click();
+  await expect(page.locator("#connection")).toHaveText("VPS подключён");
+  await page.getByRole("button", { name: "Сессии", exact: true }).click();
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  await page
+    .getByRole("button", { name: "Написать / надиктовать", exact: true })
+    .click();
+  await page.locator("#text").fill("Подготовь один отчёт");
+  const review = page.locator("#text-form button");
+  const send = page.getByRole("button", { name: "Отправить", exact: true });
+  await review.click();
+  dropNextReply("agent");
+  await send.click();
+  await expect(page.locator("#notice")).toContainText("Соединение потеряно");
+  await expect(page.locator("#connection")).toHaveText("VPS подключён", {
+    timeout: 10000,
+  });
+  await page
+    .getByRole("button", { name: "Изменить / перезаписать", exact: true })
+    .click();
+  await expect(page.locator("#text")).toHaveValue("Подготовь один отчёт");
+  await review.click();
+  await send.click();
+  await expect(page.locator("#title")).toHaveText("hermes:main:a");
+  const sends = calls.filter((call) => call.method === "agent");
+  expect(sends).toHaveLength(1);
+  expect(
+    calls.find((call) => call.method === "workspace.send.receipt")?.params
+      .operationId,
+  ).toBe(sends[0].params.idempotencyKey);
+});
+
+test("an uncertain answer is looked up before another confirmation can dispatch it", async ({
+  page,
+}) => {
+  const { calls, replyNext } = await server(page);
+  await connect(page);
+  await page.getByRole("button", { name: "Входящие", exact: true }).click();
+  await page.locator("#inbox-list button").click();
+  await page.getByRole("button", { name: "Квартал", exact: true }).click();
+  const confirm = page.getByRole("button", {
+    name: "Подтвердить",
+    exact: true,
+  });
+  replyNext("inbox.answer", { status: "uncertain" });
+  await confirm.click();
+  await expect(page.locator("#phone-notice")).toContainText(
+    "Отправка не подтверждена",
+  );
+  await confirm.click();
+  await expect
+    .poll(
+      () => calls.filter((call) => call.method === "inbox.operation").length,
+    )
+    .toBe(1);
+  const answers = calls.filter((call) => call.method === "inbox.answer");
+  expect(answers).toHaveLength(1);
+  expect(
+    calls.find((call) => call.method === "inbox.operation")?.params.operationId,
+  ).toBe(answers[0].params.operationId);
+});
 
 test("a rejected send receipt survives a socket restart and releases the draft for a new operation", async ({
   page,

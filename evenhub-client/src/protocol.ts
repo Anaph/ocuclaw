@@ -69,6 +69,11 @@ export function endpointScope(address: string): string {
   return url.toString();
 }
 
+interface AnswerReceipt {
+  operationId: string;
+  id: string;
+  sessionKey: string;
+}
 export class ReceiptStore {
   constructor(
     private storage: Pick<Storage, "getItem" | "setItem" | "removeItem">,
@@ -77,24 +82,35 @@ export class ReceiptStore {
   private get key() {
     return `ocuclaw.pendingOperation:${encodeURIComponent(this.scope)}`;
   }
-  save(receipt: { operationId: string; id: string; sessionKey: string }) {
-    this.storage.setItem(this.key, JSON.stringify(receipt));
+  save(receipt: AnswerReceipt) {
+    const entries = this.list();
+    if (!entries.some((entry) => entry.operationId === receipt.operationId))
+      this.storage.setItem(this.key, JSON.stringify([...entries, receipt]));
   }
-  load(): { operationId: string; id: string; sessionKey: string } | null {
+  list(): AnswerReceipt[] {
     try {
-      const item = JSON.parse(this.storage.getItem(this.key) || "null");
-      return item &&
-        ["operationId", "id", "sessionKey"].every(
-          (k) => typeof item[k] === "string",
-        )
-        ? item
-        : null;
+      const saved = JSON.parse(this.storage.getItem(this.key) || "null");
+      // Older clients stored a single receipt under this endpoint key.
+      return (Array.isArray(saved) ? saved : [saved]).filter(
+        (item) =>
+          record(item) &&
+          ["operationId", "id", "sessionKey"].every(
+            (key) => typeof item[key] === "string",
+          ),
+      );
     } catch {
-      return null;
+      return [];
     }
   }
-  clear() {
-    this.storage.removeItem(this.key);
+  clear(operationId: string) {
+    const entries = this.list();
+    const remaining = entries.filter(
+      (entry) => entry.operationId !== operationId,
+    );
+    if (remaining.length === entries.length) return;
+    if (remaining.length)
+      this.storage.setItem(this.key, JSON.stringify(remaining));
+    else this.storage.removeItem(this.key);
   }
 }
 

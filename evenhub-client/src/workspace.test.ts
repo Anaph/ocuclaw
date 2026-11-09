@@ -26,6 +26,7 @@ function harness(request: (method: string, p: any) => Promise<any>) {
   } as unknown as Relay;
   return {
     workspace: new Workspace(relay, new InboxModel(), storage),
+    newSurface: () => new Workspace(relay, new InboxModel(), storage),
     values,
     observers,
   };
@@ -291,6 +292,53 @@ test("send preserves draft edits made while the agent acknowledges", async () =>
   ack.resolve({ status: "accepted" });
   await send;
   assert.equal(w.draft(), "Следующее");
+});
+test("the two surfaces serialize sends to the same chat and a HUD send preserves the phone draft", async () => {
+  const ack = deferred();
+  let sends = 0;
+  const { workspace: phone, newSurface } = harness(async (method) => {
+    assert.equal(method, "agent");
+    sends++;
+    return ack.promise;
+  });
+  const hud = newSurface();
+  phone.reset("wss://a.test");
+  hud.reset("wss://a.test");
+  phone.chatKey = "hermes:main:a";
+  phone.saveDraft("Черновик телефона");
+  const sending = hud.send("Черновик телефона", [], phone.chatKey);
+  await assert.rejects(phone.send("Второе сообщение", []), /уже отправляется/);
+  ack.resolve({ status: "accepted" });
+  await sending;
+  assert.equal(sends, 1);
+  assert.equal(phone.draft(), "Черновик телефона");
+});
+test("the HUD can verify its original send after the phone consumes the shared receipt", async () => {
+  let sends = 0;
+  const { workspace: phone, newSurface } = harness(async (method) => {
+    if (method === "agent") {
+      sends++;
+      throw Error("network");
+    }
+    if (method === "workspace.send.receipt") return { status: "accepted" };
+    return {};
+  });
+  const hud = newSurface();
+  phone.reset("wss://a.test");
+  hud.reset("wss://a.test");
+  phone.chatKey = "hermes:main:a";
+  const attempt = {};
+  await assert.rejects(
+    hud.send("Исходное", [], phone.chatKey, attempt),
+    /network/,
+  );
+  await phone.checkSend();
+  assert.equal(phone.pendingSend(), null);
+  assert.equal(
+    (await hud.send("Исходное", [], phone.chatKey, attempt)).status,
+    "accepted",
+  );
+  assert.equal(sends, 1);
 });
 test("a failed attachment batch cancels earlier uploads without issuing a send", async () => {
   const calls: string[] = [];

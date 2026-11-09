@@ -18,10 +18,24 @@ test("receipts belong to one endpoint and storage keys never include a token", (
     sessionKey: "hermes:main:a",
   };
   a.save(receipt);
-  assert.equal(b.load(), null);
-  assert.deepEqual(a.load(), receipt);
-  b.clear();
-  assert.deepEqual(a.load(), receipt);
+  assert.deepEqual(b.list(), []);
+  assert.deepEqual(a.list(), [receipt]);
+  b.clear(receipt.operationId);
+  assert.deepEqual(a.list(), [receipt]);
+  const key = [...entries.keys()][0];
+  assert(!key.includes("private"));
+  entries.set(key, JSON.stringify(receipt));
+  const second = {
+    operationId: "operation-b",
+    id: "question-b",
+    sessionKey: "hermes:main:b",
+  };
+  const otherSurface = new ReceiptStore(storage, scope);
+  otherSurface.save(second);
+  a.clear(receipt.operationId);
+  assert.deepEqual(otherSurface.list(), [second]);
+  otherSurface.clear(second.operationId);
+  assert.equal(entries.size, 0);
 });
 test("LAN development contexts get cryptographically generated UUIDs without randomUUID", () => {
   const provider = {

@@ -264,6 +264,7 @@ test("session actions and completion read receipts are available without switchi
       }
       if (f.method === "sessions.create")
         data = { key: "hermes:main:new-session" };
+      if (f.method === "agent") data = { status: "accepted", runId: "run-1" };
       socket.send(
         JSON.stringify({
           type: "ocuclaw.workspace.result",
@@ -349,10 +350,11 @@ test("session actions and completion read receipts are available without switchi
   expect(calls.some((x) => x.method === "sessions.switch")).toBe(false);
 });
 
-test("switching VPS isolates cached results and uncertain receipts", async ({
+test("switching VPS isolates cached results and each answer receipt is reconciled separately", async ({
   page,
 }) => {
   const calls: { server: string; method: string }[] = [];
+  const checked: string[] = [];
   await page.routeWebSocket("ws://127.0.0.1:47803/**", (socket) =>
     socket.onMessage((raw) => {
       const f = JSON.parse(String(raw));
@@ -388,7 +390,13 @@ test("switching VPS isolates cached results and uncertain receipts", async ({
                 ]
               : [],
         };
-      if (f.method === "inbox.operation") data = { status: "uncertain" };
+      if (f.method === "inbox.operation") {
+        checked.push(f.params.operationId);
+        data = {
+          status:
+            f.params.operationId === "operation-b" ? "accepted" : "uncertain",
+        };
+      }
       if (f.method === "inbox.get") data = { status: "source_unavailable" };
       socket.send(
         JSON.stringify({
@@ -405,11 +413,10 @@ test("switching VPS isolates cached results and uncertain receipts", async ({
     sessionStorage.setItem(
       "ocuclaw.pendingOperation:" +
         encodeURIComponent("ws://127.0.0.1:47803/a"),
-      JSON.stringify({
-        operationId: "operation-a",
-        id: "q-a",
-        sessionKey: "hermes:main:a",
-      }),
+      JSON.stringify([
+        { operationId: "operation-a", id: "q-a", sessionKey: "hermes:main:a" },
+        { operationId: "operation-b", id: "q-b", sessionKey: "hermes:main:b" },
+      ]),
     ),
   );
   await page.getByLabel("Адрес сервера").fill("ws://127.0.0.1:47803/a");
@@ -418,14 +425,20 @@ test("switching VPS isolates cached results and uncertain receipts", async ({
   await expect(page.locator("#notice")).toContainText(
     "Предыдущая отправка ещё не подтверждена",
   );
+  await expect(page.locator("#notice")).toContainText(
+    "Предыдущий ответ принят Hermes",
+  );
+  expect(checked.sort()).toEqual(["operation-a", "operation-b"]);
   expect(
     await page.evaluate(() =>
-      sessionStorage.getItem(
-        "ocuclaw.pendingOperation:" +
-          encodeURIComponent("ws://127.0.0.1:47803/a"),
-      ),
+      JSON.parse(
+        sessionStorage.getItem(
+          "ocuclaw.pendingOperation:" +
+            encodeURIComponent("ws://127.0.0.1:47803/a"),
+        ) || "[]",
+      ).map((receipt: { operationId: string }) => receipt.operationId),
     ),
-  ).not.toBeNull();
+  ).toEqual(["operation-a"]);
   await page.getByRole("button", { name: "Готово · 1", exact: true }).click();
   await expect(page.locator("#actions")).toContainText("Секрет сервера A");
   await page.locator("#setup summary").click();
