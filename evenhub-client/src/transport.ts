@@ -4,12 +4,14 @@ interface Timing {
   handshake: number;
   request: number;
   heartbeat: number;
+  idle: number;
   reconnect: number;
 }
 const DEFAULT_TIMING: Timing = {
   handshake: 10000,
   request: 70000,
   heartbeat: 15000,
+  idle: 35000,
   reconnect: 3000,
 };
 export class Relay {
@@ -27,6 +29,7 @@ export class Relay {
   private reconnect?: ReturnType<typeof setTimeout>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private handshake?: ReturnType<typeof setTimeout>;
+  private checkSocket?: () => void;
   private generation = 0;
   private url = "";
   private token = "";
@@ -111,19 +114,67 @@ export class Relay {
     }
     this.pending.clear();
   }
+  private retire(
+    generation: number,
+    socket: WebSocket,
+    {
+      code,
+      message,
+      terminal = false,
+    }: {
+      code?: number;
+      message?: string;
+      terminal?: boolean;
+    } = {},
+  ) {
+    if (!this.active(generation, socket)) return;
+    this.socket = null;
+    this.socketReady = false;
+    this.checkSocket = undefined;
+    this.clearTimers();
+    this.terminal = terminal || code === 4001 || code === 1008;
+    this.rejectPending("Соединение потеряно; проверьте результат операции");
+    this.state(false);
+    const notice =
+      code === 4001
+        ? "Ключ подключения отклонён"
+        : code === 1008
+          ? "Сервер отклонил протокол подключения"
+          : message;
+    if (notice) this.emitError(notice);
+    if (generation === this.generation && !this.closed && !this.terminal)
+      this.reconnect = setTimeout(() => this.open(), this.timing.reconnect);
+    // Some hosts never deliver the close event after losing the network.
+    if (socket.readyState < 2) socket.close();
+  }
+  resume() {
+    this.checkSocket?.();
+    if (this.closed || this.terminal || this.socket) return;
+    clearTimeout(this.reconnect);
+    this.open();
+  }
   private open() {
+    if (this.closed || this.terminal || this.socket) return;
     const generation = ++this.generation;
     const url = new URL(this.url);
     url.searchParams.set("token", this.token);
     const socket = (this.socket = this.createSocket(url.toString()));
     this.socketReady = false;
     this.subscription = null;
-    const stop = (message: string, terminal = false) => {
-      if (!this.active(generation, socket)) return;
-      this.terminal = terminal;
-      this.emitError(message);
-      socket.close();
+    const stop = (message: string, terminal = false) =>
+      this.retire(generation, socket, { message, terminal });
+    let lastFrame = Date.now(),
+      lastFrameMonotonic = performance.now();
+    const checkSocket = () => {
+      if (
+        this.socketReady &&
+        (socket.readyState !== 1 ||
+          Date.now() - lastFrame >= this.timing.idle ||
+          performance.now() - lastFrameMonotonic >= this.timing.idle)
+      )
+        stop("Соединение потеряно");
     };
+    this.checkSocket = checkSocket;
     this.handshake = setTimeout(
       () => stop("Сервер не завершил подключение"),
       this.timing.handshake,
@@ -148,7 +199,9 @@ export class Relay {
       } catch {
         return;
       }
-      if (!frame || typeof frame !== "object") return;
+      if (!frame || typeof frame.type !== "string") return;
+      lastFrame = Date.now();
+      lastFrameMonotonic = performance.now();
       if (frame.type === "protocolHelloAck" && !this.socketReady) {
         if (frame.protocolVersion !== "v2") {
           stop("Сервер не поддерживает протокол v2", true);
@@ -158,6 +211,8 @@ export class Relay {
         this.socketReady = true;
         void this.subscribe(generation, socket, true);
         this.heartbeat = setInterval(() => {
+          if (!this.active(generation, socket)) return;
+          checkSocket();
           if (!this.active(generation, socket)) return;
           if (socket.readyState === 1) {
             try {
@@ -216,23 +271,8 @@ export class Relay {
         else p.resolve(frame.data);
       }
     };
-    socket.onclose = (event) => {
-      if (!this.active(generation, socket)) return;
-      this.socketReady = false;
-      this.clearTimers();
-      this.state(false);
-      this.rejectPending("Соединение потеряно; проверьте результат операции");
-      if (event.code === 4001 || event.code === 1008) {
-        this.terminal = true;
-        this.emitError(
-          event.code === 4001
-            ? "Ключ подключения отклонён"
-            : "Сервер отклонил протокол подключения",
-        );
-      }
-      if (!this.terminal)
-        this.reconnect = setTimeout(() => this.open(), this.timing.reconnect);
-    };
+    socket.onclose = (event) =>
+      this.retire(generation, socket, { code: event.code });
     socket.onerror = () => {
       if (this.active(generation, socket)) socket.close();
     };
@@ -262,12 +302,11 @@ export class Relay {
         await this.fetchSnapshot("inbox.subscribe", generation, socket);
       } catch (error) {
         if (!this.active(generation, socket)) return;
-        this.state(false);
-        this.emitError((error as Error).message);
-        // A non-compatible server needs an explicit reconnect after update.
-        if ((error as Error).message === "unsupported_operation")
-          this.terminal = true;
-        socket.close();
+        const message = (error as Error).message;
+        this.retire(generation, socket, {
+          message,
+          terminal: this.terminal || message === "unsupported_operation",
+        });
       }
     })();
     this.subscription = work;
@@ -424,6 +463,7 @@ export class Relay {
     this.socket?.close();
     this.socket = null;
     this.socketReady = false;
+    this.checkSocket = undefined;
     this.subscription = null;
     this.state(false);
     this.rejectPending("Отключено");

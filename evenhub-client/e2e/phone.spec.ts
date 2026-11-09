@@ -145,6 +145,48 @@ test("a rejected send receipt survives a socket restart and releases the draft f
   await expect(page.locator(".streaming")).toContainText("Поток восстановлен");
 });
 
+test("the phone wakes from a silent network loss and reconciles the original chat send", async ({
+  page,
+}) => {
+  const fixture = workspaceFixture();
+  let connections = 0;
+  let muteFirst = false;
+  await page.routeWebSocket("ws://127.0.0.1:47801/**", (socket) => {
+    const first = ++connections === 1;
+    fixture.attach({
+      send: (text) => {
+        if (!first || !muteFirst) socket.send(text);
+      },
+      close: (options) => socket.close(options),
+      onMessage: (handle) => socket.onMessage(handle),
+    });
+  });
+  await page.clock.install();
+  await connect(page);
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  const draft = page.getByLabel("Сообщение Hermes");
+  await draft.fill("Переживёт разрыв");
+  muteFirst = true;
+  await page.locator("#compose-chat")
+    .getByRole("button", { name: "Отправить", exact: true }).click();
+  const sends = () => fixture.calls.filter((frame) => frame.method === "agent");
+  await expect.poll(() => sends().length).toBe(1);
+  await page.clock.fastForward(36000);
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect.poll(() => connections).toBe(2);
+  await expect(page.locator("#phone-status")).toContainText("● Hermes");
+  await expect.poll(() => fixture.calls.filter(
+    (frame) => frame.method === "chat.subscribe",
+  ).length).toBe(2);
+  await expect(draft).toHaveValue("Переживёт разрыв");
+  await page.getByRole("button", { name: "Проверить отправку", exact: true }).click();
+  await expect(draft).toHaveValue("");
+  expect(sends()).toHaveLength(1);
+  expect(fixture.calls.find(
+    (frame) => frame.method === "workspace.send.receipt",
+  )?.params.operationId).toBe(sends()[0].params.idempotencyKey);
+});
+
 test("a rejected schedule mutation can be corrected and submitted as a new operation", async ({
   page,
 }) => {
@@ -264,7 +306,7 @@ async function simulateG2(page: Page, phone = false) {
         import { mountHud } from "/src/hud.ts";
         import { PhoneApp } from "/src/phone.ts";
         import "/src/style.css";
-        const simulated = window.simulatedG2 = { tiles: {}, audio: [], exits: [], shown: [] };
+        const simulated = window.simulatedG2 = { tiles: {}, audio: [], exits: [], shown: [], frames: 0 };
         const captions = new WeakMap();
         const fill = CanvasRenderingContext2D.prototype.fillText;
         CanvasRenderingContext2D.prototype.fillText = function(text, x, y, ...rest) {
@@ -301,10 +343,17 @@ async function simulateG2(page: Page, phone = false) {
             simulated.emit = listener;
             return () => {};
           },
+          onDeviceStatusChanged: listener => {
+            simulated.status = listener;
+            return () => {};
+          },
           updateImageRawData: async ({ containerID, imageData }) => {
             if (simulated.block) await new Promise(resolve => { simulated.release = resolve; });
             simulated.tiles[containerID] = Array.from(new Uint8Array(imageData).slice(0, 8));
-            if (containerID === 13) simulated.shown = captions.get(imageData.buffer) || [];
+            if (containerID === 13) {
+              simulated.shown = captions.get(imageData.buffer) || [];
+              simulated.frames++;
+            }
             return "success";
           },
           shutDownPageContainer: async (mode) => {
@@ -346,14 +395,110 @@ async function simulateG2(page: Page, phone = false) {
     page.evaluate((event) => (window as any).simulatedG2.emit(event), data);
   const ring = (eventType = 0) =>
     event({ sysEvent: { eventSource: 2, eventType } });
+  const status = (connectType: "connected" | "disconnected") =>
+    page.evaluate((connectType) =>
+      (window as any).simulatedG2.status({ connectType }), connectType);
   const shown = (text: string) =>
     expect
       .poll(() =>
         page.evaluate(() => (window as any).simulatedG2.shown.join("\n")),
       )
       .toContain(text);
-  return { hud, event, ring, shown };
+  return { hud, event, ring, shown, status };
 }
+
+test("R1 resumes after G2 reconnects while an old display write is still blocked", async ({
+  page,
+}) => {
+  const { calls } = await server(page);
+  const { hud, event, ring, shown, status } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Другой чат");
+  await page.evaluate(() => { (window as any).simulatedG2.block = true; });
+  await ring(3);
+  await expect.poll(() => page.evaluate(
+    () => Boolean((window as any).simulatedG2.release),
+  )).toBe(true);
+  await ring(3); // The glasses still show the list. This must not exit from the root.
+  await status("disconnected");
+  await ring(2);
+  await ring(3);
+  await event({ menuItemClickEvent: { itemID: 104 } });
+  await expect(hud.locator("#title")).toHaveText("OcuClaw");
+  expect(calls.some((call) => call.method === "jobs.list")).toBe(false);
+  expect(await page.evaluate(() => (window as any).simulatedG2.exits)).toEqual([]);
+
+  await page.evaluate(() => { (window as any).simulatedG2.block = false; });
+  await status("connected");
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Другой чат");
+  const frames = await page.evaluate(() => (window as any).simulatedG2.frames);
+  await page.evaluate(() => (window as any).simulatedG2.release());
+  await expect.poll(() => page.evaluate(
+    () => (window as any).simulatedG2.frames,
+  )).toBeGreaterThan(frames);
+  await ring();
+  await shown("> Квартал");
+});
+
+test("R1 double-click cancels confirmation even when the host emits a click first", async ({
+  page,
+}) => {
+  const { calls } = await server(page);
+  const { ring, shown } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await ring();
+  await shown("> Hermes / Другой чат");
+  await ring();
+  await shown("> Квартал");
+  await ring();
+  await shown("> Отправить");
+  await page.waitForTimeout(250);
+  await ring();
+  await ring(3);
+  await shown("> Квартал");
+  await page.waitForTimeout(300);
+  expect(calls.filter((call) => call.method === "inbox.answer")).toHaveLength(0);
+  await ring();
+  await shown("> Отправить");
+  await page.waitForTimeout(250);
+  await ring();
+  await shown("Ответ принят");
+  expect(calls.filter((call) => call.method === "inbox.answer")).toHaveLength(1);
+});
+
+test("R1 cancels interrupted G2 dictation and records again after reconnecting", async ({
+  page,
+}) => {
+  const { calls } = await server(page);
+  const { event, ring, shown, status } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
+  await event({ menuItemClickEvent: { itemID: 104 } });
+  await shown("> + Новая задача голосом");
+  await ring();
+  await shown("> Надиктовать");
+  await ring();
+  await shown("> Завершить запись");
+  await event({ audioEvent: { audioPcm: [5, 6, 7, 8] } });
+  await status("disconnected");
+  await ring();
+  await status("connected");
+  await shown("Связь с G2 потеряна");
+  await shown("> Надиктовать");
+  expect(calls.filter((call) => call.method === "workspace.stt.transcribe")).toHaveLength(0);
+  await ring();
+  await shown("> Завершить запись");
+  await event({ audioEvent: { audioPcm: [1, 2, 3, 4] } });
+  await ring();
+  await shown("Проверьте текст перед отправкой");
+  const stt = calls.filter((call) => call.method === "workspace.stt.transcribe");
+  expect(stt).toHaveLength(1);
+  expect(Buffer.from(stt[0].params.wav, "base64").subarray(44)).toEqual(
+    Buffer.from([1, 2, 3, 4]),
+  );
+});
 
 test("phone without G2 picks an available Hermes STT provider and keeps the draft editable", async ({
   page,
@@ -392,6 +537,7 @@ test("R1 dictates and confirms a schedule, then recovers a lost save acknowledgm
 }) => {
   const { calls, replyNext, dropNextReply } = await server(page);
   const { hud, event, ring, shown } = await simulateG2(page);
+  await shown("> Нужен ответ · 1");
   await event({ menuItemClickEvent: { itemID: 104 } });
   await expect(
     hud.getByRole("button", { name: "+ Новая задача голосом" }),
@@ -1318,7 +1464,15 @@ test("a recovered approval names the previous decision while the new choice rema
     .click();
   await page.getByRole("button", { name: "Подтвердить", exact: true }).click();
   await expect.poll(() => sent.length).toBe(1);
-  await page.clock.fastForward(71000);
+  // Let each heartbeat get a reply while the one answer request times out.
+  for (let cycle = 0; cycle < 4; cycle++) {
+    await page.clock.fastForward(15000);
+    await expect
+      .poll(() => fixture.calls.filter((call) => call.method === "inbox.subscribe").length)
+      .toBeGreaterThanOrEqual(cycle + 2);
+  }
+  await page.clock.fastForward(11000);
+  await expect(page.locator("#phone-notice")).toContainText("Ответ сервера не получен");
   await page
     .getByRole("button", { name: "Изменить / Назад", exact: true })
     .click();

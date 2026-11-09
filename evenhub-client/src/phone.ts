@@ -2154,6 +2154,12 @@ export class PhoneApp {
       () => {
         void this.run(() => this.stopRecording());
       },
+      () => {
+        clearTimeout(this.recordTimer);
+        this.recording = false;
+        this.message("Связь с G2 потеряна. Повторите диктовку.");
+        this.render();
+      },
     );
     this.recording = true;
     this.recordTimer = setTimeout(

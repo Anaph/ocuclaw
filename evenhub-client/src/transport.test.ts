@@ -8,6 +8,7 @@ class Socket {
   onmessage: any;
   onerror: any;
   sent: any[] = [];
+  closeNotifies = true;
   send(data: string) {
     this.sent.push(JSON.parse(data));
   }
@@ -20,7 +21,7 @@ class Socket {
   }
   close(code = 1000) {
     this.readyState = 3;
-    this.onclose?.({ code });
+    if (this.closeNotifies) this.onclose?.({ code });
   }
   reply(method: string, data: unknown) {
     const request = this.sent.filter((x) => x.method === method).at(-1);
@@ -53,7 +54,7 @@ const snapshot = (id = "") => ({
       ]
     : [],
 });
-function harness() {
+function harness(timing: ConstructorParameters<typeof Relay>[1] = {}) {
   const sockets: Socket[] = [];
   const relay = new Relay(
     () => {
@@ -61,7 +62,7 @@ function harness() {
       sockets.push(socket);
       return socket as unknown as WebSocket;
     },
-    { handshake: 100, request: 100, heartbeat: 10000, reconnect: 10 },
+    { handshake: 100, request: 100, heartbeat: 10000, reconnect: 10, ...timing },
   );
   return { relay, sockets };
 }
@@ -85,6 +86,45 @@ test("Workspace becomes online only after version negotiation and initial snapsh
   await ready(relay, sockets[0]);
   assert.deepEqual(states, [true]);
   relay.disconnect();
+});
+
+test("a silent half-open socket reconnects without replaying an in-flight mutation", async () => {
+  const { relay, sockets } = harness({
+    heartbeat: 10,
+    idle: 40,
+    request: 1000,
+  });
+  const states: boolean[] = [];
+  const results: string[] = [];
+  relay.onState = (online) => states.push(online);
+  relay.onSnapshot = (value) => results.push(value.completed[0].id);
+  relay.connect("ws://localhost/a", "key");
+  const old = sockets[0];
+  try {
+    await ready(relay, old, "before");
+    old.closeNotifies = false;
+    const pending = assert.rejects(
+      relay.request("inbox.answer", { operationId: "original" }),
+      /Соединение потеряно/,
+    );
+    for (let tries = 0; tries < 40 && sockets.length < 2; tries++)
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(sockets.length, 2);
+    assert.equal(old.readyState, 3);
+    await pending;
+    await ready(relay, sockets[1], "after");
+    old.onclose({ code: 4001 });
+    old.frame({
+      type: "ocuclaw.workspace.changed",
+      version: 1,
+      data: snapshot("retired"),
+    });
+    assert.deepEqual(states, [true, false, true]);
+    assert.deepEqual(results, ["before", "after"]);
+    assert.equal(sockets[1].sent.some((frame) => frame.method === "inbox.answer"), false);
+  } finally {
+    relay.disconnect();
+  }
 });
 test("outcome consumers receive typed rejections but bare protocol errors still reject", async () => {
   const { relay, sockets } = harness();

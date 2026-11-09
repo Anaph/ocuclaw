@@ -117,6 +117,7 @@ export function mountHud(
   let currentJob: Job | null = null;
   let currentJobKey = "";
   let assertJobProfile = () => {};
+  let commitTap: ReturnType<typeof setTimeout> | undefined;
   let connectionGeneration = 0,
     connectionScope = "",
     sessionSearch = "";
@@ -125,6 +126,7 @@ export function mountHud(
     return `ocuclaw.ui:${encodeURIComponent(connectionScope)}`;
   }
   function resetConnection(scope: string) {
+    cancelCommitTap();
     connectionGeneration++;
     workspace.reset(scope);
     currentJob = null;
@@ -207,6 +209,7 @@ export function mountHud(
     }
   }
   function go(next: Screen) {
+    cancelCommitTap();
     if (notification) clearNotification();
     notice = "";
     screen = next;
@@ -1304,7 +1307,12 @@ export function mountHud(
     transcribing = false;
   async function startRecording() {
     if (glasses.phoneInteracting) throw Error("Завершите действие на телефоне");
-    await glasses.start();
+    await glasses.start(undefined, undefined, () => {
+      clearTimeout(recordTimer);
+      voiceRetry = null;
+      go("compose");
+      message("Связь с G2 потеряна. Повторите диктовку.");
+    });
     voiceRetry = null;
     positions.delete("record");
     go("record");
@@ -1321,6 +1329,7 @@ export function mountHud(
       go("compose");
       await transcribeRecording();
     } finally {
+      if (screen === "record") go("compose");
       transcribing = false;
     }
   }
@@ -1345,8 +1354,11 @@ export function mountHud(
     if (screen === "record") {
       clearTimeout(recordTimer);
       run(async () => {
-        await glasses.stop();
-        go("compose");
+        try {
+          await glasses.stop();
+        } finally {
+          go("compose");
+        }
       });
       return;
     }
@@ -1528,6 +1540,7 @@ export function mountHud(
     showNotification();
   }
   glasses.onDevice = () => {
+    cancelCommitTap();
     shownAction = "";
     render();
   };
@@ -1538,7 +1551,10 @@ export function mountHud(
       ? "VPS подключён"
       : "Нет связи";
     if (online) void reconcileOperations().catch(() => {});
-    else available = false;
+    else {
+      cancelCommitTap();
+      available = false;
+    }
     render();
   };
   function actionKey() {
@@ -1553,11 +1569,23 @@ export function mountHud(
       current.actions[selected]?.id,
     ]);
   }
+  function cancelCommitTap() {
+    clearTimeout(commitTap);
+    commitTap = undefined;
+  }
   function handleInput(input: Input, device: boolean) {
+    if (device && !shownAction) return;
+    if (!device || input !== "select") cancelCommitTap();
     const previousTap = lastTap;
     if (device && input === "select") lastTap = performance.now();
     if (busy) return;
-    if (input === "back") return back();
+    if (input === "back") {
+      if (
+        device && screen === "home" && !notification && shownAction !== actionKey()
+      )
+        return;
+      return back();
+    }
     if (input === "menu") {
       if (screen === "record") return;
       if (screen === "confirm") return;
@@ -1566,18 +1594,19 @@ export function mountHud(
     }
     if (input === "select") {
       const action = current.actions[selected];
-      if (device && (!glasses.displayReady || shownAction !== actionKey()))
-        return;
-      // A quick second event must not confirm the screen opened by the first.
-      if (
-        device &&
-        screen === "confirm" &&
-        action &&
-        ["send", "retry"].includes(action.id) &&
-        lastTap - previousTap < 250
-      )
-        return;
-      if (action) run(action.run);
+      if (!action) return;
+      const key = actionKey();
+      if (device && (!glasses.displayReady || shownAction !== key)) return;
+      if (device && screen === "confirm" && ["send", "retry"].includes(action.id)) {
+        // A host may report a click before classifying it as a double-click.
+        if (commitTap || lastTap - previousTap < 250) return;
+        if (!relay.online) return message("Нет связи с Hermes");
+        commitTap = setTimeout(() => {
+          commitTap = undefined;
+          if (relay.online && shownAction === key && actionKey() === key)
+            run(action.run);
+        }, 250);
+      } else run(action.run);
       return;
     }
     if (screen === "read" && !notification) {
@@ -1604,7 +1633,7 @@ export function mountHud(
   }
   glasses.onInput = (input) => handleInput(input, true);
   glasses.onMenu = (id) => {
-    if (busy || ["record", "confirm"].includes(screen)) return;
+    if (!shownAction || busy || ["record", "confirm"].includes(screen)) return;
     if (id === 101) go("pending");
     else if (id === 102)
       run(async () => {
@@ -1762,6 +1791,7 @@ export function mountHud(
       button.className = i === selected ? "selected" : "";
       button.disabled = busy;
       button.onclick = () => {
+        cancelCommitTap();
         selected = i;
         positions.set(screen, action.id);
         run(action.run);
@@ -1821,7 +1851,9 @@ export function mountHud(
     run(useDraft);
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && relay.online) {
+    if (document.visibilityState !== "visible") return;
+    relay.resume();
+    if (relay.online) {
       void refreshInbox().catch(() => {});
       if (screen === "sessions")
         void refreshSessions()
@@ -1829,7 +1861,12 @@ export function mountHud(
           .catch(() => {});
     }
   });
+  window.addEventListener("online", () => relay.resume());
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) relay.resume();
+  });
   window.addEventListener("pagehide", () => {
+    cancelCommitTap();
     clearTimeout(recordTimer);
     voiceRetry = null;
     void glasses

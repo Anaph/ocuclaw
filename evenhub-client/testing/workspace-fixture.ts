@@ -88,7 +88,10 @@ export function workspaceFixture(
         );
         return;
       }
-      if (frame.type === "ping") return;
+      if (frame.type === "ping") {
+        socket.send(JSON.stringify({ type: "pong", ts: frame.ts }));
+        return;
+      }
       calls.push(frame);
       const p = frame.params || {};
       let data: any = {};

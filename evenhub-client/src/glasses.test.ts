@@ -173,3 +173,76 @@ test("a late page acknowledgment cannot revive a disconnected G2 display", async
   await Promise.resolve();
   assert.equal(glasses.displayReady, true);
 });
+
+test("repeated status updates keep the live page and ring input pauses while G2 is absent", async () => {
+  let builds = 0;
+  let deviceStatus: (status: { connectType: string }) => void = () => {};
+  let emit: (event: any) => void = () => {};
+  const inputs: string[] = [];
+  const menus: number[] = [];
+  const bridge = {
+    createStartUpPageContainer: async () => {
+      builds++;
+      return 0;
+    },
+    onDeviceStatusChanged: (listener: typeof deviceStatus) => {
+      deviceStatus = listener;
+    },
+    onEvenHubEvent: (listener: typeof emit) => {
+      emit = listener;
+      return () => {};
+    },
+  };
+  const glasses = new Glasses(async () => bridge as any);
+  glasses.onInput = (input) => inputs.push(input);
+  glasses.onMenu = (id) => menus.push(id);
+  await glasses.init();
+  deviceStatus({ connectType: "connected" });
+  assert.equal(builds, 1);
+  const ring = (type: OsEventTypeList) =>
+    emit({
+      sysEvent: new Sys_ItemEvent({
+        eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+        eventType: type,
+      }),
+    });
+  deviceStatus({ connectType: "disconnected" });
+  ring(OsEventTypeList.SCROLL_BOTTOM_EVENT);
+  ring(OsEventTypeList.DOUBLE_CLICK_EVENT);
+  emit({ menuItemClickEvent: { itemID: 101 } });
+  assert.deepEqual(inputs, []);
+  assert.deepEqual(menus, []);
+  deviceStatus({ connectType: "connected" });
+  await Promise.resolve();
+  ring(OsEventTypeList.SCROLL_BOTTOM_EVENT);
+  ring(OsEventTypeList.DOUBLE_CLICK_EVENT);
+  emit({ menuItemClickEvent: { itemID: 101 } });
+  assert.deepEqual(inputs, ["down", "back"]);
+  assert.deepEqual(menus, [101]);
+  assert.equal(builds, 2);
+});
+
+test("a failed startup from an old G2 connection leaves the new display intact", async () => {
+  let rejectOld: (error: Error) => void = () => {};
+  let status: (status: { connectType: string }) => void = () => {};
+  let first = true;
+  const bridge = {
+    createStartUpPageContainer: () => {
+      if (!first) return Promise.resolve(0);
+      first = false;
+      return new Promise<number>((_, reject) => { rejectOld = reject; });
+    },
+    onDeviceStatusChanged: (listener: typeof status) => {
+      status = listener;
+    },
+    onEvenHubEvent: () => () => {},
+  };
+  const glasses = new Glasses(async () => bridge as any);
+  const initialized = glasses.init();
+  await Promise.resolve();
+  status({ connectType: "disconnected" });
+  status({ connectType: "connected" });
+  rejectOld(Error("old page failed"));
+  await initialized;
+  assert(glasses.displayReady);
+});

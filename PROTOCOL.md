@@ -2988,6 +2988,9 @@ Client storage and answer receipts are scoped to the relay endpoint without quer
 credentials; changing endpoints clears all session/question UI state. Protocol v2
 alone is not enough to enable commands: Workspace negotiation and a valid initial
 snapshot are required. A source outage remains distinct from a socket outage.
+The client checks connection liveness during the 15-second heartbeat and when
+the app wakes. It retires a socket after at least 35 seconds without a server
+frame, rejects in-flight requests, and reconnects without replaying mutations.
 
 ### Workspace phone / schedule extension (client 0.2.0)
 
