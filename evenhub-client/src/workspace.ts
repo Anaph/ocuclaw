@@ -61,6 +61,16 @@ export interface ScheduleOptions {
   runNowPolicy: string;
   stopSupported: boolean;
 }
+interface ScheduleOperation {
+  operationId: string;
+  operation: string;
+  params: Record<string, unknown>;
+}
+export class ScheduleRejected extends Error {
+  constructor(readonly code: string) {
+    super(errorText(code));
+  }
+}
 interface PendingSend {
   id: string;
   text: string;
@@ -600,7 +610,19 @@ export class Workspace {
   private receiptKey() {
     return `ocuclaw.scheduleOperation:${encodeURIComponent(this.scope)}:${this.profile}`;
   }
-  async mutateSchedule(operation: string, params: Record<string, unknown>) {
+  pendingSchedule(): ScheduleOperation | null {
+    const saved = this.storage.getItem(this.receiptKey());
+    try {
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  }
+  async mutateSchedule(
+    operation: string,
+    params: Record<string, unknown>,
+    reserved?: (operationId: string) => void,
+  ) {
     const key = this.receiptKey(),
       profileId = this.profile;
     if (this.storage.getItem(key))
@@ -608,6 +630,7 @@ export class Workspace {
     const operationId = randomId();
     const saved = JSON.stringify({ operationId, operation, params });
     this.storage.setItem(key, saved);
+    reserved?.(operationId);
     return this.submitSchedule(key, saved, profileId);
   }
   private async submitSchedule(key: string, saved: string, profileId: string) {
@@ -619,7 +642,7 @@ export class Workspace {
     });
     this.applyScheduleReceipt(key, saved, result);
     if (result.status === "rejected")
-      throw Error(errorText(result.error || "Hermes отклонил изменение"));
+      throw new ScheduleRejected(result.error || "Hermes отклонил изменение");
     if (result.status === "uncertain" || !result.status)
       throw Error("Результат неизвестен. Проверьте операцию перед повтором.");
     return result;
@@ -636,33 +659,36 @@ export class Workspace {
     )
       this.storage.removeItem(key);
   }
-  async retrySchedule() {
+  async retrySchedule(
+    expectedOperationId = this.pendingSchedule()?.operationId,
+  ) {
     const key = this.receiptKey(),
       profileId = this.profile,
       epoch = this.profileEpoch;
     const saved = this.storage.getItem(key);
-    if (!saved) return;
+    if (!saved || JSON.parse(saved).operationId !== expectedOperationId)
+      throw Error("Операция изменилась. Проверьте её состояние заново.");
     const receipt = await this.outcome("automations.receipt", {
-      operationId: JSON.parse(saved).operationId,
+      operationId: expectedOperationId,
       profileId,
     });
     this.applyScheduleReceipt(key, saved, receipt);
-    if (receipt.status !== "not_found")
-      throw Error("Операция уже известна Hermes; повтор не отправлен");
+    if (receipt.status !== "not_found") return receipt;
     if (epoch !== this.profileEpoch || this.storage.getItem(key) !== saved)
       throw Error("Операция или профиль изменились. Повтор не отправлен.");
     return this.submitSchedule(key, saved, profileId);
   }
-  async reconcileSchedule() {
+  async reconcileSchedule(operationId = this.pendingSchedule()?.operationId) {
     const key = this.receiptKey(),
       profileId = this.profile;
     const saved = this.storage.getItem(key);
-    if (!saved) return null;
+    if (!operationId) return null;
     const result = await this.outcome("automations.receipt", {
-      operationId: JSON.parse(saved).operationId,
+      operationId,
       profileId,
     });
-    this.applyScheduleReceipt(key, saved, result);
+    if (saved && JSON.parse(saved).operationId === operationId)
+      this.applyScheduleReceipt(key, saved, result);
     return result;
   }
 }

@@ -3,6 +3,7 @@ import DOMPurify from "dompurify";
 import { AudioInputSource } from "@evenrealities/even_hub_sdk";
 import {
   Workspace,
+  ScheduleRejected,
   errorText,
   messageText,
   scheduleForm,
@@ -62,7 +63,13 @@ type ScheduleDraft = {
   form: ScheduleForm | null;
   revision?: string;
   original?: Job["fields"];
+  operationId?: string;
 };
+const fieldsMatch = (left: ScheduleFields, right: unknown) =>
+  JSON.stringify(Object.entries(left).sort()) ===
+  JSON.stringify(
+    Object.entries(right && typeof right === "object" ? right : {}).sort(),
+  );
 type SchedulePreview = {
   reviewHash: string;
   scheduleDisplay?: string;
@@ -82,6 +89,7 @@ export class PhoneApp {
   private search = "";
   private hidden = false;
   private inboxTab = "pending";
+  private inboxSession: { key: string; title: string } | null = null;
   private question: Question | null = null;
   private renameSession: { key: string; title: string } | null = null;
   private selected = new Set<number>();
@@ -108,6 +116,7 @@ export class PhoneApp {
   private preview: SchedulePreview | null = null;
   private previewUntil = 0;
   private scheduleDraftProfile = "";
+  private scheduleDraftOperation?: string;
   private fields: ScheduleFields | null = null;
   private editorState: ScheduleForm | null = null;
   private historyJob = "";
@@ -125,6 +134,8 @@ export class PhoneApp {
   private answerDraft = "";
   private contextIds = new Set<string>();
   private showContext = false;
+  private contextChatKey = "";
+  private chatMenuOpen = false;
   private renderedChatKey = "";
   private renderedMessages: Workspace["messages"] | null = null;
   private renderedStream = "";
@@ -283,12 +294,16 @@ export class PhoneApp {
     this.job = null;
     this.editorState = null;
     this.scheduleDraftProfile = "";
+    this.scheduleDraftOperation = undefined;
     this.attachmentDrafts.clear();
     this.preview = null;
     this.confirmation = null;
     this.historyJob = "";
     this.contextIds.clear();
     this.showContext = false;
+    this.contextChatKey = "";
+    this.chatMenuOpen = false;
+    this.inboxSession = null;
     this.search = "";
     this.hidden = false;
     this.showNew = false;
@@ -300,6 +315,7 @@ export class PhoneApp {
     if (tab === this.tab || this.busy) return;
     if (this.recording) return this.message("Завершите диктовку");
     if (this.tab === "schedule") this.preview = null;
+    if (tab === "inbox") this.inboxSession = null;
     this.tab = tab;
     this.question = null;
     this.renameSession = null;
@@ -358,7 +374,7 @@ export class PhoneApp {
     this.renderTabs();
     const pendingTab = this.panel.querySelector("#pending");
     if (pendingTab)
-      pendingTab.textContent = `Нужен ответ · ${orderedQuestions(this.inbox.snapshot.pending).length}`;
+      pendingTab.textContent = `Нужен ответ · ${this.pendingQuestions().length}`;
     for (const element of this.panel.querySelectorAll<HTMLElement>(
       "[data-deadline]",
     )) {
@@ -626,6 +642,12 @@ export class PhoneApp {
     const key = this.data.chatKey,
       session = this.data.sessions.find((x) => x.key === key),
       foreign = key.split(":")[2] === "x";
+    if (this.contextChatKey !== key) {
+      this.contextChatKey = key;
+      this.contextIds.clear();
+      this.showContext = false;
+      this.chatMenuOpen = false;
+    }
     const title =
       session?.label ||
       session?.displayName ||
@@ -688,12 +710,27 @@ export class PhoneApp {
       this.button("Вопросы сессии", () => {
         this.tab = "inbox";
         this.inboxTab = "pending";
+        this.inboxSession = { key, title };
         this.render();
       }),
     );
+    const menu = document.createElement("details");
+    menu.className = "chat-more";
+    menu.open = this.chatMenuOpen;
+    menu.innerHTML = '<summary>Действия</summary><div class="chat-menu"></div>';
+    menu.ontoggle = () => {
+      if (menu.isConnected) this.chatMenuOpen = menu.open;
+    };
+    const secondary = menu.querySelector(".chat-menu")!;
+    const menuAction = (label: string, action: () => void | Promise<unknown>) =>
+      this.button(label, () => {
+        this.chatMenuOpen = false;
+        menu.open = false;
+        return action();
+      });
     if (session?.actions?.pin)
-      actions.append(
-        this.button(session.pinned ? "Открепить" : "Закрепить", async () => {
+      secondary.append(
+        menuAction(session.pinned ? "Открепить" : "Закрепить", async () => {
           await this.data.request("sessions.pin", {
             key,
             pinned: !session.pinned,
@@ -702,14 +739,14 @@ export class PhoneApp {
         }),
       );
     if (session?.actions?.rename)
-      actions.append(
-        this.button("Переименовать", () => {
+      secondary.append(
+        menuAction("Переименовать", () => {
           this.renameSession = { key, title };
         }),
       );
     if (session?.actions?.hide)
-      actions.append(
-        this.button(session.hidden ? "Вернуть в список" : "Скрыть", () => {
+      secondary.append(
+        menuAction(session.hidden ? "Вернуть в список" : "Скрыть", () => {
           this.confirm(
             session.hidden
               ? "Вернуть чат в список?"
@@ -726,37 +763,58 @@ export class PhoneApp {
         }),
       );
     if (session?.actions?.stop)
-      actions.append(
-        this.button("Остановить", () => {
+      secondary.append(
+        menuAction("Остановить", () => {
           this.confirm("Остановить текущую работу Hermes?", async () => {
             await this.data.request("sessions.abort", { key });
             this.message("Остановка запрошена");
           });
         }),
       );
-    actions.append(
-      this.button(
-        this.showContext ? "Готово: создать задачу" : "Выбрать контекст задачи",
-        () => {
-          if (this.showContext) {
-            const selected = this.data.messages.filter((m, i) =>
-              this.contextIds.has(String(m.id ?? i)),
-            );
-            return this.newSchedule(
-              selected
-                .map((m) => `${m.role}: ${messageText(m.content)}`)
-                .join("\n\n"),
-            );
-          } else this.showContext = true;
-        },
-      ),
-    );
+    if (!this.showContext && this.data.messages.length)
+      secondary.append(
+        menuAction("Выбрать контекст задачи", () => {
+          this.showContext = true;
+        }),
+      );
+    if (secondary.childElementCount) actions.append(menu);
+    const createFromContext = this.showContext
+      ? this.button("", () =>
+          this.newSchedule(
+            this.data.messages
+              .filter((message, i) =>
+                this.contextIds.has(String(message.id ?? i)),
+              )
+              .map(
+                (message) => `${message.role}: ${messageText(message.content)}`,
+              )
+              .join("\n\n"),
+          ),
+        )
+      : null;
+    const updateContextAction = () => {
+      if (!createFromContext) return;
+      const count = this.contextIds.size;
+      createFromContext.textContent = `В расписание · ${count}`;
+      createFromContext.disabled = count === 0 || this.recording;
+    };
+    if (createFromContext) {
+      actions.append(
+        createFromContext,
+        this.button("Отменить выбор", () => {
+          this.contextIds.clear();
+          this.showContext = false;
+        }),
+      );
+      updateContextAction();
+    }
     this.panel.querySelectorAll<HTMLInputElement>("[data-context]").forEach(
       (input) =>
         (input.onchange = () => {
           const i = Number(input.dataset.context),
             id = String(this.data.messages[i].id ?? i);
           input.checked ? this.contextIds.add(id) : this.contextIds.delete(id);
+          updateContextAction();
         }),
     );
     this.panel.querySelectorAll<HTMLButtonElement>(".schedule-from").forEach(
@@ -866,12 +924,20 @@ export class PhoneApp {
       }),
     );
   }
+  private pendingQuestions() {
+    return orderedQuestions(
+      this.inbox.snapshot.pending.filter(
+        (item) =>
+          !this.inboxSession || item.sessionKey === this.inboxSession.key,
+      ),
+    );
+  }
   private renderInbox() {
     if (this.question) {
       this.renderQuestion();
       return;
     }
-    const pending = orderedQuestions(this.inbox.snapshot.pending);
+    const pending = this.pendingQuestions();
     const stale = !this.relay.online || !this.inbox.snapshot.available;
     const unavailable = this.relay.online
       ? "Источник вопросов недоступен"
@@ -882,8 +948,20 @@ export class PhoneApp {
     });
     this.bind("#completed", () => {
       this.inboxTab = "completed";
+      this.inboxSession = null;
     });
     const list = this.panel.querySelector("#inbox-list")!;
+    if (this.inboxSession) {
+      const scope = document.createElement("p");
+      scope.className = "row";
+      scope.textContent = this.inboxSession.title;
+      scope.append(
+        this.button("Все сессии", () => {
+          this.inboxSession = null;
+        }),
+      );
+      list.before(scope);
+    }
     if (this.inboxTab === "pending")
       for (const item of pending) {
         const card = this.button(
@@ -1089,13 +1167,12 @@ export class PhoneApp {
       context,
     );
   }
-  private scheduleDraftKey() {
+  private scheduleDraftKey(
+    profile = this.scheduleDraftProfile,
+    jobId: string | null = this.job?.id ?? null,
+  ) {
     return `ocuclaw.scheduleDraft:${encodeURIComponent(
-      JSON.stringify([
-        this.data.scope,
-        this.scheduleDraftProfile,
-        this.job?.id ?? null,
-      ]),
+      JSON.stringify([this.data.scope, profile, jobId]),
     )}`;
   }
   private saveScheduleDraft() {
@@ -1104,8 +1181,24 @@ export class PhoneApp {
       form: this.editorState,
       revision: this.job?.revision,
       original: this.job?.fields,
+      operationId: this.scheduleDraftOperation,
     };
     localStorage.setItem(this.scheduleDraftKey(), JSON.stringify(draft));
+  }
+  private readScheduleDraft(
+    key = this.scheduleDraftKey(),
+  ): ScheduleDraft | null {
+    try {
+      const draft = JSON.parse(localStorage.getItem(key) || "null");
+      return draft &&
+        ["name", "prompt", "schedule"].every(
+          (field) => typeof draft.fields?.[field] === "string",
+        )
+        ? draft
+        : null;
+    } catch {
+      return null;
+    }
   }
   private openScheduleEditor(
     job: Job | null,
@@ -1118,22 +1211,36 @@ export class PhoneApp {
     this.preview = null;
     this.fields = fields;
     this.editorState = null;
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem(this.scheduleDraftKey()) || "null",
-      ) as ScheduleDraft | null;
-      if (saved?.fields && typeof saved.fields.schedule === "string") {
-        this.fields = saved.fields;
-        this.editorState = saved.form;
-        if (job && saved.revision)
-          this.job = {
-            ...job,
-            revision: saved.revision,
-            fields: saved.original || job.fields,
-          };
+    this.scheduleDraftOperation = undefined;
+    const saved = this.readScheduleDraft();
+    if (saved) {
+      this.fields = saved.fields;
+      this.editorState = saved.form;
+      this.scheduleDraftOperation = saved.operationId;
+      if (job && saved.revision)
+        this.job = {
+          ...job,
+          revision: saved.revision,
+          fields: saved.original || job.fields,
+        };
+      const pending = this.data.pendingSchedule();
+      if (
+        !this.scheduleDraftOperation &&
+        pending &&
+        pending.operation ===
+          (job ? "automations.update" : "automations.create") &&
+        (pending.params.jobId ?? null) === (job?.id ?? null) &&
+        fieldsMatch(saved.fields, pending.params.fields)
+      ) {
+        this.scheduleDraftOperation = pending.operationId;
+        this.saveScheduleDraft();
       }
-    } catch {}
-    if (context) {
+    }
+    if (context && this.scheduleDraftOperation)
+      this.message(
+        "Сначала проверьте сохранение черновика. Затем добавьте контекст.",
+      );
+    else if (context) {
       const addition = `Контекст, выбранный пользователем:\n${context}`;
       if (!this.fields.prompt.includes(addition)) {
         this.fields.prompt = [this.fields.prompt || "Задача:\n", addition].join(
@@ -1149,6 +1256,7 @@ export class PhoneApp {
     this.editorState = null;
     this.preview = null;
     this.scheduleDraftProfile = "";
+    this.scheduleDraftOperation = undefined;
   }
   private scheduleTarget() {
     if (this.scheduleDraftProfile !== this.data.profile)
@@ -1164,7 +1272,92 @@ export class PhoneApp {
     if (this.fields === fields) {
       this.preview = preview;
       this.previewUntil = requestedAt + 115000;
+      requestAnimationFrame(() => {
+        if (this.tab === "schedule" && this.preview === preview)
+          this.panel
+            .querySelector<HTMLElement>("#schedule-preview h2")
+            ?.focus();
+      });
     }
+  }
+  private settleScheduleDraft(
+    key: string,
+    operationId: string,
+    status: string,
+    previousFields?: unknown,
+  ) {
+    if (status !== "saved" && status !== "rejected") return;
+    const draft = this.readScheduleDraft(key);
+    if (
+      draft &&
+      (draft.operationId === operationId ||
+        (!draft.operationId &&
+          previousFields &&
+          fieldsMatch(draft.fields, previousFields)))
+    ) {
+      if (status === "saved") localStorage.removeItem(key);
+      else {
+        delete draft.operationId;
+        localStorage.setItem(key, JSON.stringify(draft));
+      }
+    }
+    if (this.scheduleDraftOperation !== operationId) return;
+    if (status === "saved") this.closeScheduleEditor();
+    else {
+      this.scheduleDraftOperation = undefined;
+      this.preview = null;
+    }
+  }
+  private async checkScheduleOperation() {
+    const pending = this.data.pendingSchedule();
+    const operationId = this.scheduleDraftOperation ?? pending?.operationId;
+    if (!operationId) return this.message("Неподтверждённых операций нет");
+    if (this.scheduleDraftOperation) this.scheduleTarget();
+    const ownsDraft =
+      Boolean(this.scheduleDraftOperation) ||
+      ["automations.create", "automations.update"].includes(
+        pending?.operation || "",
+      );
+    const jobId = this.scheduleDraftOperation
+      ? this.job?.id
+      : pending?.params.jobId;
+    const key = this.scheduleDraftKey(
+      this.data.profile,
+      typeof jobId === "string" ? jobId : null,
+    );
+    const report = async (result: { status: string; error?: string }) => {
+      if (ownsDraft)
+        this.settleScheduleDraft(
+          key,
+          operationId,
+          result.status,
+          pending?.params.fields,
+        );
+      this.message(
+        result.error
+          ? errorText(result.error)
+          : `Состояние операции: ${statusText(result.status)}`,
+      );
+      if (!["not_found", "uncertain"].includes(result.status))
+        await this.data.loadJobs();
+    };
+    const result = await this.data.reconcileSchedule(operationId);
+    if (
+      result?.status === "not_found" &&
+      pending?.operationId === operationId
+    ) {
+      this.confirm(
+        "Hermes не получил операцию. Повторить её с исходным идентификатором?",
+        async () => {
+          try {
+            await report(await this.data.retrySchedule(operationId));
+          } catch (error) {
+            if (!(error instanceof ScheduleRejected)) throw error;
+            await report({ status: "rejected", error: error.code });
+          }
+        },
+      );
+    } else if (result) await report(result);
   }
   private renderSchedule() {
     if (this.fields && this.data.profile !== this.scheduleDraftProfile) {
@@ -1191,26 +1384,10 @@ export class PhoneApp {
       void this.run(() =>
         this.data.loadJobs((event.target as HTMLSelectElement).value),
       );
-    this.bind("#check-operation", async () => {
-      const result = await this.data.reconcileSchedule();
-      if (result?.status === "not_found")
-        this.confirm(
-          "Hermes не получил предыдущую операцию. Повторить её с прежним идентификатором?",
-          async () => {
-            await this.data.retrySchedule();
-            await this.data.loadJobs();
-          },
-        );
-      else
-        this.message(
-          result
-            ? result.error
-              ? errorText(result.error)
-              : `Состояние операции: ${statusText(result.status)}`
-            : "Неподтверждённых операций нет",
-        );
-      await this.data.loadJobs();
-    });
+    const check =
+      this.panel.querySelector<HTMLButtonElement>("#check-operation")!;
+    check.hidden = !this.data.pendingSchedule();
+    this.bind("#check-operation", () => this.checkScheduleOperation());
     for (const [id, label] of [
       ["all", "Все"],
       ["active", "Активные"],
@@ -1363,6 +1540,22 @@ export class PhoneApp {
       });
     });
     const form = this.panel.querySelector<HTMLFormElement>("#schedule-form")!;
+    if (this.scheduleDraftOperation) {
+      form.inert = true;
+      this.panel.querySelector<HTMLButtonElement>("#discard-schedule")!.hidden =
+        true;
+      const recovery = document.createElement("section");
+      recovery.className = "card schedule-recovery";
+      recovery.setAttribute("role", "status");
+      recovery.textContent =
+        "Сохранение ждёт подтверждения Hermes. Черновик сохранён.";
+      recovery.append(
+        this.button("Проверить сохранение", () =>
+          this.checkScheduleOperation(),
+        ),
+      );
+      form.before(recovery);
+    }
     (form.elements.namedItem("kind") as HTMLSelectElement).value = state.kind;
     const updateVisibility = () => {
       const kind = (form.elements.namedItem("kind") as HTMLSelectElement).value;
@@ -1412,9 +1605,9 @@ export class PhoneApp {
     this.bind("#schedule-voice", () =>
       this.recording ? this.stopRecording() : this.startRecording("schedule"),
     );
-    if (this.preview) {
+    if (this.preview && !this.scheduleDraftOperation) {
       const box = this.panel.querySelector("#schedule-preview")!;
-      box.innerHTML = `<section class="card"><h2>Проверьте задачу</h2><h3>${esc(this.fields!.name)}</h3><p class="preserve">${esc(this.fields!.prompt)}</p><p>${esc(this.preview.scheduleDisplay || this.fields!.schedule)} · ${esc(this.preview.timezone)}</p><h3>Ближайшие запуски по Hermes</h3><ol>${(this.preview.nextRuns || []).map((x: string) => `<li>${esc(date(x))}</li>`).join("")}</ol></section>`;
+      box.innerHTML = `<section class="card"><h2 tabindex="-1">Проверьте задачу</h2><h3>${esc(this.fields!.name)}</h3><p class="preserve">${esc(this.fields!.prompt)}</p><p>${esc(this.preview.scheduleDisplay || this.fields!.schedule)} · ${esc(this.preview.timezone)}</p><h3>Ближайшие запуски по Hermes</h3><ol>${(this.preview.nextRuns || []).map((x: string) => `<li>${esc(date(x))}</li>`).join("")}</ol></section>`;
       box.append(
         this.button("Подтвердить и сохранить", async () => {
           const fields = this.fields!;
@@ -1428,22 +1621,31 @@ export class PhoneApp {
             );
           };
           if (performance.now() >= this.previewUntil) return refresh();
+          const key = this.scheduleDraftKey();
+          let operationId: string | undefined;
           try {
-            await this.data.mutateSchedule(
+            const result = await this.data.mutateSchedule(
               this.job ? "automations.update" : "automations.create",
               {
                 fields,
                 reviewHash: preview.reviewHash,
                 ...this.scheduleTarget(),
               },
+              (id) => {
+                operationId = this.scheduleDraftOperation = id;
+                this.saveScheduleDraft();
+                form.inert = true;
+              },
             );
+            if (operationId)
+              this.settleScheduleDraft(key, operationId, result.status);
           } catch (error) {
-            if ((error as Error).message === errorText("preview_expired"))
-              return refresh();
+            if (error instanceof ScheduleRejected && operationId) {
+              this.settleScheduleDraft(key, operationId, "rejected");
+              if (error.code === "preview_expired") return refresh();
+            }
             throw error;
           }
-          localStorage.removeItem(this.scheduleDraftKey());
-          this.closeScheduleEditor();
           await this.data.loadJobs();
         }),
       );

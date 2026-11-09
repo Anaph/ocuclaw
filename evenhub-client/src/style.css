@@ -322,12 +322,41 @@ input[type="checkbox"] {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.chat-open #chat-actions,
 .chat-open .compose-tools {
   flex-wrap: nowrap;
   overflow-x: auto;
   flex-shrink: 0;
   scrollbar-width: thin;
+}
+.chat-open #chat-actions {
+  flex-shrink: 0;
+}
+.chat-more {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.chat-more summary {
+  border: 1px solid #355043;
+  background: #14251f;
+  border-radius: 9px;
+  padding: 7px 10px;
+}
+.chat-menu {
+  position: absolute;
+  inset-inline-end: 0;
+  z-index: 2;
+  display: grid;
+  gap: 4px;
+  width: min(17rem, 100%);
+  padding: 8px;
+  border: 1px solid #476457;
+  border-radius: 10px;
+  background: #10201b;
+}
+.schedule-recovery button {
+  display: block;
+  margin: 12px 0 0;
 }
 .chat-open #chat-actions button,
 .chat-open .compose-tools > * {

@@ -442,7 +442,7 @@ test("a rejected schedule mutation can be corrected and submitted as a new opera
   );
 });
 
-test("a schedule saved before socket loss is reconciled without a second create", async ({
+test("a saved schedule clears its restored draft even when the HUD already checked the shared receipt", async ({
   page,
 }) => {
   const { calls, dropNextReply } = await server(page);
@@ -470,17 +470,24 @@ test("a schedule saved before socket loss is reconciled without a second create"
   await expect(page.locator("#phone-status")).toContainText("● Hermes", {
     timeout: 10000,
   });
-  await save.click();
-  await expect(page.locator("#phone-notice")).toContainText(
-    "Сначала проверьте предыдущую операцию",
-  );
-  await page.getByRole("button", { name: "‹ Расписание", exact: true }).click();
-  await page
-    .getByRole("button", {
-      name: "Проверить неподтверждённую операцию",
-      exact: true,
-    })
-    .click();
+  await expect(save).toHaveCount(0);
+  const check = page.getByRole("button", {
+    name: "Проверить сохранение",
+    exact: true,
+  });
+  await expect(check).toBeVisible();
+  await page.evaluate(() => {
+    for (const key of Object.keys(localStorage))
+      if (key.startsWith("ocuclaw.scheduleOperation:"))
+        localStorage.removeItem(key);
+  });
+  await connect(page);
+  await page.getByRole("button", { name: "Расписание", exact: true }).click();
+  const newJob = page.getByRole("button", { name: "＋ Задача", exact: true });
+  await newJob.click();
+  await expect(page.locator("#job-name")).toHaveValue("Один запуск операции");
+  await expect(save).toHaveCount(0);
+  await check.click();
   await expect(page.locator("#phone-notice")).toContainText("Сохранено");
   await expect(
     page.getByRole("heading", { name: "Один запуск операции", exact: true }),
@@ -491,6 +498,8 @@ test("a schedule saved before socket loss is reconciled without a second create"
   expect(creates).toHaveLength(1);
   const receipt = calls.find((frame) => frame.method === "automations.receipt");
   expect(receipt.params.operationId).toBe(creates[0].params.operationId);
+  await newJob.click();
+  await expect(page.getByLabel("Название", { exact: true })).toHaveValue("");
 });
 
 async function simulateG2(page: Page) {
@@ -578,10 +587,10 @@ async function simulateG2(page: Page) {
   return { hud, event, ring, shown };
 }
 
-test("simulated G2 microphone creates a native schedule preview and requires a tap to save", async ({
+test("R1 dictates and confirms a schedule, then recovers a lost save acknowledgment", async ({
   page,
 }) => {
-  const { calls, replyNext } = await server(page);
+  const { calls, replyNext, dropNextReply } = await server(page);
   const { hud, event, ring, shown } = await simulateG2(page);
   await event({ menuItemClickEvent: { itemID: 104 } });
   await expect(
@@ -648,14 +657,31 @@ test("simulated G2 microphone creates a native schedule preview and requires a t
     .screenshot({ path: "test-results/g2-schedule-simulation.png" });
   await shown("> Создать задачу");
   await shown("Ближайший запуск: 2026-11-10 09:00:00+03:00");
+  dropNextReply("automations.create");
   await page.waitForTimeout(250);
   await ring();
+  await shown("> Проверить сохранение");
+  await expect(hud.locator("#connection")).toHaveText("VPS подключён", {
+    timeout: 10000,
+  });
+  await ring(3);
+  await shown("Сохранение задачи");
+  await shown("> Проверить сохранение");
+  await ring();
+  await shown("Подтверждение");
+  await shown("> Проверить сохранение");
+  await ring();
+  await shown("Задача сохранена");
   await expect(
     hud.getByRole("button", { name: /Голосовая сводка/ }),
   ).toBeVisible();
   const creates = calls.filter((call) => call.method === "automations.create");
   expect(creates).toHaveLength(1);
   expect(creates[0].params.reviewHash).toBe("a".repeat(64));
+  expect(
+    calls.find((call) => call.method === "automations.receipt")?.params
+      .operationId,
+  ).toBe(creates[0].params.operationId);
 });
 
 test("R1 shows the exact answer and checks an unconfirmed operation before retrying", async ({
@@ -710,22 +736,21 @@ test("R1 reads long permission context, cancels, then uses the system exit at th
   page,
 }) => {
   const fixture = await server(page);
-  fixture.replacePending([
-    {
-      id: "permission",
-      sessionKey: "hermes:main:b",
-      sessionTitle: "Разрешение",
-      agentName: "Hermes",
-      kind: "permission",
-      question: "Команда агента. ".repeat(45),
-      choices: [],
-      multiSelect: false,
-      allowOther: false,
-      createdAtMs: Date.now(),
-      expiresAtMs: Date.now() + 60000,
-      allowedDecisions: ["allow-once", "deny"],
-    },
-  ]);
+  const permission: Question = {
+    id: "permission",
+    sessionKey: "hermes:main:b",
+    sessionTitle: "Разрешение",
+    agentName: "Hermes",
+    kind: "permission",
+    question: "Команда агента. ".repeat(45),
+    choices: [],
+    multiSelect: false,
+    allowOther: false,
+    createdAtMs: Date.now(),
+    expiresAtMs: Date.now() + 60000,
+    allowedDecisions: ["allow-once", "deny"],
+  };
+  fixture.replacePending([permission]);
   const { ring, shown } = await simulateG2(page);
   await shown("> Нужен ответ · 1");
   await ring();
@@ -738,6 +763,20 @@ test("R1 reads long permission context, cancels, then uses the system exit at th
   await shown("> Полный текст вопроса");
   await ring();
   await shown("Текст · 1/");
+  fixture.replacePending([
+    permission,
+    {
+      id: "new-question",
+      sessionKey: "hermes:main:a",
+      sessionTitle: "Первый чат",
+      agentName: "Hermes",
+      kind: "question",
+      question: "Новый запрос",
+      createdAtMs: Date.now(),
+      expiresAtMs: null,
+    },
+  ]);
+  fixture.update();
   await ring(2);
   await shown("Текст · 2/");
   await ring(3);
@@ -751,7 +790,9 @@ test("R1 reads long permission context, cancels, then uses the system exit at th
   await ring(3);
   await shown("> Разрешить один раз");
   await ring(3);
-  await shown("Нужен ответ · 1");
+  await shown("Новый вопрос · Hermes");
+  await ring(3);
+  await shown("Нужен ответ · 2");
   await ring(3);
   await shown("OcuClaw");
   await ring(3);
@@ -818,13 +859,13 @@ test("R1 pages a long selected answer and refuses to send after its deadline", a
   await ring();
   await shown("«Последний квартал");
   await ring(2);
-  await shown("> Прочитать ответ полностью");
+  await shown("> Прочитать полностью");
   await ring();
   await shown("Текст · 1/");
   await ring(2);
   await shown("Текст · 2/");
   await ring(3);
-  await shown("> Прочитать ответ полностью");
+  await shown("> Прочитать полностью");
   await ring(1);
   await shown("> Отправить");
   await page.evaluate(() => {
@@ -939,6 +980,58 @@ test("phone keeps the composer visible, anchors older history, and leaves readin
   await expect(send).toBeInViewport();
 });
 
+test("the phone exposes chat actions on a narrow screen and scopes context and questions to the chat", async ({
+  page,
+}) => {
+  const fixture = await server(page);
+  fixture.replacePending(
+    ["a", "b"].map((key) => ({
+      id: `q-${key}`,
+      sessionKey: `hermes:main:${key}`,
+      sessionTitle: key === "a" ? "Первый чат" : "Другой чат",
+      question: `Вопрос ${key}`,
+      kind: "question",
+      agentName: "Hermes",
+      createdAtMs: Date.now(),
+      expiresAtMs: null,
+    })),
+  );
+  await page.setViewportSize({ width: 320, height: 720 });
+  await connect(page);
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  const menu = page.locator(".chat-more summary");
+  await expect(menu).toBeInViewport();
+  await menu.click();
+  await expect(
+    page.getByRole("button", { name: "Переименовать", exact: true }),
+  ).toBeInViewport();
+  await page
+    .getByRole("button", { name: "Выбрать контекст задачи", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "В расписание · 0", exact: true }),
+  ).toBeDisabled();
+  await page.getByLabel("В контекст задачи", { exact: true }).first().check();
+  await expect(
+    page.getByRole("button", { name: "В расписание · 1", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "‹ Чаты", exact: true }).click();
+  await page.getByRole("button", { name: /Другой чат/ }).click();
+  await expect(
+    page.getByLabel("В контекст задачи", { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Вопросы сессии", exact: true })
+    .click();
+  await expect(page.locator("#inbox-list")).toContainText("Вопрос b");
+  await expect(page.locator("#inbox-list")).not.toContainText("Вопрос a");
+  await page.getByRole("button", { name: "Все сессии", exact: true }).click();
+  await expect(page.locator("#inbox-list")).toContainText("Вопрос a");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
+    320,
+  );
+});
+
 test("phone without G2: streaming, draft, attachment upload, addressed Inbox and independent HUD", async ({
   page,
 }) => {
@@ -1037,6 +1130,9 @@ test("schedule uses server preview before save, native pause/run and execution h
   await expect(
     page.getByRole("heading", { name: "Ближайшие запуски по Hermes" }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Проверьте задачу", exact: true }),
+  ).toBeFocused();
   expect(calls.filter((x) => x.method === "automations.create")).toHaveLength(
     0,
   );

@@ -15,6 +15,9 @@ import { Relay } from "./transport";
 import { ReceiptStore, endpointScope, isSnapshot } from "./protocol";
 import {
   Workspace,
+  ScheduleRejected,
+  errorText,
+  statusText,
   type Job,
   type ScheduleFields,
   type SendAttempt,
@@ -52,6 +55,8 @@ interface Confirmation {
   text: string;
   bodyLines?: string[];
   label: string;
+  checkLabel?: string;
+  retryLabel?: string;
   back: Screen;
   send: () => Promise<void>;
   check?: () => Promise<void>;
@@ -82,7 +87,7 @@ export function mountHud(
     | { kind: "message"; key: string; context?: string; attempt?: SendAttempt }
     | { kind: "rename"; key: string }
     | { kind: "search" }
-    | { kind: "schedule" };
+    | { kind: "schedule"; recovery?: Confirmation };
   let target: Target | null = null,
     draft = "",
     readText = "",
@@ -189,23 +194,32 @@ export function mountHud(
     }
   }
   function go(next: Screen) {
+    if (notification) clearNotification();
     notice = "";
     screen = next;
     selected = 0;
     if (next === "pending") model.enter();
     render();
+    showNotification();
   }
   function confirm(
     text: string,
     action: () => Promise<void>,
     back: Screen = screen,
-    options: Partial<Pick<Confirmation, "label" | "phase" | "bodyLines">> = {},
+    options: Partial<
+      Pick<
+        Confirmation,
+        "label" | "phase" | "bodyLines" | "checkLabel" | "retryLabel"
+      >
+    > = {},
   ) {
     confirmation = {
       id: ++confirmationId,
       text,
       label: options.label ?? "Отправить",
       bodyLines: options.bodyLines,
+      checkLabel: options.checkLabel,
+      retryLabel: options.retryLabel,
       back,
       send: action,
       phase: options.phase ?? "review",
@@ -446,14 +460,47 @@ export function mountHud(
               render();
             },
           })),
-          {
-            id: "receipt",
-            label: "Проверить прошлое действие",
-            run: async () => {
-              const result = await workspace.reconcileSchedule();
-              message(result?.status || "Нет неподтверждённых действий");
-            },
-          },
+          ...(workspace.pendingSchedule()
+            ? [
+                {
+                  id: "receipt",
+                  label: "Проверить операцию",
+                  run: async () => {
+                    const operation = workspace.pendingSchedule();
+                    if (!operation) return;
+                    const report = async (result: {
+                      status: string;
+                      error?: string;
+                    }) => {
+                      message(
+                        result.error
+                          ? errorText(result.error)
+                          : statusText(result.status),
+                      );
+                      if (result.status !== "uncertain")
+                        await workspace.loadJobs();
+                    };
+                    const receipt = await workspace.reconcileSchedule(
+                      operation.operationId,
+                    );
+                    if (receipt?.status === "not_found")
+                      confirm(
+                        "Hermes не получил операцию. Повторить?",
+                        async () => {
+                          const result = await workspace.retrySchedule(
+                            operation.operationId,
+                          );
+                          go("jobs");
+                          await report(result);
+                        },
+                        "jobs",
+                        { label: "Повторить" },
+                      );
+                    else if (receipt) await report(receipt);
+                  },
+                },
+              ]
+            : []),
         ],
       };
     if (screen === "job" && currentJob) {
@@ -855,15 +902,15 @@ export function mountHud(
                   : "send",
             label:
               flow.phase === "check"
-                ? "Проверить отправку"
+                ? flow.checkLabel || "Проверить отправку"
                 : flow.phase === "retry"
-                  ? "Повторить отправку"
+                  ? flow.retryLabel || "Повторить отправку"
                   : flow.label,
             run: flow.phase === "check" && flow.check ? flow.check : flow.send,
           },
           {
             id: "full",
-            label: "Прочитать ответ полностью",
+            label: "Прочитать полностью",
             run: () => full(flow.text),
           },
           {
@@ -872,6 +919,28 @@ export function mountHud(
             run: () => go(flow.back),
           },
           { id: "cancel", label: "Отмена", run: () => go(flow.back) },
+        ],
+      };
+    }
+    if (
+      screen === "compose" &&
+      target?.kind === "schedule" &&
+      target.recovery
+    ) {
+      const recovery = target.recovery;
+      return {
+        title: "Сохранение задачи",
+        body: "Проверьте квитанцию Hermes.",
+        actions: [
+          {
+            id: "resume-save",
+            label: "Проверить сохранение",
+            run: () => {
+              confirmation = recovery;
+              go("confirm");
+            },
+          },
+          close,
         ],
       };
     }
@@ -924,28 +993,97 @@ export function mountHud(
     return {
       title: `Текст · ${readPage + 1}/${chunks.length}`,
       body: chunks[readPage] || "",
-      actions: [
-        {
-          id: "next",
-          label: "Следующая страница",
-          run: () => {
-            readPage = (readPage + 1) % chunks.length;
-            render();
-          },
-        },
-        {
-          id: "prev",
-          label: "Предыдущая страница",
-          run: () => {
-            readPage = (readPage + chunks.length - 1) % chunks.length;
-            render();
-          },
-        },
-        close,
-      ],
+      actions: [close],
+    };
+  }
+  async function reviewSchedule(
+    bound: Extract<Target, { kind: "schedule" }>,
+    text: string,
+  ) {
+    if (workspace.pendingSchedule()) {
+      go("jobs");
+      return message("Проверьте предыдущую операцию расписания.");
+    }
+    const draftResult = await workspace.schedule("automations.draft", { text });
+    const fields = draftResult.fields as ScheduleFields;
+    const { preview } = await workspace.schedule("automations.preview", {
+      fields,
+    });
+    const nextRun = preview.nextRuns[0]?.replace("T", " ") || "—";
+    const nearest = `Ближайший запуск: ${nextRun}`;
+    let operationId: string | undefined;
+    async function report(receipt: { status: string; error?: string }) {
+      if (receipt.status === "saved") {
+        bound.recovery = undefined;
+        go("jobs");
+        message("Задача сохранена");
+        await workspace
+          .loadJobs()
+          .catch(() => message("Задача сохранена. Список пока недоступен."));
+      } else if (receipt.status === "rejected") {
+        bound.recovery = undefined;
+        go("compose");
+        message(errorText(receipt.error || "Hermes отклонил задачу"));
+      } else if (
+        receipt.status === "not_found" &&
+        workspace.pendingSchedule()?.operationId === operationId
+      ) {
+        flow.phase = "retry";
+        message("Hermes не получил операцию. Можно повторить.");
+      } else {
+        flow.phase = "check";
+        message(
+          receipt.error
+            ? errorText(receipt.error)
+            : "Сохранение ещё не подтверждено",
+        );
+      }
+    }
+    const flow = confirm(
+      `${fields.name}\n${nearest}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
+      async () => {
+        try {
+          const result = operationId
+            ? await workspace.retrySchedule(operationId)
+            : await workspace.mutateSchedule(
+                "automations.create",
+                {
+                  fields,
+                  reviewHash: preview.reviewHash,
+                },
+                (id) => {
+                  operationId = id;
+                },
+              );
+          await report(result);
+        } catch (error) {
+          if (error instanceof ScheduleRejected)
+            return report({ status: "rejected", error: error.code });
+          if (operationId) {
+            flow.phase = "check";
+            bound.recovery = flow;
+          }
+          throw error;
+        }
+      },
+      "compose",
+      {
+        label: "Создать задачу",
+        checkLabel: "Проверить сохранение",
+        retryLabel: "Повторить сохранение",
+        bodyLines: [fields.name, nearest],
+      },
+    );
+    flow.check = async () => {
+      const receipt = await workspace.reconcileSchedule(operationId);
+      if (receipt) await report(receipt);
     };
   }
   function useDraft() {
+    if (target?.kind === "schedule" && target.recovery) {
+      confirmation = target.recovery;
+      return go("confirm");
+    }
     draft = textField.value.trim() || draft;
     if (!draft) return message("Введите или надиктуйте текст");
     if (!target) return;
@@ -954,32 +1092,8 @@ export function mountHud(
         target?.kind === "message" && target.context
           ? `${target.context}\n${draft}`
           : draft;
-    if (boundTarget.kind === "schedule") {
-      return (async () => {
-        const result = await workspace.schedule("automations.draft", {
-          text: boundDraft,
-        });
-        const fields = result.fields as ScheduleFields;
-        const { preview } = await workspace.schedule("automations.preview", {
-          fields,
-        });
-        const nextRun = preview.nextRuns[0]?.replace("T", " ") || "—";
-        const nearest = `Ближайший запуск: ${nextRun}`;
-        confirm(
-          `${fields.name}\n${nearest}\n\n${preview.scheduleDisplay} · ${preview.timezone}\n${preview.nextRuns.join("\n")}\n\n${fields.prompt}`,
-          async () => {
-            await workspace.mutateSchedule("automations.create", {
-              fields,
-              reviewHash: preview.reviewHash,
-            });
-            await workspace.loadJobs();
-            go("jobs");
-          },
-          "compose",
-          { label: "Создать задачу", bodyLines: [fields.name, nearest] },
-        );
-      })();
-    }
+    if (boundTarget.kind === "schedule")
+      return reviewSchedule(boundTarget, boundDraft);
     if (boundTarget.kind === "question") {
       questionId = boundTarget.id;
       const item = q();
@@ -1114,8 +1228,7 @@ export function mountHud(
       notification ||
       glasses.isRecording ||
       glasses.phoneInteracting ||
-      ["record", "confirm", "compose"].includes(screen) ||
-      (screen === "read" && ["confirm", "compose"].includes(readReturn)) ||
+      ["record", "confirm", "compose", "read", "question"].includes(screen) ||
       busy
     )
       return;
@@ -1230,6 +1343,7 @@ export function mountHud(
       chatKey,
       currentJob?.id,
       confirmation?.id,
+      screen === "read" ? readPage : null,
       current.actions[selected]?.id,
     ]);
   }
@@ -1449,7 +1563,8 @@ export function mountHud(
       actions.append(button);
     });
     app.querySelector<HTMLFormElement>("#text-form")!.hidden =
-      screen !== "compose";
+      screen !== "compose" ||
+      (target?.kind === "schedule" && Boolean(target.recovery));
     textField.disabled = busy;
     const canvas = draw(current);
     document
