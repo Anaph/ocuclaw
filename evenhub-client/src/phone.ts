@@ -128,8 +128,11 @@ export class PhoneApp {
   private showNew = false;
   private creationProfile = "default";
   private creationModel = "";
-  private confirmation: { text: string; action: () => Promise<void> } | null =
-    null;
+  private confirmation: {
+    text: string;
+    action: () => Promise<void>;
+    label: string;
+  } | null = null;
   private panel: HTMLElement;
   private status: HTMLElement;
   private toast: HTMLElement;
@@ -276,8 +279,12 @@ export class PhoneApp {
       .querySelector(selector)
       ?.addEventListener("click", () => void this.run(action));
   }
-  private confirm(text: string, action: () => Promise<void>) {
-    this.confirmation = { text, action };
+  private confirm(
+    text: string,
+    action: () => Promise<void>,
+    label = "Подтвердить",
+  ) {
+    this.confirmation = { text, action, label };
     this.render();
   }
   private async refreshInbox() {
@@ -493,7 +500,9 @@ export class PhoneApp {
   private renderVerificationBadge() {
     const count = this.data.unconfirmed().length;
     this.verificationButton.hidden =
-      !count || (this.tab === "inbox" && this.inboxTab === "verification");
+      !count ||
+      !!this.confirmation ||
+      (this.tab === "inbox" && this.inboxTab === "verification");
     this.verificationButton.textContent = `Нужна проверка · ${count}`;
   }
   private async verifySend(key: string, operationId?: string) {
@@ -738,9 +747,9 @@ export class PhoneApp {
     this.panel.innerHTML = `<section class="card"><h1>Подтверждение</h1><p class="preserve">${esc(pending.text)}</p><div class="row" id="confirm-actions"></div></section>`;
     const actions = this.panel.querySelector("#confirm-actions")!;
     actions.append(
-      this.button("Подтвердить", async () => {
+      this.button(pending.label, async () => {
         await pending.action();
-        this.confirmation = null;
+        if (this.confirmation === pending) this.confirmation = null;
       }),
       this.button("Изменить / Назад", () => {
         this.confirmation = null;
@@ -1318,22 +1327,55 @@ export class PhoneApp {
     const prepare = (answer: Answer, label: string) => {
       if (!canSend(item)) return this.message("Срок ответа истёк");
       const action = "decision" in answer ? item.permissionCommand : null;
-      this.confirm(
-        `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}${action ? `\n\n${action}` : ""}`,
-        async () => {
-          const result = await this.data.answer(item, answer);
-          if (result.status !== "accepted")
-            throw Error(
-              result.error
-                ? errorText(result.error)
-                : statusText(result.status),
-            );
+      const text = `${item.agentName} / ${item.sessionTitle}\n\nОтправить ответ:\n${label}${action ? `\n\n${action}` : ""}`;
+      const attempt = this.data.answerAttempt(item);
+      const report = async (result: { status: string; error?: string }) => {
+        if (
+          ["accepted", "already_answered", "expired", "not_found"].includes(
+            result.status,
+          )
+        ) {
           this.question = null;
           this.answerDraft = "";
           await this.refreshInbox().catch(() => {});
-          this.message("Ответ принят");
-        },
-      );
+          this.message(
+            result.status === "accepted"
+              ? "Ответ принят"
+              : statusText(result.status),
+          );
+          return;
+        }
+        throw Error(
+          result.error ? errorText(result.error) : statusText(result.status),
+        );
+      };
+      const check = async () => {
+        const result = await this.data.checkAnswer(item, attempt);
+        if (result.status === "pending") {
+          this.confirm(text, submit, "Повторить отправку");
+          this.message("Вопрос ещё открыт. Проверьте ответ перед повтором.");
+          return;
+        }
+        await report(result);
+      };
+      const submit = async () => {
+        let result;
+        try {
+          result = await this.data.answer(item, answer, attempt);
+        } catch (error) {
+          if (attempt.operationId)
+            this.confirm(text, check, "Проверить отправку");
+          throw error;
+        }
+        if (
+          attempt.operationId &&
+          ["uncertain", "source_unavailable"].includes(result.status)
+        )
+          this.confirm(text, check, "Проверить отправку");
+        await report(result);
+      };
+      if (attempt.operationId) this.confirm(text, check, "Проверить отправку");
+      else this.confirm(text, submit);
     };
     if (item.kind === "permission")
       for (const decision of item.allowedDecisions || []) {
@@ -2012,12 +2054,8 @@ export class PhoneApp {
     try {
       const pcm = await this.glasses.stop();
       if (cancel) return;
-      const result = await this.data.request("workspace.stt.transcribe", {
-        wav: wavBase64(pcm),
-        language: "ru",
-      });
-      const text = String(result.text || result.transcript || "").trim();
-      if (!text) throw Error("Речь не распознана. Повторите запись.");
+      if (!pcm.length) throw Error("Запись пуста");
+      const text = await this.data.transcribe(wavBase64(pcm));
       if (this.dictationTarget === "chat")
         this.data.saveDraft(
           [this.data.draft(), text].filter(Boolean).join("\n"),

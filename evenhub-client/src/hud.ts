@@ -1254,25 +1254,11 @@ export function mountHud(
   async function transcribeRecording() {
     const pcm = voiceRetry;
     if (!pcm) throw Error("Запись пуста");
-    let provider = providerField.value.trim();
-    if (!provider) {
-      const listing = await relay.request("workspace.stt.providers");
-      provider = listing.providers?.find(
-        (item: { available?: boolean; id: string }) => item.available,
-      )?.id;
-    }
-    if (!provider) throw Error("На VPS не настроено распознавание речи");
-    const reply = await relay.request("workspace.stt.transcribe", {
-      wav: wavBase64(pcm),
-      provider,
-      language: "ru",
-    });
-    const transcript =
-      typeof reply.transcript === "string" ? reply.transcript.trim() : "";
-    if (!reply.success || !transcript)
-      throw Error(reply.error || "Не удалось распознать речь");
+    draft = await workspace.transcribe(
+      wavBase64(pcm),
+      providerField.value.trim(),
+    );
     voiceRetry = null;
-    draft = transcript;
     textField.value = draft;
     positions.set("compose", "use");
     message("Проверьте текст перед отправкой");

@@ -1,286 +1,16 @@
 import { test, expect, type Page } from "@playwright/test";
 import type { Completion, Question } from "../src/model";
+import { workspaceFixture } from "../testing/workspace-fixture";
 async function server(page: Page) {
-  const calls: any[] = [];
-  const sendReceipts = new Map<string, any>();
-  const scheduleReceipts = new Map<string, any>();
-  const answerReceipts = new Map<string, any>();
-  const nextReply = new Map<string, any>();
-  const dropReplies = new Set<string>();
-  let peer: any;
-  let jobs: any[] = [];
-  let completed: Completion[] = [];
-  let pending: Question[] = [
-    {
-      id: "question-1",
-      sessionKey: "hermes:main:b",
-      sessionTitle: "Другой чат",
-      agentName: "Hermes",
-      kind: "question",
-      question: "Какой период?",
-      choices: ["Квартал", "Год"],
-      multiSelect: false,
-      allowOther: true,
-      createdAtMs: Date.now(),
-      expiresAtMs: Date.now() + 600000,
-    },
-  ];
-  const sessions = [
-    {
-      key: "hermes:main:a",
-      label: "Первый чат",
-      preview: "Результат",
-      agentStatus: { working: true },
-      actions: { rename: true, pin: true, hide: true, stop: true },
-    },
-    {
-      key: "hermes:main:b",
-      label: "Другой чат",
-      agentStatus: { needsYou: true },
-      actions: { rename: true, pin: true, hide: true, stop: true },
-    },
-  ];
-  let messages: any[] = [
-    { id: 1, role: "user", content: "Подготовь отчёт" },
-    {
-      id: 2,
-      role: "assistant",
-      content:
-        "## Отчёт\n```js\nconst ok = true;\n```\n<script>window.injected=true</script>",
-    },
-  ];
-  const snapshot = () => ({
-    version: 1,
-    available: true,
-    authorizedNamespaces: ["main", "research"],
-    capabilities: {
-      allGatewayQuestions: true,
-      coverage: "gateway",
-      permissions: "gateway",
-    },
-    pending,
-    completed,
-  });
-  const options = {
-    supported: true,
-    serverNowMs: Date.now(),
-    timezone: "Europe/Istanbul",
-    missedPolicy: "Штатные правила Hermes",
-    parallelPolicy: "Hermes",
-    runNowPolicy: "Ближайший запуск переносится на сейчас",
-    stopSupported: true,
-  };
-  await page.routeWebSocket("ws://127.0.0.1:47801/**", (socket) => {
-    peer = socket;
-    socket.onMessage((raw) => {
-      const frame = JSON.parse(String(raw));
-      if (frame.type === "protocolHello") {
-        socket.send(
-          JSON.stringify({ type: "protocolHelloAck", protocolVersion: "v2" }),
-        );
-        return;
-      }
-      if (frame.type === "ping") return;
-      calls.push(frame);
-      const p = frame.params || {};
-      let data: any = {};
-      if (frame.method === "capabilities")
-        data = {
-          version: 1,
-          chatStream: true,
-          catalog: true,
-          schedules: true,
-          uploads: {
-            fileBytes: 16777216,
-            totalBytes: 33554432,
-            chunkBytes: 65536,
-            files: 8,
-          },
-        };
-      if (["inbox.subscribe", "inbox.snapshot"].includes(frame.method))
-        data = snapshot();
-      if (frame.method === "inbox.completed")
-        data = {
-          items: completed.filter(
-            (item) =>
-              !p.id || (item.id === p.id && item.sessionKey === p.sessionKey),
-          ),
-        };
-      if (frame.method === "workspace.catalog")
-        data = {
-          agents: [
-            { id: "default", name: "Hermes" },
-            { id: "research", name: "Исследователь" },
-          ],
-          models: [{ id: "model-a", provider: "custom", name: "Модель A" }],
-        };
-      if (frame.method === "sessions.list") data = { sessions };
-      if (frame.method === "sessions.create")
-        data = {
-          key:
-            p.profileId === "research"
-              ? "hermes:research:new"
-              : "hermes:main:new",
-        };
-      if (["chat.history", "chat.subscribe"].includes(frame.method))
-        data = { messages, hasMore: false, nextBeforeId: null };
-      if (frame.method === "agent") {
-        data = nextReply.get("agent") ?? { status: "accepted", runId: "run-1" };
-        if (data.status === "accepted")
-          messages = [
-            ...messages,
-            { id: messages.length + 1, role: "user", content: p.message },
-          ];
-        sendReceipts.set(p.idempotencyKey, data);
-      }
-      if (frame.method === "workspace.send.receipt")
-        data = sendReceipts.get(p.operationId) ?? { status: "not_found" };
-      if (frame.method === "inbox.get") {
-        const item = pending.find(
-          (x) => x.id === p.id && x.sessionKey === p.sessionKey,
-        );
-        data = item
-          ? { status: "pending", item }
-          : { status: "already_answered" };
-      }
-      if (frame.method === "inbox.answer") {
-        data = nextReply.get(frame.method) ?? { status: "accepted" };
-        if (data.status === "accepted")
-          pending = pending.filter((item) => item.id !== p.id);
-        answerReceipts.set(p.operationId, data);
-      }
-      if (frame.method === "inbox.operation")
-        data = answerReceipts.get(p.operationId) ?? { status: "not_found" };
-      if (frame.method === "automations.options") data = options;
-      if (frame.method === "jobs.list") data = { jobs };
-      if (frame.method === "workspace.stt.providers")
-        data = { providers: [{ id: "simulated", available: true }] };
-      if (frame.method === "workspace.stt.transcribe")
-        data = {
-          success: true,
-          transcript: "Каждый день в девять собирай сводку",
-        };
-      if (frame.method === "automations.draft")
-        data = {
-          fields: {
-            name: "Голосовая сводка",
-            prompt: p.text,
-            schedule: "0 9 * * *",
-          },
-        };
-      if (frame.method === "automations.preview")
-        data = {
-          preview: {
-            fields: p.fields,
-            reviewHash: "a".repeat(64),
-            timezone: "Europe/Istanbul",
-            scheduleDisplay: p.fields.schedule,
-            nextRuns: [
-              "2026-11-10T09:00:00+03:00",
-              "2026-11-11T09:00:00+03:00",
-            ],
-          },
-        };
-      if (
-        frame.method === "automations.create" &&
-        !nextReply.has(frame.method)
-      ) {
-        jobs = [
-          {
-            id: "job-1",
-            name: p.fields.name,
-            state: "scheduled",
-            schedule: p.fields.schedule,
-            nextRunAt: "2026-11-10T09:00:00+03:00",
-            fields: p.fields,
-            revision: "b".repeat(64),
-          },
-        ];
-        data = { status: "saved" };
-      }
-      if (frame.method === "automations.read") data = { job: jobs[0] };
-      if (frame.method === "automations.receipt")
-        data = scheduleReceipts.get(p.operationId) ?? { status: "not_found" };
-      if (frame.method === "jobs.pause") {
-        jobs[0].paused = true;
-        data = { status: "applied" };
-      }
-      if (frame.method === "jobs.run") data = { status: "applied" };
-      if (frame.method === "jobs.history")
-        data = {
-          history: [
-            {
-              id: "execution-1",
-              jobId: "job-1",
-              status: "completed",
-              delivery: "not_configured",
-              summary: "Задача выполнена",
-              sessionKey: "hermes:main:x:cron:cron_test",
-            },
-          ],
-        };
-      if (frame.method === "uploads.begin")
-        data = { id: "upload-1", chunkBytes: 65536 };
-      if (frame.method === "uploads.chunk")
-        data = {
-          id: p.id,
-          offset: p.offset + atob(p.content).length,
-          complete: true,
-        };
-      if (nextReply.has(frame.method)) {
-        data = nextReply.get(frame.method);
-        nextReply.delete(frame.method);
-      }
-      if (frame.method === "automations.create")
-        scheduleReceipts.set(p.operationId, data);
-      if (dropReplies.delete(frame.method)) {
-        void socket.close({ code: 1012, reason: "Simulated relay restart" });
-        return;
-      }
-      socket.send(
-        JSON.stringify({
-          type: "ocuclaw.workspace.result",
-          version: 1,
-          id: frame.id,
-          data,
-        }),
-      );
-    });
-  });
-  return {
-    calls,
-    replacePending: (items: typeof pending) => {
-      pending = items;
-    },
-    replaceCompleted: (items: Completion[]) => {
-      completed = items;
-    },
-    replyNext: (method: string, data: unknown) => nextReply.set(method, data),
-    dropNextReply: (method: string) => dropReplies.add(method),
-    resolveExternal: () => {
-      pending = [];
-    },
-    update: (patch: Partial<ReturnType<typeof snapshot>> = {}) =>
-      peer.send(
-        JSON.stringify({
-          type: "ocuclaw.workspace.changed",
-          version: 1,
-          data: { ...snapshot(), ...patch },
-        }),
-      ),
-    emit: (event: string, data: any) =>
-      peer.send(
-        JSON.stringify({
-          type: "ocuclaw.workspace.chat",
-          version: 1,
-          event,
-          data,
-        }),
-      ),
-  };
+  const fixture = workspaceFixture();
+  await page.routeWebSocket("ws://127.0.0.1:47801/**", fixture.attach);
+  return fixture;
 }
 async function connect(page: Page) {
   await page.goto("/?preview=1");
+  await fillPhoneConnection(page);
+}
+async function fillPhoneConnection(page: Page) {
   await page.getByRole("button", { name: "Настройки", exact: true }).click();
   await page.locator("#phone-connect [name=url]").fill("ws://127.0.0.1:47801/");
   await page.locator("#phone-connect [name=token]").fill("key");
@@ -347,7 +77,13 @@ test("an uncertain answer is looked up before another confirmation can dispatch 
   await expect(page.locator("#phone-notice")).toContainText(
     "Отправка не подтверждена",
   );
-  await confirm.click();
+  replyNext("inbox.operation", { status: "not_found" });
+  await page
+    .getByRole("button", { name: "Проверить отправку", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Повторить отправку", exact: true }),
+  ).toBeVisible();
   await expect
     .poll(
       () => calls.filter((call) => call.method === "inbox.operation").length,
@@ -517,7 +253,7 @@ test("a saved schedule clears its restored draft even when the HUD already check
   await expect(page.getByLabel("Название", { exact: true })).toHaveValue("");
 });
 
-async function simulateG2(page: Page) {
+async function simulateG2(page: Page, phone = false) {
   await page.route("**/src/main.ts", (route) =>
     route.fulfill({
       contentType: "application/javascript",
@@ -526,6 +262,7 @@ async function simulateG2(page: Page) {
         import { Relay } from "/src/transport.ts";
         import { InboxModel } from "/src/model.ts";
         import { mountHud } from "/src/hud.ts";
+        import { PhoneApp } from "/src/phone.ts";
         import "/src/style.css";
         const simulated = window.simulatedG2 = { tiles: {}, audio: [], exits: [], shown: [] };
         const captions = new WeakMap();
@@ -557,7 +294,9 @@ async function simulateG2(page: Page) {
           return bytes;
         };
         const bridge = {
-          createStartUpPageContainer: async () => 0,
+          createStartUpPageContainer: async () => ${phone ? 1 : 0},
+          getLocalStorage: async () => "",
+          setLocalStorage: async () => true,
           onEvenHubEvent: listener => {
             simulated.emit = listener;
             return () => {};
@@ -577,18 +316,32 @@ async function simulateG2(page: Page) {
             return true;
           },
         };
-        const hud = document.querySelector("#app");
-        hud.id = "hud-panel";
-        mountHud(new Relay(), new Glasses(async () => bridge), new InboxModel(), hud);
+        const root = document.querySelector("#app");
+        const relay = new Relay();
+        const glasses = new Glasses(async () => bridge);
+        const inbox = new InboxModel();
+        const hudRoot = document.createElement("section");
+        hudRoot.id = "hud-panel";
+        hudRoot.hidden = ${phone};
+        root.append(hudRoot);
+        const hud = mountHud(relay, glasses, inbox, hudRoot);
+        if (${phone}) {
+          const phoneRoot = document.createElement("section");
+          root.prepend(phoneRoot);
+          new PhoneApp(phoneRoot, relay, glasses, inbox, hud, hudRoot);
+        }
       `,
     }),
   );
-  await page.goto("/?hud=1");
+  await page.goto(phone ? "/" : "/?hud=1");
   const hud = page.locator("#hud-panel");
-  await hud.locator("#connect [name=url]").fill("ws://127.0.0.1:47801/");
-  await hud.locator("#connect [name=token]").fill("key");
-  await hud.locator("#connect button").click();
-  await expect(hud.locator("#connection")).toHaveText("VPS подключён");
+  if (phone) await fillPhoneConnection(page);
+  else {
+    await hud.locator("#connect [name=url]").fill("ws://127.0.0.1:47801/");
+    await hud.locator("#connect [name=token]").fill("key");
+    await hud.locator("#connect button").click();
+    await expect(hud.locator("#connection")).toHaveText("VPS подключён");
+  }
   const event = (data: unknown) =>
     page.evaluate((event) => (window as any).simulatedG2.emit(event), data);
   const ring = (eventType = 0) =>
@@ -601,6 +354,38 @@ async function simulateG2(page: Page) {
       .toContain(text);
   return { hud, event, ring, shown };
 }
+
+test("phone without G2 picks an available Hermes STT provider and keeps the draft editable", async ({
+  page,
+}) => {
+  const { calls, replyNext } = await server(page);
+  const { event } = await simulateG2(page, true);
+  await page
+    .getByRole("navigation", { name: "Разделы" })
+    .getByRole("button", { name: "Чаты" })
+    .click();
+  await page.getByRole("button", { name: /Первый чат/ }).click();
+  await page.locator("#message-input").fill("Черновик");
+  await page.locator("#dictate").click();
+  await expect(page.locator("#dictate")).toHaveText("Завершить диктовку");
+  await event({ audioEvent: { audioPcm: [1, 2, 3, 4] } });
+  replyNext("workspace.stt.providers", {
+    providers: [
+      { id: "offline", available: false },
+      { id: "simulated", available: true },
+    ],
+  });
+  await page.locator("#dictate").click();
+  await expect(page.locator("#message-input")).toHaveValue(
+    "Черновик\nКаждый день в девять собирай сводку",
+  );
+  const stt = calls.find(({ method }) => method === "workspace.stt.transcribe");
+  expect(stt?.params).toMatchObject({ provider: "simulated", language: "ru" });
+  expect(Buffer.from(stt.params.wav, "base64").subarray(44)).toEqual(
+    Buffer.from([1, 2, 3, 4]),
+  );
+  expect(calls.some(({ method }) => method === "agent")).toBe(false);
+});
 
 test("R1 dictates and confirms a schedule, then recovers a lost save acknowledgment", async ({
   page,

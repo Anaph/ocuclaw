@@ -7,8 +7,9 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
     "test": "tsx --test src/*.test.ts",
-    "pack": "npm run build && evenhub pack app.json dist --sdk-ver 0.0.16 -o ocuclaw-inbox.ehpk",
-    "test:e2e": "playwright test"
+    "pack": "npm run build && node scripts/pack.mjs",
+    "test:e2e": "playwright test",
+    "test:device": "tsx testing/device-acceptance.ts"
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "0.0.16",

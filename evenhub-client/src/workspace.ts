@@ -213,6 +213,24 @@ export class Workspace {
     if (generation !== this.generation) throw Error("Подключение изменилось");
     return result;
   }
+  async transcribe(wav: string, provider?: string) {
+    if (!provider) {
+      const listing = await this.request<{
+        providers?: { id: string; available: boolean }[];
+      }>("workspace.stt.providers");
+      provider = listing.providers?.find((item) => item.available)?.id;
+    }
+    if (!provider) throw Error("В Hermes не настроено распознавание речи");
+    const result = await this.request<{
+      success: boolean;
+      transcript?: string;
+      error?: string;
+    }>("workspace.stt.transcribe", { wav, provider, language: "ru" });
+    const text = result.transcript?.trim();
+    if (!result.success || !text)
+      throw Error(result.error || "Речь не распознана. Повторите запись.");
+    return text;
+  }
   private outcome(method: string, params: Record<string, unknown>) {
     return this.request(method, params, { acceptStatus: true });
   }

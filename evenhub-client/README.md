@@ -32,12 +32,14 @@ use ASCII (Inbox / Sessions / Actions / Schedule), since those labels use the OS
 ## Package and browser acceptance
 
 ```sh
-npm run pack
+npm run pack -- wss://your-hermes-host/
 npx playwright install chromium
 npm run test:e2e
 ```
 
 `ocuclaw-inbox.ehpk` is a private-build artifact; packaging does not publish it.
+Supply the permitted relay WSS address when packaging. For Android, G2 and R1
+setup, local fixtures and the VPS gate, see [Acceptance](ACCEPTANCE.md).
 Browser tests simulate a relay with three sessions. They check confirmation,
 addressed single/multiple answers, text input, answers from another interface and
 mobile layout. Screenshots land in `test-results/`.
@@ -75,7 +77,7 @@ actions rather than adopting the Desktop session.
 ## Acceptance boundary
 
 Local tests and packaging are not proof of physical display/microphone behavior.
-VPS, Android and G2 acceptance/deployment are the final step, as requested. Verify:
+Run Android, G2 and R1 acceptance first. VPS deployment is the final step. Verify:
 Desktop and OcuClaw share the SAME gateway process (sharing a database is not
 sufficient); native API version/shapes and profile admission; Desktop finalizer
 callbacks; STT provider; Tailscale; locked-phone behavior; four-tile throughput;

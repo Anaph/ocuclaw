@@ -9,12 +9,27 @@
   "permissions": [
     {
       "name": "network",
-      "desc": "Подключение к вашему OcuClaw VPS"
+      "desc": "Подключение к вашему OcuClaw VPS",
+      "whitelist": []
     },
     {
       "name": "g2-microphone",
       "desc": "Диктовка ответов агентам"
+    },
+    {
+      "name": "phone-microphone",
+      "desc": "Диктовка сообщений, ответов и задач с телефона"
+    },
+    {
+      "name": "album",
+      "desc": "Выбор изображения для сообщения Hermes"
+    },
+    {
+      "name": "camera",
+      "desc": "Снимок для сообщения Hermes"
     }
   ],
-  "supported_languages": ["en"]
+  "supported_languages": [
+    "en"
+  ]
 }
